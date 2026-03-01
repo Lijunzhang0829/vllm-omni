@@ -1774,9 +1774,55 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             elif hasattr(final_res, "images") and final_res.images:
                 images = final_res.images
 
+        def _to_pil_image(media_obj: Any) -> Image.Image | None:
+            if isinstance(media_obj, Image.Image):
+                return media_obj
+            if hasattr(media_obj, "cpu"):  # torch.Tensor
+                import numpy as np
+
+                arr = media_obj.float().detach().cpu().numpy()
+            else:
+                try:
+                    import numpy as np
+                except Exception:
+                    return None
+                if isinstance(media_obj, np.ndarray):
+                    arr = media_obj
+                else:
+                    return None
+
+            # For video outputs (F,H,W,C) or (F,H,W), use first frame.
+            if arr.ndim == 4:
+                arr = arr[0]
+            elif arr.ndim == 3 and arr.shape[0] > 4 and arr.shape[-1] not in (1, 3, 4):
+                arr = arr[0]
+
+            # CHW -> HWC
+            if arr.ndim == 3 and arr.shape[0] in (1, 3, 4):
+                arr = np.transpose(arr, (1, 2, 0))
+
+            if np.issubdtype(arr.dtype, np.floating):
+                maxv = float(arr.max()) if arr.size > 0 else 0.0
+                arr = (arr * 255.0 if maxv <= 1.0 else arr).clip(0, 255).astype(np.uint8)
+            else:
+                arr = arr.clip(0, 255).astype(np.uint8)
+
+            if arr.ndim == 2:
+                return Image.fromarray(arr, mode="L")
+            if arr.ndim == 3 and arr.shape[-1] == 1:
+                return Image.fromarray(arr.squeeze(-1), mode="L")
+            if arr.ndim == 3 and arr.shape[-1] == 3:
+                return Image.fromarray(arr, mode="RGB")
+            if arr.ndim == 3 and arr.shape[-1] == 4:
+                return Image.fromarray(arr, mode="RGBA")
+            return None
+
         # Convert images to base64
         image_contents = []
-        for img in images:
+        for media_obj in images:
+            img = _to_pil_image(media_obj)
+            if img is None:
+                continue
             with BytesIO() as buffer:
                 img.save(buffer, format="PNG")
                 img_bytes = buffer.getvalue()
@@ -2006,9 +2052,55 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             # Handle nested OmniRequestOutput structure where images might be in request_output
             images = getattr(result.request_output, "images", [])
 
+            def _to_pil_image(media_obj: Any) -> Image.Image | None:
+                from PIL import Image
+
+                if isinstance(media_obj, Image.Image):
+                    return media_obj
+                if hasattr(media_obj, "cpu"):  # torch.Tensor
+                    import numpy as np
+
+                    arr = media_obj.float().detach().cpu().numpy()
+                else:
+                    import numpy as np
+
+                    if isinstance(media_obj, np.ndarray):
+                        arr = media_obj
+                    else:
+                        return None
+
+                # For video outputs (F,H,W,C) or (F,H,W), use first frame.
+                if arr.ndim == 4:
+                    arr = arr[0]
+                elif arr.ndim == 3 and arr.shape[0] > 4 and arr.shape[-1] not in (1, 3, 4):
+                    arr = arr[0]
+
+                # CHW -> HWC
+                if arr.ndim == 3 and arr.shape[0] in (1, 3, 4):
+                    arr = np.transpose(arr, (1, 2, 0))
+
+                if np.issubdtype(arr.dtype, np.floating):
+                    maxv = float(arr.max()) if arr.size > 0 else 0.0
+                    arr = (arr * 255.0 if maxv <= 1.0 else arr).clip(0, 255).astype(np.uint8)
+                else:
+                    arr = arr.clip(0, 255).astype(np.uint8)
+
+                if arr.ndim == 2:
+                    return Image.fromarray(arr, mode="L")
+                if arr.ndim == 3 and arr.shape[-1] == 1:
+                    return Image.fromarray(arr.squeeze(-1), mode="L")
+                if arr.ndim == 3 and arr.shape[-1] == 3:
+                    return Image.fromarray(arr, mode="RGB")
+                if arr.ndim == 3 and arr.shape[-1] == 4:
+                    return Image.fromarray(arr, mode="RGBA")
+                return None
+
             # Convert images to base64 content
             image_contents: list[dict[str, Any]] = []
-            for img in images:
+            for media_obj in images:
+                img = _to_pil_image(media_obj)
+                if img is None:
+                    continue
                 with BytesIO() as buffer:
                     img.save(buffer, format="PNG")
                     img_bytes = buffer.getvalue()
