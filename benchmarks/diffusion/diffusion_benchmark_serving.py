@@ -7,7 +7,7 @@ Benchmark online serving for diffusion models (Image/Video Generation).
 If you want to use i2v, i2i dataset, you should `uv pip install gdown` first
 
 Supports multiple backends:
-    - vllm-omni: Uses /v1/chat/completions endpoint (default)
+    - vllm-omni: Uses /v1/chat/completions for image tasks, /v1/videos for video tasks
     - openai: Uses /v1/images/generations endpoint
 
 Usage:
@@ -56,7 +56,7 @@ from typing import Any
 import aiohttp
 import numpy as np
 import requests
-from backends import RequestFuncInput, RequestFuncOutput, backends_function_mapping
+from backends import RequestFuncInput, RequestFuncOutput, get_backend_request_config
 from tqdm.asyncio import tqdm
 
 
@@ -743,7 +743,7 @@ async def benchmark(args):
         args.base_url = f"http://{args.host}:{args.port}"
 
     # Setup API URL and request function based on backend
-    request_func, api_url = backends_function_mapping[args.backend]
+    request_func, api_url = get_backend_request_config(args.backend, args.task)
     api_url = f"{args.base_url}{api_url}"
 
     if args.dataset == "vbench":

@@ -23,7 +23,7 @@ from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
 from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanTransformer3DModel
-from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.request import OmniDiffusionExecutionState, OmniDiffusionRequest
 from vllm_omni.inputs.data import OmniTextPrompt
 from vllm_omni.platforms import current_omni_platform
 
@@ -417,137 +417,183 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin):
             # Fallback to text_encoder dtype if no transformer loaded
             dtype = self.text_encoder.dtype
 
-        # Seed / generator
-        if generator is None:
-            generator = req.sampling_params.generator
-        if generator is None and req.sampling_params.seed is not None:
-            generator = torch.Generator(device=device).manual_seed(req.sampling_params.seed)
+        state = req.execution_state.payload if req.execution_state is not None else None
+        if state is None:
+            # Seed / generator
+            if generator is None:
+                generator = req.sampling_params.generator
+            if generator is None and req.sampling_params.seed is not None:
+                generator = torch.Generator(device=device).manual_seed(req.sampling_params.seed)
 
-        # Encode prompts
-        if prompt_embeds is None:
-            prompt_embeds, negative_prompt_embeds = self.encode_prompt(
-                prompt=prompt,
-                negative_prompt=negative_prompt,
-                do_classifier_free_guidance=guidance_low > 1.0 or guidance_high > 1.0,
-                num_videos_per_prompt=req.sampling_params.num_outputs_per_prompt or 1,
-                max_sequence_length=req.sampling_params.max_sequence_length or 512,
-                device=device,
-                dtype=dtype,
-            )
-        else:
-            prompt_embeds = prompt_embeds.to(device=device, dtype=dtype)
-            if negative_prompt_embeds is not None:
-                negative_prompt_embeds = negative_prompt_embeds.to(device=device, dtype=dtype)
-            elif guidance_low > 1.0 or guidance_high > 1.0:
-                raise ValueError(
-                    "negative_prompt_embeds must be provided when prompt_embeds are given and guidance > 1."
+            # Encode prompts
+            if prompt_embeds is None:
+                prompt_embeds, negative_prompt_embeds = self.encode_prompt(
+                    prompt=prompt,
+                    negative_prompt=negative_prompt,
+                    do_classifier_free_guidance=guidance_low > 1.0 or guidance_high > 1.0,
+                    num_videos_per_prompt=req.sampling_params.num_outputs_per_prompt or 1,
+                    max_sequence_length=req.sampling_params.max_sequence_length or 512,
+                    device=device,
+                    dtype=dtype,
                 )
-
-        # Timesteps
-        self.scheduler.set_timesteps(num_steps, device=device)
-        timesteps = self.scheduler.timesteps
-        self._num_timesteps = len(timesteps)
-        boundary_timestep = None
-        if boundary_ratio is not None:
-            boundary_timestep = boundary_ratio * self.scheduler.config.num_train_timesteps
-
-        # Handle I2V mode when expand_timesteps=True and image is provided
-        multi_modal_data = req.prompts[0].get("multi_modal_data", {}) if not isinstance(req.prompts[0], str) else None
-        raw_image = multi_modal_data.get("image", None) if multi_modal_data is not None else None
-        if isinstance(raw_image, list):
-            if len(raw_image) > 1:
-                logger.warning(
-                    """Received a list of image. Only a single image is supported by this model."""
-                    """Taking only the first image for now."""
-                )
-            raw_image = raw_image[0]
-        if raw_image is None:
-            image = None
-        elif isinstance(raw_image, str):
-            image = PIL.Image.open(raw_image)
-        else:
-            image = cast(PIL.Image.Image | torch.Tensor, raw_image)
-
-        latent_condition = None
-        first_frame_mask = None
-
-        if self.expand_timesteps and image is not None:
-            # I2V mode: encode image and prepare condition
-            from diffusers.video_processor import VideoProcessor
-
-            video_processor = VideoProcessor(vae_scale_factor=self.vae_scale_factor_spatial)
-
-            # Preprocess image
-            if isinstance(image, PIL.Image.Image):
-                image = image.resize((width, height), PIL.Image.Resampling.LANCZOS)
-                image_tensor = video_processor.preprocess(image, height=height, width=width)
             else:
-                image_tensor = image
+                prompt_embeds = prompt_embeds.to(device=device, dtype=dtype)
+                if negative_prompt_embeds is not None:
+                    negative_prompt_embeds = negative_prompt_embeds.to(device=device, dtype=dtype)
+                elif guidance_low > 1.0 or guidance_high > 1.0:
+                    raise ValueError(
+                        "negative_prompt_embeds must be provided when prompt_embeds are given and guidance > 1."
+                    )
 
-            # Use out_channels for noise latents (not in_channels which includes condition)
-            num_channels_latents = self.transformer_config.out_channels
-            batch_size = prompt_embeds.shape[0]
+            # Timesteps
+            self.scheduler.set_timesteps(num_steps, device=device)
+            timesteps = self.scheduler.timesteps
+            self._num_timesteps = len(timesteps)
+            boundary_timestep = None
+            if self.boundary_ratio is not None:
+                boundary_timestep = self.boundary_ratio * self.scheduler.config.num_train_timesteps
 
-            # Prepare noise latents
-            latents = self.prepare_latents(
-                batch_size=batch_size,
-                num_channels_latents=num_channels_latents,
-                height=height,
-                width=width,
-                num_frames=num_frames,
-                dtype=torch.float32,
-                device=device,
-                generator=generator,
-                latents=req.sampling_params.latents,
-            )
+            # Handle I2V mode when expand_timesteps=True and image is provided
+            multi_modal_data = req.prompts[0].get("multi_modal_data", {}) if not isinstance(req.prompts[0], str) else None
+            raw_image = multi_modal_data.get("image", None) if multi_modal_data is not None else None
+            if isinstance(raw_image, list):
+                if len(raw_image) > 1:
+                    logger.warning(
+                        """Received a list of image. Only a single image is supported by this model."""
+                        """Taking only the first image for now."""
+                    )
+                raw_image = raw_image[0]
+            if raw_image is None:
+                image = None
+            elif isinstance(raw_image, str):
+                image = PIL.Image.open(raw_image)
+            else:
+                image = cast(PIL.Image.Image | torch.Tensor, raw_image)
 
-            # Encode image condition
-            num_latent_frames = latents.shape[2]
-            latent_height = latents.shape[3]
-            latent_width = latents.shape[4]
+            latent_condition = None
+            first_frame_mask = None
 
-            image_tensor = image_tensor.unsqueeze(2)  # [B, C, 1, H, W]
-            image_tensor = image_tensor.to(device=device, dtype=self.vae.dtype)
-            latent_condition = retrieve_latents(self.vae.encode(image_tensor), sample_mode="argmax")
-            latent_condition = latent_condition.repeat(batch_size, 1, 1, 1, 1)
+            if self.expand_timesteps and image is not None:
+                # I2V mode: encode image and prepare condition
+                from diffusers.video_processor import VideoProcessor
 
-            # Normalize condition latents
-            latents_mean = (
-                torch.tensor(self.vae.config.latents_mean)
-                .view(1, self.vae.config.z_dim, 1, 1, 1)
-                .to(latent_condition.device, latent_condition.dtype)
-            )
-            latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(
-                latent_condition.device, latent_condition.dtype
-            )
-            latent_condition = (latent_condition - latents_mean) * latents_std
-            latent_condition = latent_condition.to(torch.float32)
+                video_processor = VideoProcessor(vae_scale_factor=self.vae_scale_factor_spatial)
 
-            # Create mask: 0 for first frame (condition), 1 for rest (to denoise)
-            first_frame_mask = torch.ones(
-                1, 1, num_latent_frames, latent_height, latent_width, dtype=torch.float32, device=device
-            )
-            first_frame_mask[:, :, 0] = 0
+                # Preprocess image
+                if isinstance(image, PIL.Image.Image):
+                    image = image.resize((width, height), PIL.Image.Resampling.LANCZOS)
+                    image_tensor = video_processor.preprocess(image, height=height, width=width)
+                else:
+                    image_tensor = image
+
+                # Use out_channels for noise latents (not in_channels which includes condition)
+                num_channels_latents = self.transformer_config.out_channels
+                batch_size = prompt_embeds.shape[0]
+
+                # Prepare noise latents
+                latents = self.prepare_latents(
+                    batch_size=batch_size,
+                    num_channels_latents=num_channels_latents,
+                    height=height,
+                    width=width,
+                    num_frames=num_frames,
+                    dtype=torch.float32,
+                    device=device,
+                    generator=generator,
+                    latents=req.sampling_params.latents,
+                )
+
+                # Encode image condition
+                num_latent_frames = latents.shape[2]
+                latent_height = latents.shape[3]
+                latent_width = latents.shape[4]
+
+                image_tensor = image_tensor.unsqueeze(2)  # [B, C, 1, H, W]
+                image_tensor = image_tensor.to(device=device, dtype=self.vae.dtype)
+                latent_condition = retrieve_latents(self.vae.encode(image_tensor), sample_mode="argmax")
+                latent_condition = latent_condition.repeat(batch_size, 1, 1, 1, 1)
+
+                # Normalize condition latents
+                latents_mean = (
+                    torch.tensor(self.vae.config.latents_mean)
+                    .view(1, self.vae.config.z_dim, 1, 1, 1)
+                    .to(latent_condition.device, latent_condition.dtype)
+                )
+                latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(
+                    1, self.vae.config.z_dim, 1, 1, 1
+                ).to(latent_condition.device, latent_condition.dtype)
+                latent_condition = (latent_condition - latents_mean) * latents_std
+                latent_condition = latent_condition.to(torch.float32)
+
+                # Create mask: 0 for first frame (condition), 1 for rest (to denoise)
+                first_frame_mask = torch.ones(
+                    1, 1, num_latent_frames, latent_height, latent_width, dtype=torch.float32, device=device
+                )
+                first_frame_mask[:, :, 0] = 0
+            else:
+                # T2V mode: standard latent preparation
+                num_channels_latents = self.transformer_config.in_channels
+                latents = self.prepare_latents(
+                    batch_size=prompt_embeds.shape[0],
+                    num_channels_latents=num_channels_latents,
+                    height=height,
+                    width=width,
+                    num_frames=num_frames,
+                    dtype=torch.float32,
+                    device=device,
+                    generator=generator,
+                    latents=req.sampling_params.latents,
+                )
+
+            state = {
+                "prompt_embeds": prompt_embeds,
+                "negative_prompt_embeds": negative_prompt_embeds,
+                "timesteps": timesteps,
+                "boundary_timestep": boundary_timestep,
+                "latents": latents,
+                "latent_condition": latent_condition,
+                "first_frame_mask": first_frame_mask,
+                "guidance_low": guidance_low,
+                "guidance_high": guidance_high,
+                "num_steps": num_steps,
+                "height": height,
+                "width": width,
+                "num_frames": num_frames,
+                "attention_kwargs": attention_kwargs or {},
+                "output_type": output_type,
+            }
+            req.execution_state = OmniDiffusionExecutionState(step_index=0, payload=state)
         else:
-            # T2V mode: standard latent preparation
-            num_channels_latents = self.transformer_config.in_channels
-            latents = self.prepare_latents(
-                batch_size=prompt_embeds.shape[0],
-                num_channels_latents=num_channels_latents,
-                height=height,
-                width=width,
-                num_frames=num_frames,
-                dtype=torch.float32,
-                device=device,
-                generator=generator,
-                latents=req.sampling_params.latents,
-            )
+            prompt_embeds = state["prompt_embeds"]
+            negative_prompt_embeds = state["negative_prompt_embeds"]
+            self.scheduler.set_timesteps(state["num_steps"], device=device)
+            timesteps = self.scheduler.timesteps
+            state["timesteps"] = timesteps
+            self._num_timesteps = len(timesteps)
+            boundary_timestep = state["boundary_timestep"]
+            latents = state["latents"]
+            latent_condition = state["latent_condition"]
+            first_frame_mask = state["first_frame_mask"]
+            guidance_low = state["guidance_low"]
+            guidance_high = state["guidance_high"]
+            attention_kwargs = state.get("attention_kwargs") or {}
+            output_type = state.get("output_type", output_type)
+            height = int(state["height"])
+            width = int(state["width"])
 
-        if attention_kwargs is None:
-            attention_kwargs = {}
+        start_index = req.execution_state.step_index if req.execution_state is not None else 0
+        if start_index >= len(timesteps):
+            raise RuntimeError(
+                f"Invalid resume step for req_id={req.request_ids[0] if req.request_ids else req.request_key}: "
+                f"start_index={start_index} >= timesteps_len={len(timesteps)}"
+            )
+        end_index = len(timesteps)
+        if req.preempt_enabled:
+            end_index = min(end_index, start_index + max(1, int(req.preempt_step_chunk_size)))
 
         # Denoising
-        for t in timesteps:
+        for idx in range(start_index, end_index):
+            t = timesteps[idx]
             self._current_timestep = t
 
             # Select model based on timestep and boundary_ratio
@@ -629,6 +675,15 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin):
             # Compute the previous noisy sample x_t -> x_t-1 with automatic CFG sync
             latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
 
+        state["latents"] = latents
+        if req.execution_state is None:
+            req.execution_state = OmniDiffusionExecutionState()
+        req.execution_state.payload = state
+        req.execution_state.step_index = end_index
+
+        if end_index < len(timesteps):
+            return DiffusionOutput(output=None, finished=False, request_key=req.request_key)
+
         # Wan2.2 is prone to out of memory errors when predicting large videos
         # so we empty the cache here to avoid OOM before vae decoding.
         if current_omni_platform.is_available():
@@ -655,7 +710,8 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin):
             latents = latents / latents_std + latents_mean
             output = self.vae.decode(latents, return_dict=False)[0]
 
-        return DiffusionOutput(output=output)
+        req.execution_state = None
+        return DiffusionOutput(output=output, finished=True, request_key=req.request_key)
 
     def predict_noise(self, current_model: nn.Module | None = None, **kwargs: Any) -> torch.Tensor:
         """
