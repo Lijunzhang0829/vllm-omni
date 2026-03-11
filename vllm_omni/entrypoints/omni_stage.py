@@ -229,13 +229,16 @@ def _resolve_worker_cls(engine_args: dict[str, Any]) -> None:
 
 def _build_od_config(engine_args: dict[str, Any], model: str) -> dict[str, Any]:
     """Build OmniDiffusionConfig kwargs from engine args."""
-    od_config = engine_args.get("od_config", {})
-    if not od_config:
-        od_config = {"model": model}
-        od_field_names = {f.name for f in fields(OmniDiffusionConfig)}
-        for key, value in engine_args.items():
-            if key in od_field_names:
-                od_config[key] = value
+    raw_od_config = engine_args.get("od_config", {})
+    od_config = dict(raw_od_config) if raw_od_config else {}
+    od_config.setdefault("model", model)
+
+    # Merge diffusion config fields from engine_args on top of any pre-existing
+    # od_config so CLI/runtime overrides are not dropped by stage configs.
+    od_field_names = {f.name for f in fields(OmniDiffusionConfig)}
+    for key, value in engine_args.items():
+        if key in od_field_names:
+            od_config[key] = value
     return od_config
 
 
