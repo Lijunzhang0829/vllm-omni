@@ -563,7 +563,6 @@ class DiffusionLoRAManager:
         self._update_adapter_scale(adapter_id, scale)
 
     def _deactivate_all_adapters(self) -> None:
-        logger.info("Deactivating all adapters: %d layers", len(self._lora_modules))
         for lora_layer in self._lora_modules.values():
             lora_layer.reset_lora(0)
         self._active_adapter_id = None
