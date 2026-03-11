@@ -223,4 +223,6 @@ class DiffusionModelRunner:
             ):
                 cache_summary(self.pipeline, details=True)
 
-            return output
+        if output.request_key is None:
+            output.request_key = req.request_key
+        return output

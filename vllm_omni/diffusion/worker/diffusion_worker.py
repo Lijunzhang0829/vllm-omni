@@ -13,6 +13,7 @@ import multiprocessing as mp
 import os
 from collections.abc import Iterable
 from contextlib import AbstractContextManager, nullcontext
+from datetime import datetime
 from typing import Any
 
 import torch
@@ -38,6 +39,12 @@ from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager
 from vllm_omni.diffusion.profiler import CurrentProfiler
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
+from vllm_omni.diffusion.worker.scheduling_policy import (
+    DiffusionSchedulingPolicy,
+    TargetFreeGlobalReorderPolicy,
+    req_debug_id,
+    req_step_index,
+)
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.worker.gpu_memory_utils import get_process_gpu_memory
@@ -353,6 +360,8 @@ class WorkerProc:
         # Create worker using WorkerWrapperBase for extension support
         self.worker = self._create_worker(gpu_id, od_config, worker_extension_cls, custom_pipeline_args)
         self._running = True
+        self._current_req: OmniDiffusionRequest | None = None
+        self._scheduling_policy: DiffusionSchedulingPolicy = TargetFreeGlobalReorderPolicy()
 
     def _create_worker(
         self,
@@ -375,9 +384,144 @@ class WorkerProc:
         if self.result_mq is not None:
             self.result_mq.enqueue(output)
 
-    def recv_message(self):
+    def recv_message(self, timeout: float | None = None):
         """Receive messages from broadcast queue."""
-        return self.mq.dequeue(indefinite=True)
+        return self.mq.dequeue(timeout=timeout, indefinite=timeout is None)
+
+    def _supports_step_preemption(self) -> bool:
+        model_cls_name = self.od_config.model_class_name or ""
+        return model_cls_name.startswith("QwenImage")
+
+    def _enqueue_generation_req(self, req: OmniDiffusionRequest) -> None:
+        req.get_or_assign_priority()
+        req.preempt_enabled = self._supports_step_preemption()
+        req.preempt_step_chunk_size = max(1, int(req.preempt_step_chunk_size))
+        incoming_req_id = self._req_debug_id(req)
+        if self._scheduling_policy.is_aborted(incoming_req_id):
+            print(
+                f"[DiffusionDrop][{self._now_str()}][rank={self.gpu_id}] req_id={incoming_req_id} reason=aborted",
+                flush=True,
+            )
+            return
+        print(
+            f"[DiffusionArrive][{self._now_str()}][rank={self.gpu_id}] "
+            f"req_id={incoming_req_id} preempt_enabled={req.preempt_enabled}",
+            flush=True,
+        )
+        decision = self._scheduling_policy.on_request_arrival(req, self._current_req)
+        for dropped_id in self._scheduling_policy.consume_recent_dropped_request_ids():
+            print(
+                f"[DiffusionDrop][{self._now_str()}][rank={self.gpu_id}] req_id={dropped_id} reason=aborted",
+                flush=True,
+            )
+        if decision.preemption is not None:
+            preempted_req_id = self._req_debug_id(decision.preemption.preempted_req)
+            current_step = self._req_step_index(decision.preemption.preempted_req)
+            candidate_req_id = self._req_debug_id(decision.preemption.selected_req)
+            print(
+                f"[DiffusionPreempt][{self._now_str()}][rank={self.gpu_id}] "
+                f"preempt req_id={preempted_req_id} at step={current_step}; "
+                f"switch_to req_id={candidate_req_id} "
+                f"cost_cur={decision.preemption.preempted_cost:.0f} "
+                f"cost_new={decision.preemption.selected_cost:.0f}",
+                flush=True,
+            )
+        self._current_req = decision.current_req
+
+    def _schedule_next_after_finish(self) -> OmniDiffusionRequest | None:
+        # Global rescheduling decision point #2: current request finished.
+        next_req = self._scheduling_policy.on_request_finish()
+        for dropped_id in self._scheduling_policy.consume_recent_dropped_request_ids():
+            print(
+                f"[DiffusionDrop][{self._now_str()}][rank={self.gpu_id}] req_id={dropped_id} reason=aborted",
+                flush=True,
+            )
+        if next_req is None:
+            return None
+        next_req_id = self._req_debug_id(next_req)
+        next_step = self._req_step_index(next_req)
+        print(
+            f"[DiffusionResume][{self._now_str()}][rank={self.gpu_id}] "
+            f"resume req_id={next_req_id} from step={next_step}",
+            flush=True,
+        )
+        return next_req
+
+    @staticmethod
+    def _req_debug_id(req: OmniDiffusionRequest) -> str:
+        return req_debug_id(req)
+
+    @staticmethod
+    def _req_step_index(req: OmniDiffusionRequest) -> int:
+        return req_step_index(req)
+
+    @staticmethod
+    def _now_str() -> str:
+        return datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+
+    def _abort_requests(self, request_ids: list[str]) -> None:
+        if not request_ids:
+            return
+        self._scheduling_policy.abort_request_ids(request_ids)
+        for rid in request_ids:
+            if isinstance(rid, str):
+                print(f"[DiffusionAbort][{self._now_str()}][rank={self.gpu_id}] req_id={rid}", flush=True)
+
+        if self._current_req is not None:
+            cur_id = self._req_debug_id(self._current_req)
+            if self._scheduling_policy.is_aborted(cur_id):
+                aborted_req = self._current_req
+                self._current_req = self._schedule_next_after_finish()
+                self.return_result(
+                    {
+                        "type": "generation_result",
+                        "request_key": aborted_req.request_key,
+                        "output": DiffusionOutput(
+                            error=f"request {cur_id} aborted",
+                            finished=True,
+                            request_key=aborted_req.request_key,
+                        ),
+                    }
+                )
+
+    def _drain_incoming_messages(self) -> None:
+        while self._running:
+            try:
+                msg = self.recv_message(timeout=0.0)
+            except TimeoutError:
+                return
+            except Exception as e:
+                logger.error("Error receiving message in worker loop: %s", e, exc_info=True)
+                return
+
+            if msg is None or (hasattr(msg, "__len__") and len(msg) == 0):
+                logger.warning("Worker %s: Received empty payload, ignoring", self.gpu_id)
+                continue
+
+            if isinstance(msg, dict) and msg.get("type") == "rpc":
+                try:
+                    result, should_reply = self.execute_rpc(msg)
+                    if should_reply:
+                        self.return_result(result)
+                except Exception as e:
+                    logger.error("Error processing RPC: %s", e, exc_info=True)
+                    if self.result_mq is not None:
+                        self.return_result(DiffusionOutput(error=str(e)))
+                continue
+
+            if isinstance(msg, dict) and msg.get("type") == "shutdown":
+                logger.info("Worker %s: Received shutdown message", self.gpu_id)
+                self._running = False
+                return
+
+            if isinstance(msg, dict) and msg.get("type") == "abort":
+                self._abort_requests(msg.get("request_ids", []))
+                continue
+
+            if isinstance(msg, OmniDiffusionRequest):
+                self._enqueue_generation_req(msg)
+            else:
+                logger.warning("Worker %s: Ignoring unsupported message type %s", self.gpu_id, type(msg))
 
     def execute_rpc(self, rpc_request: dict) -> tuple[object | None, bool]:
         """Execute an RPC request and indicate whether to reply."""
@@ -406,52 +550,96 @@ class WorkerProc:
         logger.info(f"Worker {self.gpu_id} ready to receive requests via shared memory")
 
         while self._running:
-            msg = None
+            self._drain_incoming_messages()
+            if not self._running:
+                break
+
+            if self._current_req is None:
+                try:
+                    msg = self.recv_message(timeout=None)
+                except Exception as e:
+                    logger.error("Error receiving message in worker loop: %s", e, exc_info=True)
+                    continue
+                if isinstance(msg, OmniDiffusionRequest):
+                    self._enqueue_generation_req(msg)
+                elif isinstance(msg, dict) and msg.get("type") == "rpc":
+                    try:
+                        result, should_reply = self.execute_rpc(msg)
+                        if should_reply:
+                            self.return_result(result)
+                    except Exception as e:
+                        logger.error("Error processing RPC: %s", e, exc_info=True)
+                        if self.result_mq is not None:
+                            self.return_result(DiffusionOutput(error=str(e)))
+                    continue
+                elif isinstance(msg, dict) and msg.get("type") == "shutdown":
+                    logger.info("Worker %s: Received shutdown message", self.gpu_id)
+                    self._running = False
+                    break
+                elif isinstance(msg, dict) and msg.get("type") == "abort":
+                    self._abort_requests(msg.get("request_ids", []))
+                    continue
+                else:
+                    logger.warning("Worker %s: Ignoring unsupported message type %s", self.gpu_id, type(msg))
+                    continue
+
+            if self._current_req is None:
+                continue
+
+            current_req_id = self._req_debug_id(self._current_req)
+            if self._scheduling_policy.is_aborted(current_req_id):
+                self.return_result(
+                    {
+                        "type": "generation_result",
+                        "request_key": self._current_req.request_key,
+                        "output": DiffusionOutput(
+                            error=f"request {current_req_id} aborted",
+                            finished=True,
+                            request_key=self._current_req.request_key,
+                        ),
+                    }
+                )
+                self._current_req = self._schedule_next_after_finish()
+                continue
+
             try:
-                msg = self.recv_message()
+                output = self.worker.execute_model(self._current_req, self.od_config)
             except Exception as e:
+                failed_req_id = self._req_debug_id(self._current_req)
+                failed_step = self._req_step_index(self._current_req)
+                print(
+                    f"[DiffusionError][{self._now_str()}][rank={self.gpu_id}] "
+                    f"req_id={failed_req_id} step={failed_step} error={e}",
+                    flush=True,
+                )
                 logger.error(
-                    f"Error receiving message in worker loop: {e}",
+                    "Error executing forward in event loop: %s",
+                    e,
                     exc_info=True,
                 )
-                continue
+                output = DiffusionOutput(error=str(e), finished=True, request_key=self._current_req.request_key)
 
-            if msg is None or len(msg) == 0:
-                logger.warning("Worker %s: Received empty payload, ignoring", self.gpu_id)
-                continue
-
-            # Route message based on type
-            if isinstance(msg, dict) and msg.get("type") == "rpc":
+            if output.finished:
+                finished_req_id = self._req_debug_id(self._current_req)
+                finished_step = self._req_step_index(self._current_req)
+                status = "error" if output.error else "ok"
+                print(
+                    f"[DiffusionFinish][{self._now_str()}][rank={self.gpu_id}] "
+                    f"req_id={finished_req_id} status={status} step={finished_step}",
+                    flush=True,
+                )
                 try:
-                    result, should_reply = self.execute_rpc(msg)
-                    if should_reply:
-                        self.return_result(result)
-                except Exception as e:
-                    logger.error(f"Error processing RPC: {e}", exc_info=True)
-                    if self.result_mq is not None:
-                        self.return_result(DiffusionOutput(error=str(e)))
-
-            elif isinstance(msg, dict) and msg.get("type") == "shutdown":
-                logger.info("Worker %s: Received shutdown message", self.gpu_id)
-                self._running = False
-                continue
-
-            else:
-                # Handle generation request
-                try:
-                    output = self.worker.execute_model(msg, self.od_config)
-                except Exception as e:
-                    logger.error(
-                        f"Error executing forward in event loop: {e}",
-                        exc_info=True,
+                    self.return_result(
+                        {
+                            "type": "generation_result",
+                            "request_key": self._current_req.request_key,
+                            "output": output,
+                        }
                     )
-                    output = DiffusionOutput(error=str(e))
-
-                try:
-                    self.return_result(output)
                 except zmq.ZMQError as e:
-                    logger.error(f"ZMQ error sending reply: {e}")
-                    continue
+                    logger.error("ZMQ error sending reply: %s", e)
+                self._current_req = self._schedule_next_after_finish()
+                continue
 
         logger.info("event loop terminated.")
         try:
