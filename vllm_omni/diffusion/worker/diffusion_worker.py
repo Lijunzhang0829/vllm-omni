@@ -389,6 +389,8 @@ class WorkerProc:
         return self.mq.dequeue(timeout=timeout, indefinite=timeout is None)
 
     def _supports_step_preemption(self) -> bool:
+        if getattr(self.od_config, "disable_diffusion_preemption", False):
+            return False
         model_cls_name = self.od_config.model_class_name or ""
         return model_cls_name.startswith("QwenImage")
 

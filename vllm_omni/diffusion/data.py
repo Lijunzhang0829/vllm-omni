@@ -439,6 +439,9 @@ class OmniDiffusionConfig:
 
     log_level: str = "info"
 
+    # Diffusion scheduling behavior
+    disable_diffusion_preemption: bool = False
+
     # Omni configuration (injected from stage config)
     omni_kv_config: dict[str, Any] = field(default_factory=dict)
 

@@ -321,6 +321,11 @@ class OmniServeCommand(CLISubcommand):
             type=int,
             help="The max size of generate image (height * width).",
         )
+        omni_config_group.add_argument(
+            "--disable-diffusion-preemption",
+            action="store_true",
+            help="Disable step-level diffusion preemption for models that support it.",
+        )
 
         # TTS-specific parameters
         omni_config_group.add_argument(
