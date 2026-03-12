@@ -250,6 +250,14 @@ class RankGenerator:
                 ranks.append(group)
             return ranks
 
+        # Standalone HSDP special case:
+        # the orthogonal world excludes the fs dimension, so when all other
+        # parallel sizes are 1 we still need per-rank singleton groups for the
+        # non-FS dimensions. Otherwise only rank 0 is covered and non-zero
+        # ranks fail group initialization.
+        if self.world_size == 1 and self.fs > 1:
+            return [[i + self.rank_offset] for i in range(self.fs)]
+
         mask = self.get_mask(self.order, token)
         ranks = generate_masked_orthogonal_rank_groups(self.world_size, self.ordered_size, mask)
         if self.rank_offset > 0:
