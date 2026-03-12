@@ -243,6 +243,8 @@ class RankGenerator:
         if independent_ranks and token == "fs":
             # FS groups divide world into groups of size fs
             # e.g., world_size=8, fs=4 -> [[0,1,2,3], [4,5,6,7]]
+            if self.world_size == 1 and self.fs > 1:
+                return [list(range(self.rank_offset, self.rank_offset + self.fs))]
             ranks = []
             num_groups = self.world_size // self.fs
             for i in range(num_groups):
