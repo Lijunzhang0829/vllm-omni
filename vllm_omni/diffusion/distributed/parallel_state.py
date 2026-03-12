@@ -567,6 +567,10 @@ def set_seq_parallel_pg(
           slice using offsets of size sp_size.
     """
     sp_size = sp_ring_degree * sp_ulysses_degree
+    if sp_group_ranks is not None and world_size == 1 and sp_size == 1 and len(sp_group_ranks) > 1:
+        # Standalone HSDP creates singleton SP groups for each FS rank even
+        # though the orthogonal DiT world excludes the fs dimension.
+        world_size = len(sp_group_ranks)
     dp_size = world_size // sp_size
 
     assert world_size % sp_size == 0, f"world_size {world_size} % sp_size {sp_ulysses_degree} == 0"
