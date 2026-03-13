@@ -1562,6 +1562,8 @@ def output_strip(r_output: RequestOutput | OmniRequestOutput, final_output: bool
 
     # check multimodal data is required by stage output config.
     if final_output and final_output_type != "text":
+        if isinstance(r_output, OmniRequestOutput):
+            return _strip_final_diffusion_output(r_output, final_output_type)
         return r_output
 
     # If the request has already finished, should not be altered.
@@ -1579,3 +1581,44 @@ def output_strip(r_output: RequestOutput | OmniRequestOutput, final_output: bool
                 out.multimodal_output = {}
 
     return r_output
+
+
+def _strip_final_diffusion_output(r_output: OmniRequestOutput, final_output_type: str | None) -> OmniRequestOutput:
+    """Build a lean final diffusion payload for IPC.
+
+    Final diffusion serving only needs the generated media payload and request
+    metadata. Keeping nested request_output/prompt/latents around can retain
+    large tensors and slow down serialization on NPU paths.
+    """
+    return OmniRequestOutput(
+        request_id=r_output.request_id,
+        finished=r_output.finished,
+        final_output_type=final_output_type or r_output.final_output_type,
+        images=_sanitize_ipc_payload(r_output.images),
+        prompt=None,
+        latents=None,
+        metrics=dict(r_output.metrics or {}),
+        _multimodal_output=_sanitize_ipc_payload(r_output.multimodal_output),
+    )
+
+
+def _sanitize_ipc_payload(payload: Any) -> Any:
+    """Convert tensors to CPU-backed payloads before stage IPC."""
+    try:
+        import numpy as np
+        import torch
+    except Exception:
+        np = None  # type: ignore[assignment]
+        torch = None  # type: ignore[assignment]
+
+    if torch is not None and isinstance(payload, torch.Tensor):
+        return payload.detach().contiguous().cpu()
+    if np is not None and isinstance(payload, np.ndarray):
+        return np.ascontiguousarray(payload)
+    if isinstance(payload, list):
+        return [_sanitize_ipc_payload(item) for item in payload]
+    if isinstance(payload, tuple):
+        return tuple(_sanitize_ipc_payload(item) for item in payload)
+    if isinstance(payload, dict):
+        return {key: _sanitize_ipc_payload(value) for key, value in payload.items()}
+    return payload
