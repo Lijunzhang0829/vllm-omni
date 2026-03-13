@@ -9,12 +9,16 @@ from __future__ import annotations
 import base64
 import os
 import tempfile
+import time
 from io import BytesIO
 from typing import Any
 
 import numpy as np
 import torch
 from PIL import Image
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 
 def decode_input_reference(input_reference: str | None, input_reference_bytes: bytes | None) -> Image.Image | None:
@@ -143,17 +147,36 @@ def encode_video_base64(video: Any, fps: int) -> str:
     except ImportError as exc:  # pragma: no cover - optional dependency
         raise ImportError("diffusers is required for export_to_video.") from exc
 
+    normalize_start = time.perf_counter()
     frames = _coerce_video_to_frames(video)
     if not frames:
         raise ValueError("No frames found to encode.")
+    logger.info(
+        "Video encoding: normalized %d frame(s) in %.2fs",
+        len(frames),
+        time.perf_counter() - normalize_start,
+    )
 
     tmp_file = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
     tmp_file.close()
     try:
+        export_start = time.perf_counter()
         export_to_video(frames, tmp_file.name, fps=fps)
+        logger.info(
+            "Video encoding: export_to_video wrote %s in %.2fs",
+            tmp_file.name,
+            time.perf_counter() - export_start,
+        )
+        read_start = time.perf_counter()
         with open(tmp_file.name, "rb") as f:
             video_bytes = f.read()
-        return base64.b64encode(video_bytes).decode("utf-8")
+        encoded = base64.b64encode(video_bytes).decode("utf-8")
+        logger.info(
+            "Video encoding: read %.2f MiB and base64-encoded in %.2fs",
+            len(video_bytes) / (1024 * 1024),
+            time.perf_counter() - read_start,
+        )
+        return encoded
     finally:
         try:
             os.remove(tmp_file.name)

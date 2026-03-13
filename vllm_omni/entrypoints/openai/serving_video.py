@@ -134,11 +134,32 @@ class OmniOpenAIServingVideo:
             gen_params.seed,
         )
 
+        generation_start = time.perf_counter()
         result = await self._run_generation(prompt, gen_params, request_id, raw_request)
+        logger.info(
+            "Video generation completed for request %s in %.2fs",
+            request_id,
+            time.perf_counter() - generation_start,
+        )
+
+        extract_start = time.perf_counter()
         videos = self._extract_video_outputs(result)
+        logger.info(
+            "Extracted %d video payload(s) for request %s in %.2fs",
+            len(videos),
+            request_id,
+            time.perf_counter() - extract_start,
+        )
         output_fps = fps or 24
 
+        encode_start = time.perf_counter()
         video_data = [VideoData(b64_json=encode_video_base64(video, fps=output_fps)) for video in videos]
+        logger.info(
+            "Encoded %d video payload(s) for request %s in %.2fs",
+            len(video_data),
+            request_id,
+            time.perf_counter() - encode_start,
+        )
         return VideoGenerationResponse(created=int(time.time()), data=video_data)
 
     def _resolve_model_name(self, raw_request: Request | None) -> str | None:
