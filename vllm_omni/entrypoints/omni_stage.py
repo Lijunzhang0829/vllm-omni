@@ -19,6 +19,7 @@ from collections.abc import Sequence
 from contextlib import contextmanager
 from dataclasses import fields
 from typing import Any, Literal, cast
+from urllib.parse import urlparse
 
 from vllm import PromptType, RequestOutput
 from vllm.inputs import TextPrompt
@@ -60,6 +61,29 @@ from vllm_omni.metrics import count_tokens_from_outputs
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
+
+
+def _zmq_endpoint_is_local(endpoint: str) -> bool:
+    """Return True when a ZMQ endpoint stays on the local host.
+
+    For local ZMQ transports, we can safely pass large payloads through SHM and
+    only send the SHM metadata through ZMQ. For remote TCP transports, SHM is
+    not visible cross-host and must remain disabled.
+    """
+    if endpoint.startswith(("ipc://", "inproc://")):
+        return True
+    if endpoint.startswith("tcp://"):
+        parsed = urlparse(endpoint)
+        host = parsed.hostname
+        return host in {"127.0.0.1", "localhost", "::1"}
+    return False
+
+
+def _should_disable_shm_for_zmq(in_endpoint: str | None, out_endpoint: str | None) -> bool:
+    endpoints = [endpoint for endpoint in (in_endpoint, out_endpoint) if endpoint is not None]
+    if not endpoints:
+        return False
+    return not all(_zmq_endpoint_is_local(endpoint) for endpoint in endpoints)
 
 
 @contextmanager
@@ -718,17 +742,26 @@ def _stage_worker(
     # Resolve ZMQ queue endpoints if needed
     zmq_ctx = None
     if isinstance(in_q, str) or isinstance(out_q, str):
+        in_endpoint = in_q if isinstance(in_q, str) else None
+        out_endpoint = out_q if isinstance(out_q, str) else None
         zmq_ctx = zmq.Context()
         if isinstance(in_q, str):
             in_q = create_zmq_queue(zmq_ctx, in_q, zmq.PULL)
         if isinstance(out_q, str):
             out_q = create_zmq_queue(zmq_ctx, out_q, zmq.PUSH)
-        # When using ZMQ (cross-node IPC), disable SHM so data is sent inline.
-        shm_threshold_bytes = sys.maxsize
-        logger.info(
-            "[Stage-%s] ZMQ transport detected; disabling SHM IPC (shm_threshold_bytes set to maxsize)",
-            stage_id,
-        )
+        if _should_disable_shm_for_zmq(in_endpoint, out_endpoint):
+            # Cross-host ZMQ cannot dereference local SHM handles.
+            shm_threshold_bytes = sys.maxsize
+            logger.info(
+                "[Stage-%s] Remote ZMQ transport detected; disabling SHM IPC (shm_threshold_bytes set to maxsize)",
+                stage_id,
+            )
+        else:
+            logger.info(
+                "[Stage-%s] Local ZMQ transport detected; keeping SHM IPC enabled (shm_threshold_bytes=%s)",
+                stage_id,
+                shm_threshold_bytes,
+            )
 
     # Aggregates for running average
     _agg_total_tokens = 0
@@ -1125,17 +1158,26 @@ async def _stage_worker_async(
     # Resolve ZMQ queue endpoints if needed
     zmq_ctx = None
     if isinstance(in_q, str) or isinstance(out_q, str):
+        in_endpoint = in_q if isinstance(in_q, str) else None
+        out_endpoint = out_q if isinstance(out_q, str) else None
         zmq_ctx = zmq.Context()
         if isinstance(in_q, str):
             in_q = create_zmq_queue(zmq_ctx, in_q, zmq.PULL)
         if isinstance(out_q, str):
             out_q = create_zmq_queue(zmq_ctx, out_q, zmq.PUSH)
-        # When using ZMQ (cross-node IPC), disable SHM so data is sent inline.
-        shm_threshold_bytes = sys.maxsize
-        logger.info(
-            "[Stage-%s] ZMQ transport detected; disabling SHM IPC (shm_threshold_bytes set to maxsize)",
-            stage_id,
-        )
+        if _should_disable_shm_for_zmq(in_endpoint, out_endpoint):
+            # Cross-host ZMQ cannot dereference local SHM handles.
+            shm_threshold_bytes = sys.maxsize
+            logger.info(
+                "[Stage-%s] Remote ZMQ transport detected; disabling SHM IPC (shm_threshold_bytes set to maxsize)",
+                stage_id,
+            )
+        else:
+            logger.info(
+                "[Stage-%s] Local ZMQ transport detected; keeping SHM IPC enabled (shm_threshold_bytes=%s)",
+                stage_id,
+                shm_threshold_bytes,
+            )
 
     # Aggregates for running average
     _agg_total_tokens = 0
