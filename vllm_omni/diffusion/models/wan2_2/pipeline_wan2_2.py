@@ -324,6 +324,39 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin):
     def current_timestep(self):
         return self._current_timestep
 
+    def _snapshot_scheduler_state(self) -> dict[str, Any]:
+        """Capture per-request scheduler state for step-level preemption resume."""
+        return {
+            "model_outputs": list(self.scheduler.model_outputs),
+            "timestep_list": list(self.scheduler.timestep_list),
+            "lower_order_nums": int(self.scheduler.lower_order_nums),
+            "last_sample": self.scheduler.last_sample,
+            "step_index": self.scheduler.step_index,
+            "begin_index": self.scheduler.begin_index,
+            "this_order": int(self.scheduler.this_order),
+        }
+
+    def _restore_scheduler_state(self, scheduler_state: dict[str, Any] | None) -> None:
+        """Restore per-request scheduler state after set_timesteps resets internals."""
+        if not scheduler_state:
+            return
+
+        solver_order = int(self.scheduler.config.solver_order)
+        model_outputs = list(scheduler_state.get("model_outputs") or [])
+        timestep_list = list(scheduler_state.get("timestep_list") or [])
+        if len(model_outputs) < solver_order:
+            model_outputs.extend([None] * (solver_order - len(model_outputs)))
+        if len(timestep_list) < solver_order:
+            timestep_list.extend([None] * (solver_order - len(timestep_list)))
+
+        self.scheduler.model_outputs = model_outputs[:solver_order]
+        self.scheduler.timestep_list = timestep_list[:solver_order]
+        self.scheduler.lower_order_nums = int(scheduler_state.get("lower_order_nums", 0))
+        self.scheduler.last_sample = scheduler_state.get("last_sample")
+        self.scheduler.this_order = int(scheduler_state.get("this_order", 1))
+        self.scheduler._step_index = scheduler_state.get("step_index")
+        self.scheduler._begin_index = scheduler_state.get("begin_index")
+
     def forward(
         self,
         req: OmniDiffusionRequest,
@@ -561,12 +594,14 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin):
                 "num_frames": num_frames,
                 "attention_kwargs": attention_kwargs or {},
                 "output_type": output_type,
+                "scheduler_state": self._snapshot_scheduler_state(),
             }
             req.execution_state = OmniDiffusionExecutionState(step_index=0, payload=state)
         else:
             prompt_embeds = state["prompt_embeds"]
             negative_prompt_embeds = state["negative_prompt_embeds"]
             self.scheduler.set_timesteps(state["num_steps"], device=device)
+            self._restore_scheduler_state(state.get("scheduler_state"))
             timesteps = self.scheduler.timesteps
             state["timesteps"] = timesteps
             self._num_timesteps = len(timesteps)
@@ -676,6 +711,7 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin):
             latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
 
         state["latents"] = latents
+        state["scheduler_state"] = self._snapshot_scheduler_state()
         if req.execution_state is None:
             req.execution_state = OmniDiffusionExecutionState()
         req.execution_state.payload = state
