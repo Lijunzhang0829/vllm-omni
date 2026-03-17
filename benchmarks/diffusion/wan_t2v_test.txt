@@ -1,0 +1,3 @@
+Request(request_id='req-big-0001', prompt='a cinematic city skyline at dawn', width=512, height=512, num_frames=33, num_inference_steps=24)
+Request(request_id='req-small-0002', prompt='a cup of coffee on wooden table', width=512, height=512, num_frames=17, num_inference_steps=16)
+Request(request_id='req-big-0003', prompt='a futuristic street market in rain', width=512, height=512, num_frames=33, num_inference_steps=24)
