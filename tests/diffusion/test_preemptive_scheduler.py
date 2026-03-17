@@ -6,6 +6,7 @@ from threading import Lock
 from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.scheduler import Scheduler
+from vllm_omni.diffusion.worker.scheduling_policy import estimate_remaining_cost
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 
@@ -63,3 +64,20 @@ def test_scheduler_matches_results_by_request_key():
 
     assert first is out1
     assert second is out2
+
+
+def test_estimate_remaining_cost_accounts_for_video_frames():
+    req = OmniDiffusionRequest(
+        prompts=["test"],
+        sampling_params=OmniDiffusionSamplingParams(
+            width=640,
+            height=640,
+            num_frames=33,
+            num_inference_steps=24,
+        ),
+        request_ids=["req-video"],
+    )
+
+    cost = estimate_remaining_cost(req)
+
+    assert cost == float((24 - 0) * 640 * 640 * 33)

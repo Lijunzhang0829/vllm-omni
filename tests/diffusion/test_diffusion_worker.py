@@ -294,3 +294,24 @@ class TestDiffusionWorkerWakeUp:
         mock_buffer2.data.copy_.assert_not_called()
 
         assert result is True
+
+
+class TestDiffusionWorkerPreemptionSupport:
+    """Test model-specific step preemption guardrails."""
+
+    def test_supports_step_preemption_only_for_resume_safe_pipelines(self, mocker: MockerFixture):
+        worker = object.__new__(DiffusionWorker)
+        worker.od_config = mocker.Mock()
+        worker.od_config.disable_diffusion_preemption = False
+
+        worker.od_config.model_class_name = "Wan22Pipeline"
+        assert worker._supports_step_preemption() is True
+
+        worker.od_config.model_class_name = "Wan22I2VPipeline"
+        assert worker._supports_step_preemption() is False
+
+        worker.od_config.model_class_name = "Wan22TI2VPipeline"
+        assert worker._supports_step_preemption() is False
+
+        worker.od_config.model_class_name = "QwenImagePipeline"
+        assert worker._supports_step_preemption() is True

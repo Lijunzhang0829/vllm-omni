@@ -22,13 +22,14 @@ def req_step_index(req: OmniDiffusionRequest) -> int:
 
 
 def estimate_remaining_cost(req: OmniDiffusionRequest) -> float:
-    """Simple estimator: remaining_steps * width * height."""
+    """Simple estimator: remaining_steps * width * height * frames."""
     total_steps = int(req.sampling_params.num_inference_steps or 0)
     done_steps = req_step_index(req)
     remaining_steps = max(0, total_steps - done_steps)
     width = int(req.sampling_params.width or 1024)
     height = int(req.sampling_params.height or 1024)
-    return float(remaining_steps * width * height)
+    num_frames = int(req.sampling_params.num_frames or 1)
+    return float(remaining_steps * width * height * num_frames)
 
 
 @dataclass
@@ -147,4 +148,3 @@ class TargetFreeGlobalReorderPolicy:
                 continue
             return req
         return None
-

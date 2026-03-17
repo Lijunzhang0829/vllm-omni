@@ -392,12 +392,10 @@ class WorkerProc:
         if getattr(self.od_config, "disable_diffusion_preemption", False):
             return False
         model_cls_name = self.od_config.model_class_name or ""
+        # Only enable step preemption for pipelines that persist enough
+        # per-request execution state to resume safely after interleaving.
         return model_cls_name.startswith("QwenImage") or model_cls_name in {
-            "WanPipeline",
-            "WanImageToVideoPipeline",
             "Wan22Pipeline",
-            "Wan22I2VPipeline",
-            "Wan22TI2VPipeline",
         }
 
     def _enqueue_generation_req(self, req: OmniDiffusionRequest) -> None:
