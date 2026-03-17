@@ -6,7 +6,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import Wan22Pipeline
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -71,3 +73,16 @@ def test_wan22_scheduler_state_restore_handles_missing_history():
     assert pipeline.scheduler.lower_order_nums == 1
     assert pipeline.scheduler._step_index == 4
     assert pipeline.scheduler.this_order == 1
+
+
+def test_wan22_request_flow_shift_overrides_engine_default():
+    pipeline = object.__new__(Wan22Pipeline)
+    pipeline.od_config = SimpleNamespace(flow_shift=5.0)
+
+    req = OmniDiffusionRequest(
+        prompts=["test"],
+        sampling_params=OmniDiffusionSamplingParams(extra_args={"flow_shift": 12.0}),
+        request_ids=["req-flow-shift"],
+    )
+
+    assert pipeline._resolve_flow_shift(req) == 12.0

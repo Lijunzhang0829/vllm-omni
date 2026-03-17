@@ -323,7 +323,10 @@ class Wan22TI2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin):
         batch_size = prompt_embeds.shape[0]
 
         # Timesteps
-        self.scheduler.set_timesteps(num_steps, device=device)
+        flow_shift = req.sampling_params.extra_args.get("flow_shift")
+        if flow_shift is None:
+            flow_shift = self.od_config.flow_shift if self.od_config.flow_shift is not None else 5.0
+        self.scheduler.set_timesteps(num_steps, device=device, shift=float(flow_shift))
         timesteps = self.scheduler.timesteps
         self._num_timesteps = len(timesteps)
 

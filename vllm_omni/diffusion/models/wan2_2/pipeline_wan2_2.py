@@ -357,6 +357,14 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin):
         self.scheduler._step_index = scheduler_state.get("step_index")
         self.scheduler._begin_index = scheduler_state.get("begin_index")
 
+    def _resolve_flow_shift(self, req: OmniDiffusionRequest) -> float:
+        request_flow_shift = req.sampling_params.extra_args.get("flow_shift")
+        if request_flow_shift is not None:
+            return float(request_flow_shift)
+        if self.od_config.flow_shift is not None:
+            return float(self.od_config.flow_shift)
+        return 5.0
+
     def forward(
         self,
         req: OmniDiffusionRequest,
@@ -479,12 +487,13 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin):
                     )
 
             # Timesteps
-            self.scheduler.set_timesteps(num_steps, device=device)
+            flow_shift = self._resolve_flow_shift(req)
+            self.scheduler.set_timesteps(num_steps, device=device, shift=flow_shift)
             timesteps = self.scheduler.timesteps
             self._num_timesteps = len(timesteps)
             boundary_timestep = None
-            if self.boundary_ratio is not None:
-                boundary_timestep = self.boundary_ratio * self.scheduler.config.num_train_timesteps
+            if boundary_ratio is not None:
+                boundary_timestep = boundary_ratio * self.scheduler.config.num_train_timesteps
 
             # Handle I2V mode when expand_timesteps=True and image is provided
             multi_modal_data = req.prompts[0].get("multi_modal_data", {}) if not isinstance(req.prompts[0], str) else None
@@ -594,13 +603,14 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin):
                 "num_frames": num_frames,
                 "attention_kwargs": attention_kwargs or {},
                 "output_type": output_type,
+                "flow_shift": flow_shift,
                 "scheduler_state": self._snapshot_scheduler_state(),
             }
             req.execution_state = OmniDiffusionExecutionState(step_index=0, payload=state)
         else:
             prompt_embeds = state["prompt_embeds"]
             negative_prompt_embeds = state["negative_prompt_embeds"]
-            self.scheduler.set_timesteps(state["num_steps"], device=device)
+            self.scheduler.set_timesteps(state["num_steps"], device=device, shift=float(state.get("flow_shift", 5.0)))
             self._restore_scheduler_state(state.get("scheduler_state"))
             timesteps = self.scheduler.timesteps
             state["timesteps"] = timesteps
