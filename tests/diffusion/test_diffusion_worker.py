@@ -405,3 +405,17 @@ class TestWorkerProcResultPreparation:
 
         worker_proc.control_pipe.send.assert_called_once()
         worker_proc.result_mq.enqueue.assert_not_called()
+
+    def test_nonzero_rank_generation_result_does_not_use_control_pipe(self, mocker: MockerFixture):
+        worker_proc = object.__new__(WorkerProc)
+        worker_proc.gpu_id = 1
+        worker_proc.control_pipe = mocker.Mock()
+        worker_proc.result_mq = None
+
+        assert worker_proc._should_route_result_via_control_pipe(
+            {
+                "type": "generation_result",
+                "request_key": "req-4",
+                "output": DiffusionOutput(request_key="req-4"),
+            }
+        ) is False

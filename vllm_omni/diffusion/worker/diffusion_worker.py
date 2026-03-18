@@ -468,10 +468,13 @@ class WorkerProc:
         return output
 
     @staticmethod
-    def _should_route_result_via_control_pipe(output: Any) -> bool:
+    def _is_generation_result(output: Any) -> bool:
         if isinstance(output, dict):
             return output.get("type") == "generation_result"
         return isinstance(output, DiffusionOutput) and output.request_key is not None
+
+    def _should_route_result_via_control_pipe(self, output: Any) -> bool:
+        return self.gpu_id == 0 and self._is_generation_result(output)
 
     def _report_request_error_to_parent(self, request_key: str, error: str) -> None:
         try:
