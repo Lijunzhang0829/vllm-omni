@@ -326,6 +326,15 @@ class OmniServeCommand(CLISubcommand):
             action="store_true",
             help="Disable step-level diffusion preemption for models that support it.",
         )
+        omni_config_group.add_argument(
+            "--diffusion-preemption-min-free-memory-gb",
+            type=float,
+            default=None,
+            help=(
+                "Skip arrival-time diffusion preemption when the synchronized minimum free device memory "
+                "across workers falls below this threshold in GiB. Defaults to 1.0 on NPU and 0.0 elsewhere."
+            ),
+        )
 
         # TTS-specific parameters
         omni_config_group.add_argument(

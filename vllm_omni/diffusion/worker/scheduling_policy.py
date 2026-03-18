@@ -55,6 +55,9 @@ class DiffusionSchedulingPolicy(Protocol):
     def on_request_finish(self) -> OmniDiffusionRequest | None:
         ...
 
+    def defer_request(self, req: OmniDiffusionRequest) -> None:
+        ...
+
     def abort_request_ids(self, request_ids: list[str]) -> None:
         ...
 
@@ -112,6 +115,9 @@ class TargetFreeGlobalReorderPolicy:
 
     def on_request_finish(self) -> OmniDiffusionRequest | None:
         return self._pop_best_waiting_request()
+
+    def defer_request(self, req: OmniDiffusionRequest) -> None:
+        self._queue_request(req)
 
     def abort_request_ids(self, request_ids: list[str]) -> None:
         for rid in request_ids:
