@@ -197,68 +197,56 @@ async def async_request_v1_videos(
     session: aiohttp.ClientSession,
     pbar: tqdm | None = None,
 ) -> RequestFuncOutput:
-    """Send request to vLLM-Omni's /v1/videos endpoint."""
     output = RequestFuncOutput()
     output.start_time = time.perf_counter()
 
+    files = dict(input.extra_body)
+    if input.prompt:
+        files.setdefault("prompt", input.prompt)
+    if input.width and input.height:
+        files.setdefault("height", input.height)
+        files.setdefault("width", input.width)
+    if input.num_frames:
+        files.setdefault("num_frames", input.num_frames)
+    if input.num_inference_steps:
+        files.setdefault("num_inference_steps", input.num_inference_steps)
+    if input.seed is not None:
+        files.setdefault("seed", input.seed)
+    if input.fps:
+        files.setdefault("fps", input.fps)
+
     form = aiohttp.FormData()
-    form.add_field("model", input.model)
-    form.add_field("prompt", input.prompt)
+    for k, v in files.items():
+        form.add_field(k, str(v))
 
-    scalar_fields = {
-        "width": input.width,
-        "height": input.height,
-        "num_frames": input.num_frames,
-        "num_inference_steps": input.num_inference_steps,
-        "seed": input.seed,
-        "fps": input.fps,
-    }
-    for key, value in scalar_fields.items():
-        if value is not None:
-            form.add_field(key, str(value))
-
-    for key, value in input.extra_body.items():
-        if value is not None:
-            form.add_field(key, str(value))
-
+    image_file = None
     if input.image_paths and len(input.image_paths) > 0:
         image_path = input.image_paths[0]
-        if not os.path.exists(image_path):
-            output.error = f"Image file not found: {image_path}"
-            output.success = False
-            if pbar:
-                pbar.update(1)
-            return output
-        with open(image_path, "rb") as image_file:
-            form.add_field(
-                "input_reference",
-                image_file,
-                filename=os.path.basename(image_path),
-                content_type=_guess_mime_type(image_path),
-            )
-            try:
-                async with session.post(input.api_url, data=form) as response:
-                    if response.status == 200:
-                        output.response_body = await response.json()
-                        output.success = True
-                    else:
-                        output.error = f"HTTP {response.status}: {await response.text()}"
-                        output.success = False
-            except Exception as e:
-                output.error = str(e)
+        image_file = open(image_path, "rb")
+        form.add_field(
+            "input_reference",
+            image_file,
+            filename=os.path.basename(image_path),
+            content_type="application/octet-stream",
+        )
+
+    try:
+        async with session.post(input.api_url, data=form) as response:
+            if response.status == 200:
+                resp_json = await response.json()
+                output.response_body = resp_json
+                output.success = True
+                if "peak_memory_mb" in resp_json:
+                    output.peak_memory_mb = resp_json["peak_memory_mb"]
+            else:
+                output.error = f"HTTP {response.status}: {await response.text()}"
                 output.success = False
-    else:
-        try:
-            async with session.post(input.api_url, data=form) as response:
-                if response.status == 200:
-                    output.response_body = await response.json()
-                    output.success = True
-                else:
-                    output.error = f"HTTP {response.status}: {await response.text()}"
-                    output.success = False
-        except Exception as e:
-            output.error = str(e)
-            output.success = False
+    except Exception as e:
+        output.error = str(e)
+        output.success = False
+    finally:
+        if image_file is not None:
+            image_file.close()
 
     output.latency = time.perf_counter() - output.start_time
 
@@ -273,11 +261,5 @@ async def async_request_v1_videos(
 backends_function_mapping = {
     "vllm-omni": (async_request_chat_completions, "/v1/chat/completions"),
     "openai": (async_request_openai_images, "/v1/images/generations"),
+    "v1/videos": (async_request_v1_videos, "/v1/videos"),
 }
-
-
-def get_backend_request_config(backend: str, task: str) -> tuple[Any, str]:
-    """Resolve request function and endpoint by backend and task."""
-    if backend == "vllm-omni" and task in {"t2v", "i2v", "ti2v"}:
-        return async_request_v1_videos, "/v1/videos"
-    return backends_function_mapping[backend]
