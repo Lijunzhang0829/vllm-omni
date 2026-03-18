@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import threading
+import time
 
 import zmq
 from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
@@ -79,6 +80,12 @@ class Scheduler:
                         self._reader_error = RuntimeError("Invalid generation result from worker")
                         self._result_cv.notify_all()
                     return
+                logger.info(
+                    "Scheduler received generation result: request_key=%s finished=%s error=%s",
+                    key,
+                    output.finished,
+                    bool(output.error),
+                )
                 with self._result_cv:
                     self._pending_results[key] = output
                     self._result_cv.notify_all()
@@ -92,6 +99,12 @@ class Scheduler:
                         self._reader_error = RuntimeError("Legacy DiffusionOutput missing request_key")
                         self._result_cv.notify_all()
                     return
+                logger.info(
+                    "Scheduler received legacy diffusion result: request_key=%s finished=%s error=%s",
+                    key,
+                    message.finished,
+                    bool(message.error),
+                )
                 with self._result_cv:
                     self._pending_results[key] = message
                     self._result_cv.notify_all()
@@ -115,13 +128,25 @@ class Scheduler:
 
             # Broadcast generation request to all workers.
             self.mq.enqueue(request)
+            logger.info("Scheduler enqueued generation request: request_key=%s", request_key)
 
+            start_time = time.monotonic()
+            next_wait_log = start_time + 5.0
             with self._result_cv:
                 while True:
                     if self._reader_error is not None:
                         raise self._reader_error
                     if request_key in self._pending_results:
+                        logger.info("Scheduler returning generation result: request_key=%s", request_key)
                         return self._pending_results.pop(request_key)
+                    now = time.monotonic()
+                    if now >= next_wait_log:
+                        logger.warning(
+                            "Scheduler still waiting for generation result: request_key=%s elapsed=%.2fs",
+                            request_key,
+                            now - start_time,
+                        )
+                        next_wait_log = now + 5.0
                     self._result_cv.wait(timeout=0.1)
         except zmq.error.Again:
             logger.error("Timeout waiting for response from scheduler.")

@@ -384,7 +384,26 @@ class WorkerProc:
     def return_result(self, output: DiffusionOutput):
         """Reply to client, only on rank 0."""
         if self.result_mq is not None:
+            request_key = None
+            result_type = type(output).__name__
+            if isinstance(output, dict):
+                request_key = output.get("request_key")
+                result_type = output.get("type", result_type)
+            elif isinstance(output, DiffusionOutput):
+                request_key = output.request_key
+            logger.info(
+                "Worker %s sending result to scheduler: type=%s request_key=%s",
+                self.gpu_id,
+                result_type,
+                request_key,
+            )
             self.result_mq.enqueue(output)
+            logger.info(
+                "Worker %s sent result to scheduler: type=%s request_key=%s",
+                self.gpu_id,
+                result_type,
+                request_key,
+            )
 
     def recv_message(self, timeout: float | None = None):
         """Receive messages from broadcast queue."""
