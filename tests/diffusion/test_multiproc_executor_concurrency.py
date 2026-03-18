@@ -230,6 +230,45 @@ class TestConcurrentAddReqVsCollectiveRpcBug:
         assert results["B"].error == "result_for_call_B"
 
 
+class TestWorkerErrorPropagation:
+    def test_worker_request_error_unblocks_scheduler(self):
+        with patch.object(MultiprocDiffusionExecutor, "_init_executor"):
+            executor = MultiprocDiffusionExecutor(Mock())
+
+        executor.scheduler = Mock(spec=Scheduler)
+        executor.abort = Mock()
+        executor._scheduler_pipe_readers = [Mock()]
+        executor._pipe_reader_stop = False
+
+        message = {
+            "status": "request_error",
+            "rank": 1,
+            "request_key": "req-1",
+            "error": "oom",
+        }
+        executor._scheduler_pipe_readers[0].recv.return_value = message
+
+        wait_calls = {"count": 0}
+
+        def _wait(_readers, timeout=None):
+            wait_calls["count"] += 1
+            if wait_calls["count"] == 1:
+                return executor._scheduler_pipe_readers
+            executor._pipe_reader_stop = True
+            return []
+
+        with patch("vllm_omni.diffusion.executor.multiproc_executor.mp.connection.wait", side_effect=_wait):
+            executor._worker_pipe_loop()
+
+        executor.scheduler.publish_result.assert_called_once()
+        publish_args = executor.scheduler.publish_result.call_args
+        assert publish_args.args[0] == "req-1"
+        assert isinstance(publish_args.args[1], DiffusionOutput)
+        assert publish_args.args[1].error == "oom"
+        assert publish_args.kwargs["source"] == "worker-rank-1"
+        executor.abort.assert_called_once_with("req-1")
+
+
 # ─────────────── backward-compatibility (serial) tests ────────────────────
 
 

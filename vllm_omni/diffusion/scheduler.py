@@ -54,6 +54,18 @@ class Scheduler:
         )
         self._reader_thread.start()
 
+    def publish_result(self, request_key: str, output: DiffusionOutput, source: str = "external") -> None:
+        with self._result_cv:
+            logger.info(
+                "Scheduler publishing result from %s: request_key=%s finished=%s error=%s",
+                source,
+                request_key,
+                output.finished,
+                bool(output.error),
+            )
+            self._pending_results[request_key] = output
+            self._result_cv.notify_all()
+
     def _result_reader_loop(self):
         while not self._stop_reader:
             try:

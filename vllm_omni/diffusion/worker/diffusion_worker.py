@@ -335,12 +335,14 @@ class WorkerProc:
         self,
         od_config: OmniDiffusionConfig,
         gpu_id: int,
+        control_pipe: mp.connection.Connection,
         broadcast_handle,
         worker_extension_cls: str | None = None,
         custom_pipeline_args: dict[str, Any] | None = None,
     ):
         self.od_config = od_config
         self.gpu_id = gpu_id
+        self.control_pipe = control_pipe
 
         # Inter-process Communication
         self.context = zmq.Context(io_threads=2)
@@ -403,6 +405,24 @@ class WorkerProc:
                 self.gpu_id,
                 result_type,
                 request_key,
+            )
+
+    def _report_request_error_to_parent(self, request_key: str, error: str) -> None:
+        try:
+            self.control_pipe.send(
+                {
+                    "status": "request_error",
+                    "rank": self.gpu_id,
+                    "request_key": request_key,
+                    "error": error,
+                }
+            )
+        except Exception as exc:
+            logger.warning(
+                "Worker %s failed to report request error for %s to parent: %s",
+                self.gpu_id,
+                request_key,
+                exc,
             )
 
     def recv_message(self, timeout: float | None = None):
@@ -709,6 +729,7 @@ class WorkerProc:
                     exc_info=True,
                 )
                 output = DiffusionOutput(error=str(e), finished=True, request_key=self._current_req.request_key)
+                self._report_request_error_to_parent(self._current_req.request_key, str(e))
 
             if output.finished:
                 finished_req_id = self._req_debug_id(self._current_req)
@@ -755,6 +776,7 @@ class WorkerProc:
         worker_proc = WorkerProc(
             od_config,
             gpu_id=rank,
+            control_pipe=pipe_writer,
             broadcast_handle=broadcast_handle,
             worker_extension_cls=worker_extension_cls,
             custom_pipeline_args=custom_pipeline_args,
