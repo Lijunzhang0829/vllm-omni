@@ -14,7 +14,8 @@ import pytest
 import torch
 from pytest_mock import MockerFixture
 
-from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker
+from vllm_omni.diffusion.data import DiffusionOutput
+from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker, WorkerProc
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -358,3 +359,27 @@ class TestDiffusionWorkerPreemptionMemorySync:
         call_args = all_reduce.call_args
         assert call_args.kwargs["group"] is world_group.cpu_group
         assert call_args.args[0].device.type == "cpu"
+
+
+class TestWorkerProcResultPreparation:
+    def test_prepare_result_for_scheduler_moves_tensors_to_cpu(self):
+        output = DiffusionOutput(
+            output=torch.randn(1, 2),
+            trajectory_timesteps=[torch.tensor([1])],
+            trajectory_latents=torch.randn(1, 2),
+            trajectory_decoded=[torch.randn(1, 2)],
+            request_key="req-1",
+        )
+
+        prepared = WorkerProc._prepare_result_for_scheduler(
+            {
+                "type": "generation_result",
+                "request_key": "req-1",
+                "output": output,
+            }
+        )
+
+        assert prepared["output"].output.device.type == "cpu"
+        assert prepared["output"].trajectory_timesteps[0].device.type == "cpu"
+        assert prepared["output"].trajectory_latents.device.type == "cpu"
+        assert prepared["output"].trajectory_decoded[0].device.type == "cpu"

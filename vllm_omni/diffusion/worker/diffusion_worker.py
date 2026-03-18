@@ -386,6 +386,7 @@ class WorkerProc:
     def return_result(self, output: DiffusionOutput):
         """Reply to client, only on rank 0."""
         if self.result_mq is not None:
+            output = self._prepare_result_for_scheduler(output)
             request_key = None
             result_type = type(output).__name__
             if isinstance(output, dict):
@@ -406,6 +407,41 @@ class WorkerProc:
                 result_type,
                 request_key,
             )
+
+    @staticmethod
+    def _tensor_tree_to_cpu(value: Any) -> Any:
+        if isinstance(value, torch.Tensor):
+            return value.detach().cpu()
+        if isinstance(value, list):
+            return [WorkerProc._tensor_tree_to_cpu(v) for v in value]
+        if isinstance(value, tuple):
+            return tuple(WorkerProc._tensor_tree_to_cpu(v) for v in value)
+        if isinstance(value, dict):
+            return {k: WorkerProc._tensor_tree_to_cpu(v) for k, v in value.items()}
+        return value
+
+    @classmethod
+    def _prepare_diffusion_output_for_scheduler(cls, output: DiffusionOutput) -> DiffusionOutput:
+        return DiffusionOutput(
+            output=cls._tensor_tree_to_cpu(output.output),
+            trajectory_timesteps=cls._tensor_tree_to_cpu(output.trajectory_timesteps),
+            trajectory_latents=cls._tensor_tree_to_cpu(output.trajectory_latents),
+            trajectory_decoded=cls._tensor_tree_to_cpu(output.trajectory_decoded),
+            error=output.error,
+            finished=output.finished,
+            request_key=output.request_key,
+            post_process_func=output.post_process_func,
+        )
+
+    @classmethod
+    def _prepare_result_for_scheduler(cls, output: Any) -> Any:
+        if isinstance(output, DiffusionOutput):
+            return cls._prepare_diffusion_output_for_scheduler(output)
+        if isinstance(output, dict) and isinstance(output.get("output"), DiffusionOutput):
+            prepared = dict(output)
+            prepared["output"] = cls._prepare_diffusion_output_for_scheduler(output["output"])
+            return prepared
+        return output
 
     def _report_request_error_to_parent(self, request_key: str, error: str) -> None:
         try:
