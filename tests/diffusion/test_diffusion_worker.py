@@ -318,3 +318,34 @@ class TestDiffusionWorkerPreemptionSupport:
 
         worker.od_config.model_class_name = "QwenImagePipeline"
         assert worker._supports_step_preemption() is True
+
+
+class TestDiffusionWorkerPreemptionMemorySync:
+    def test_npu_memory_sync_uses_cpu_group(self, mocker: MockerFixture):
+        worker = object.__new__(DiffusionWorker)
+        worker.worker = mocker.Mock()
+        worker.worker.device = torch.device("npu", 0)
+        worker.od_config = mocker.Mock()
+        worker.od_config.num_gpus = 4
+
+        mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.current_omni_platform.is_npu", return_value=True)
+        mocker.patch(
+            "vllm_omni.diffusion.worker.diffusion_worker.current_omni_platform.get_free_memory",
+            return_value=1234,
+        )
+        mocker.patch("torch.distributed.is_available", return_value=True)
+        mocker.patch("torch.distributed.is_initialized", return_value=True)
+
+        all_reduce = mocker.patch("torch.distributed.all_reduce")
+        world_group = mocker.Mock()
+        world_group.cpu_group = object()
+        world_group.device_group = object()
+        mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.get_world_group", return_value=world_group)
+
+        synced = worker._get_synced_min_free_memory_bytes()
+
+        assert synced == 1234
+        all_reduce.assert_called_once()
+        call_args = all_reduce.call_args
+        assert call_args.kwargs["group"] is world_group.cpu_group
+        assert call_args.args[0].device.type == "cpu"

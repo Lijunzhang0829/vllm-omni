@@ -32,6 +32,7 @@ from vllm_omni.diffusion.data import (
 )
 from vllm_omni.diffusion.distributed.parallel_state import (
     destroy_distributed_env,
+    get_world_group,
     init_distributed_environment,
     initialize_model_parallel,
 )
@@ -416,8 +417,25 @@ class WorkerProc:
         ):
             return int(free_bytes)
 
+        world_group = get_world_group()
+        if current_omni_platform.is_npu():
+            # HCCL may need a large device-side workspace even for tiny tensors.
+            # Use the CPU/gloo world group for this diagnostic MIN reduction so
+            # the low-memory check itself does not trigger an NPU OOM.
+            free_tensor = torch.tensor([int(free_bytes)], dtype=torch.int64)
+            torch.distributed.all_reduce(
+                free_tensor,
+                op=torch.distributed.ReduceOp.MIN,
+                group=world_group.cpu_group,
+            )
+            return int(free_tensor.item())
+
         free_tensor = torch.tensor([int(free_bytes)], device=self.worker.device, dtype=torch.int64)
-        torch.distributed.all_reduce(free_tensor, op=torch.distributed.ReduceOp.MIN)
+        torch.distributed.all_reduce(
+            free_tensor,
+            op=torch.distributed.ReduceOp.MIN,
+            group=world_group.device_group,
+        )
         return int(free_tensor.item())
 
     def _should_skip_preemption_due_to_memory(self) -> tuple[bool, int | None, int]:
