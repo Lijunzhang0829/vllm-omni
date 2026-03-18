@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import os
 import time
 import uuid
 from http import HTTPStatus
@@ -27,6 +29,10 @@ from vllm_omni.lora.utils import stable_lora_int_id
 
 logger = init_logger(__name__)
 
+_VIDEO_GENERATION_TIMEOUT_ENV = "VLLM_OMNI_VIDEO_GENERATION_TIMEOUT_S"
+_VIDEO_ENCODING_TIMEOUT_ENV = "VLLM_OMNI_VIDEO_ENCODING_TIMEOUT_S"
+_DEFAULT_VIDEO_ENCODING_TIMEOUT_S = 300.0
+
 
 class OmniOpenAIServingVideo:
     """OpenAI-style video generation handler for omni diffusion models."""
@@ -40,6 +46,104 @@ class OmniOpenAIServingVideo:
         self._engine_client = engine_client
         self._model_name = model_name
         self._stage_configs = stage_configs
+
+    @staticmethod
+    def _get_timeout_seconds(env_var: str, default: float | None = None) -> float | None:
+        raw_value = os.environ.get(env_var)
+        if raw_value is None or raw_value == "":
+            return default
+        try:
+            timeout_s = float(raw_value)
+        except ValueError:
+            logger.warning("Invalid %s=%r; ignoring timeout override.", env_var, raw_value)
+            return default
+        if timeout_s <= 0:
+            return None
+        return timeout_s
+
+    @staticmethod
+    def _timeout_detail(stage_name: str, request_id: str, timeout_s: float) -> str:
+        return f"Video request {request_id} timed out during {stage_name} after {timeout_s:.1f}s."
+
+    async def _run_generation_with_timeout(
+        self,
+        prompt: OmniTextPrompt,
+        gen_params: OmniDiffusionSamplingParams,
+        request_id: str,
+        raw_request: Request | None,
+    ) -> Any:
+        timeout_s = self._get_timeout_seconds(_VIDEO_GENERATION_TIMEOUT_ENV)
+        if timeout_s is None:
+            return await self._run_generation(prompt, gen_params, request_id, raw_request)
+
+        logger.info(
+            "Applying generation timeout %.2fs for video request %s via %s.",
+            timeout_s,
+            request_id,
+            _VIDEO_GENERATION_TIMEOUT_ENV,
+        )
+        try:
+            return await asyncio.wait_for(
+                self._run_generation(prompt, gen_params, request_id, raw_request),
+                timeout=timeout_s,
+            )
+        except asyncio.TimeoutError as exc:
+            logger.error(
+                "Video request %s timed out during generation after %.2fs.",
+                request_id,
+                timeout_s,
+            )
+            raise HTTPException(
+                status_code=HTTPStatus.GATEWAY_TIMEOUT.value,
+                detail=self._timeout_detail("generation", request_id, timeout_s),
+            ) from exc
+
+    async def _encode_video_data(self, video: Any, fps: int, request_id: str, video_index: int) -> VideoData:
+        start = time.perf_counter()
+        logger.info(
+            "Video encoding started for request %s item=%d fps=%d.",
+            request_id,
+            video_index,
+            fps,
+        )
+        encoded = await asyncio.to_thread(encode_video_base64, video, fps)
+        logger.info(
+            "Video encoding finished for request %s item=%d in %.2fs.",
+            request_id,
+            video_index,
+            time.perf_counter() - start,
+        )
+        return VideoData(b64_json=encoded)
+
+    async def _encode_videos(self, videos: list[Any], fps: int, request_id: str) -> list[VideoData]:
+        timeout_s = self._get_timeout_seconds(
+            _VIDEO_ENCODING_TIMEOUT_ENV,
+            default=_DEFAULT_VIDEO_ENCODING_TIMEOUT_S,
+        )
+        encode_tasks = [
+            self._encode_video_data(video, fps=fps, request_id=request_id, video_index=idx)
+            for idx, video in enumerate(videos)
+        ]
+        try:
+            if timeout_s is None:
+                return await asyncio.gather(*encode_tasks)
+            logger.info(
+                "Applying encoding timeout %.2fs for video request %s via %s.",
+                timeout_s,
+                request_id,
+                _VIDEO_ENCODING_TIMEOUT_ENV,
+            )
+            return await asyncio.wait_for(asyncio.gather(*encode_tasks), timeout=timeout_s)
+        except asyncio.TimeoutError as exc:
+            logger.error(
+                "Video request %s timed out during encoding after %.2fs.",
+                request_id,
+                timeout_s,
+            )
+            raise HTTPException(
+                status_code=HTTPStatus.GATEWAY_TIMEOUT.value,
+                detail=self._timeout_detail("encoding", request_id, timeout_s),
+            ) from exc
 
     @classmethod
     def for_diffusion(
@@ -135,7 +239,7 @@ class OmniOpenAIServingVideo:
         )
 
         generation_start = time.perf_counter()
-        result = await self._run_generation(prompt, gen_params, request_id, raw_request)
+        result = await self._run_generation_with_timeout(prompt, gen_params, request_id, raw_request)
         logger.info(
             "Video generation completed for request %s in %.2fs",
             request_id,
@@ -153,7 +257,7 @@ class OmniOpenAIServingVideo:
         output_fps = fps or 24
 
         encode_start = time.perf_counter()
-        video_data = [VideoData(b64_json=encode_video_base64(video, fps=output_fps)) for video in videos]
+        video_data = await self._encode_videos(videos, fps=output_fps, request_id=request_id)
         logger.info(
             "Encoded %d video payload(s) for request %s in %.2fs",
             len(video_data),

@@ -4,7 +4,9 @@
 Unit tests for OpenAI-compatible video generation endpoints.
 """
 
+import asyncio
 import io
+import time
 
 import pytest
 from fastapi import FastAPI
@@ -286,6 +288,47 @@ def test_negative_prompt_and_seed_pass_through(test_client, mocker: MockerFixtur
     captured_params = engine.captured_sampling_params_list[0]
     assert captured_prompt["negative_prompt"] == "blurry"
     assert captured_params.seed == 123
+
+
+def test_video_generation_timeout_returns_504(test_client, mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch):
+    async def _slow_generation(*args, **kwargs):
+        await asyncio.sleep(0.05)
+        return MockVideoResult([object()])
+
+    monkeypatch.setenv("VLLM_OMNI_VIDEO_GENERATION_TIMEOUT_S", "0.01")
+    mocker.patch.object(
+        test_client.app.state.openai_serving_video,
+        "_run_generation",
+        side_effect=_slow_generation,
+    )
+
+    response = test_client.post(
+        "/v1/videos",
+        data={"prompt": "generation timeout"},
+    )
+
+    assert response.status_code == 504
+    assert "timed out during generation" in response.json()["detail"].lower()
+
+
+def test_video_encoding_timeout_returns_504(test_client, mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch):
+    def _slow_encode(video, fps):
+        time.sleep(0.05)
+        return "Zg=="
+
+    monkeypatch.setenv("VLLM_OMNI_VIDEO_ENCODING_TIMEOUT_S", "0.01")
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video.encode_video_base64",
+        side_effect=_slow_encode,
+    )
+
+    response = test_client.post(
+        "/v1/videos",
+        data={"prompt": "encoding timeout"},
+    )
+
+    assert response.status_code == 504
+    assert "timed out during encoding" in response.json()["detail"].lower()
 
 
 def test_invalid_lora_returns_400(test_client):
