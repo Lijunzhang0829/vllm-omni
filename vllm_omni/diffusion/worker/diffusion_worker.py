@@ -395,6 +395,7 @@ class WorkerProc:
         # Only enable step preemption for pipelines that persist enough
         # per-request execution state to resume safely after interleaving.
         return model_cls_name.startswith("QwenImage") or model_cls_name in {
+            "WanPipeline",
             "Wan22Pipeline",
         }
 

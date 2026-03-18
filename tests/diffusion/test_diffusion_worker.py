@@ -304,6 +304,9 @@ class TestDiffusionWorkerPreemptionSupport:
         worker.od_config = mocker.Mock()
         worker.od_config.disable_diffusion_preemption = False
 
+        worker.od_config.model_class_name = "WanPipeline"
+        assert worker._supports_step_preemption() is True
+
         worker.od_config.model_class_name = "Wan22Pipeline"
         assert worker._supports_step_preemption() is True
 
