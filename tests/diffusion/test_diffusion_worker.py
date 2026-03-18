@@ -321,6 +321,15 @@ class TestDiffusionWorkerPreemptionSupport:
 
 
 class TestDiffusionWorkerPreemptionMemorySync:
+    def test_npu_preemption_default_headroom_is_4gb(self, mocker: MockerFixture):
+        worker = object.__new__(DiffusionWorker)
+        worker.od_config = mocker.Mock()
+        worker.od_config.diffusion_preemption_min_free_memory_gb = None
+
+        mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.current_omni_platform.is_npu", return_value=True)
+
+        assert worker._get_preemption_min_free_memory_bytes() == 4 * 1024**3
+
     def test_npu_memory_sync_uses_cpu_group(self, mocker: MockerFixture):
         worker = object.__new__(DiffusionWorker)
         worker.worker = mocker.Mock()
