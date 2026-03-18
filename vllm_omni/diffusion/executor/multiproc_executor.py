@@ -174,28 +174,61 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                     logger.warning("Ignoring unexpected worker control message type %s", type(message))
                     continue
 
-                if message.get("status") != "request_error":
+                status = message.get("status")
+                if status == "request_error":
+                    request_key = message.get("request_key")
+                    error = message.get("error")
+                    rank = message.get("rank")
+                    if not isinstance(request_key, str) or not isinstance(error, str):
+                        logger.warning("Ignoring malformed worker request_error message: %s", message)
+                        continue
+
+                    logger.error(
+                        "Received worker request failure from rank %s for %s: %s",
+                        rank,
+                        request_key,
+                        error,
+                    )
+                    self.scheduler.publish_result(
+                        request_key,
+                        DiffusionOutput(error=error, finished=True, request_key=request_key),
+                        source=f"worker-rank-{rank}",
+                    )
+                    self.abort(request_key)
                     continue
 
-                request_key = message.get("request_key")
-                error = message.get("error")
-                rank = message.get("rank")
-                if not isinstance(request_key, str) or not isinstance(error, str):
-                    logger.warning("Ignoring malformed worker request_error message: %s", message)
+                if status == "generation_result":
+                    rank = message.get("rank")
+                    payload = message.get("payload")
+                    if isinstance(payload, dict) and payload.get("type") == "generation_result":
+                        request_key = payload.get("request_key")
+                        output = payload.get("output")
+                        if isinstance(request_key, str) and isinstance(output, DiffusionOutput):
+                            logger.info(
+                                "Received worker generation result from rank %s for %s",
+                                rank,
+                                request_key,
+                            )
+                            self.scheduler.publish_result(
+                                request_key,
+                                output,
+                                source=f"worker-rank-{rank}",
+                            )
+                            continue
+                    if isinstance(payload, DiffusionOutput) and isinstance(payload.request_key, str):
+                        logger.info(
+                            "Received worker legacy generation result from rank %s for %s",
+                            rank,
+                            payload.request_key,
+                        )
+                        self.scheduler.publish_result(
+                            payload.request_key,
+                            payload,
+                            source=f"worker-rank-{rank}",
+                        )
+                        continue
+                    logger.warning("Ignoring malformed worker generation_result message: %s", message)
                     continue
-
-                logger.error(
-                    "Received worker request failure from rank %s for %s: %s",
-                    rank,
-                    request_key,
-                    error,
-                )
-                self.scheduler.publish_result(
-                    request_key,
-                    DiffusionOutput(error=error, finished=True, request_key=request_key),
-                    source=f"worker-rank-{rank}",
-                )
-                self.abort(request_key)
 
     def add_req(self, request: OmniDiffusionRequest) -> DiffusionOutput:
         return self.scheduler.add_req(request)

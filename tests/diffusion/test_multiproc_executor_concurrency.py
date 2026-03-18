@@ -268,6 +268,46 @@ class TestWorkerErrorPropagation:
         assert publish_args.kwargs["source"] == "worker-rank-1"
         executor.abort.assert_called_once_with("req-1")
 
+    def test_worker_generation_result_unblocks_scheduler(self):
+        with patch.object(MultiprocDiffusionExecutor, "_init_executor"):
+            executor = MultiprocDiffusionExecutor(Mock())
+
+        executor.scheduler = Mock(spec=Scheduler)
+        executor.abort = Mock()
+        executor._scheduler_pipe_readers = [Mock()]
+        executor._pipe_reader_stop = False
+
+        output = DiffusionOutput(error=None, finished=True, request_key="req-2")
+        message = {
+            "status": "generation_result",
+            "rank": 0,
+            "payload": {
+                "type": "generation_result",
+                "request_key": "req-2",
+                "output": output,
+            },
+        }
+        executor._scheduler_pipe_readers[0].recv.return_value = message
+
+        wait_calls = {"count": 0}
+
+        def _wait(_readers, timeout=None):
+            wait_calls["count"] += 1
+            if wait_calls["count"] == 1:
+                return executor._scheduler_pipe_readers
+            executor._pipe_reader_stop = True
+            return []
+
+        with patch("vllm_omni.diffusion.executor.multiproc_executor.mp.connection.wait", side_effect=_wait):
+            executor._worker_pipe_loop()
+
+        executor.scheduler.publish_result.assert_called_once_with(
+            "req-2",
+            output,
+            source="worker-rank-0",
+        )
+        executor.abort.assert_not_called()
+
 
 # ─────────────── backward-compatibility (serial) tests ────────────────────
 

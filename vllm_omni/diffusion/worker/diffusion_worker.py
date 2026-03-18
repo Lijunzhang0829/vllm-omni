@@ -385,15 +385,39 @@ class WorkerProc:
 
     def return_result(self, output: DiffusionOutput):
         """Reply to client, only on rank 0."""
+        request_key = None
+        result_type = type(output).__name__
+        if isinstance(output, dict):
+            request_key = output.get("request_key")
+            result_type = output.get("type", result_type)
+        elif isinstance(output, DiffusionOutput):
+            request_key = output.request_key
+
+        if self._should_route_result_via_control_pipe(output):
+            prepared = self._prepare_result_for_scheduler(output)
+            logger.info(
+                "Worker %s sending result via control pipe: type=%s request_key=%s",
+                self.gpu_id,
+                result_type,
+                request_key,
+            )
+            self.control_pipe.send(
+                {
+                    "status": "generation_result",
+                    "rank": self.gpu_id,
+                    "payload": prepared,
+                }
+            )
+            logger.info(
+                "Worker %s sent result via control pipe: type=%s request_key=%s",
+                self.gpu_id,
+                result_type,
+                request_key,
+            )
+            return
+
         if self.result_mq is not None:
             output = self._prepare_result_for_scheduler(output)
-            request_key = None
-            result_type = type(output).__name__
-            if isinstance(output, dict):
-                request_key = output.get("request_key")
-                result_type = output.get("type", result_type)
-            elif isinstance(output, DiffusionOutput):
-                request_key = output.request_key
             logger.info(
                 "Worker %s sending result to scheduler: type=%s request_key=%s",
                 self.gpu_id,
@@ -442,6 +466,12 @@ class WorkerProc:
             prepared["output"] = cls._prepare_diffusion_output_for_scheduler(output["output"])
             return prepared
         return output
+
+    @staticmethod
+    def _should_route_result_via_control_pipe(output: Any) -> bool:
+        if isinstance(output, dict):
+            return output.get("type") == "generation_result"
+        return isinstance(output, DiffusionOutput) and output.request_key is not None
 
     def _report_request_error_to_parent(self, request_key: str, error: str) -> None:
         try:

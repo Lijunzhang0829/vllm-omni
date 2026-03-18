@@ -383,3 +383,25 @@ class TestWorkerProcResultPreparation:
         assert prepared["output"].trajectory_timesteps[0].device.type == "cpu"
         assert prepared["output"].trajectory_latents.device.type == "cpu"
         assert prepared["output"].trajectory_decoded[0].device.type == "cpu"
+
+    def test_generation_result_uses_control_pipe(self, mocker: MockerFixture):
+        worker_proc = object.__new__(WorkerProc)
+        worker_proc.gpu_id = 0
+        worker_proc.control_pipe = mocker.Mock()
+        worker_proc.result_mq = mocker.Mock()
+
+        output = DiffusionOutput(
+            output=torch.randn(1, 2),
+            request_key="req-3",
+        )
+
+        worker_proc.return_result(
+            {
+                "type": "generation_result",
+                "request_key": "req-3",
+                "output": output,
+            }
+        )
+
+        worker_proc.control_pipe.send.assert_called_once()
+        worker_proc.result_mq.enqueue.assert_not_called()
