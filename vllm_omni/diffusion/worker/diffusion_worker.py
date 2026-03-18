@@ -403,7 +403,7 @@ class WorkerProc:
     def _get_preemption_min_free_memory_bytes(self) -> int:
         configured_gb = getattr(self.od_config, "diffusion_preemption_min_free_memory_gb", None)
         if configured_gb is None:
-            configured_gb = 1.0 if current_omni_platform.is_npu() else 0.0
+            configured_gb = 0.5 if current_omni_platform.is_npu() else 0.0
         return max(0, int(float(configured_gb) * GiB_bytes))
 
     def _get_synced_min_free_memory_bytes(self) -> int | None:

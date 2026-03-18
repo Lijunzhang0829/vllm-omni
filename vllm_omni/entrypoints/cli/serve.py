@@ -332,7 +332,7 @@ class OmniServeCommand(CLISubcommand):
             default=None,
             help=(
                 "Skip arrival-time diffusion preemption when the synchronized minimum free device memory "
-                "across workers falls below this threshold in GiB. Defaults to 1.0 on NPU and 0.0 elsewhere."
+                "across workers falls below this threshold in GiB. Defaults to 0.5 on NPU and 0.0 elsewhere."
             ),
         )
 
