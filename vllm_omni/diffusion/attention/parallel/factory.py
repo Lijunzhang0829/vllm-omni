@@ -10,6 +10,7 @@ from vllm_omni.diffusion.attention.parallel.ring import RingParallelAttention
 from vllm_omni.diffusion.attention.parallel.ulysses import UlyssesParallelAttention
 from vllm_omni.diffusion.distributed.parallel_state import get_sequence_parallel_world_size, get_sp_group
 from vllm_omni.diffusion.forward_context import get_forward_context
+from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
@@ -53,12 +54,13 @@ def build_parallel_attention_strategy(
 
     # Ulysses (or Hybrid Ulysses+Ring)
     if ulysses_degree > 1:
+        effective_use_sync = use_sync or current_omni_platform.is_npu()
         logger.debug(f"Using UlyssesParallelAttention (ulysses_degree={ulysses_degree})")
         return UlyssesParallelAttention(
             sp_group=sp_group,
             scatter_idx=scatter_idx,
             gather_idx=gather_idx,
-            use_sync=use_sync,
+            use_sync=effective_use_sync,
         )
 
     # Pure Ring Attention
