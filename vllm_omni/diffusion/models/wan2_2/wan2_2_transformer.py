@@ -24,9 +24,13 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.distributed.parallel_state import (
+    get_sequence_parallel_rank,
+    get_sequence_parallel_world_size,
+)
+from vllm_omni.diffusion.distributed.sp_sharding import sp_gather
 from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
-    SequenceParallelOutput,
 )
 from vllm_omni.diffusion.forward_context import get_forward_context
 
@@ -758,20 +762,13 @@ class WanTransformer3DModel(nn.Module):
     # Sequence Parallelism for Wan (following diffusers' _cp_plan pattern)
     #
     # The _sp_plan specifies sharding/gathering at module boundaries:
-    # - patch_rope_prepare: split hidden_states and RoPE together
     # - timestep_proj_prepare: Split timestep_proj for TI2V models (4D tensor)
-    # - proj_out: Gather outputs after the final projection layer
+    #
+    # Wan uses manual frame-aligned SP sharding/gathering for the video token
+    # sequence because generic token chunking can split inside a frame.
     #
     # Note: _sp_plan corresponds to diffusers' _cp_plan (Context Parallelism)
     _sp_plan = {
-        # Shard patch-embedded hidden_states and RoPE with aligned sequence
-        # boundaries. This avoids correctness issues where hidden_states and
-        # rotary embeddings are split independently.
-        "patch_rope_prepare": {
-            0: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True, auto_pad=True),
-            1: SequenceParallelInput(split_dim=1, expected_dims=4, split_output=True, auto_pad=True),
-            2: SequenceParallelInput(split_dim=1, expected_dims=4, split_output=True, auto_pad=True),
-        },
         # Shard timestep_proj for TI2V models (4D tensor: [batch, seq_len, 6, inner_dim])
         # This is only active when ts_seq_len is not None (TI2V mode)
         # Output is a single tensor, shard along dim=1 (sequence dimension)
@@ -785,8 +782,6 @@ class WanTransformer3DModel(nn.Module):
             0: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True, auto_pad=True),
             1: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True, auto_pad=True),
         },
-        # Gather at proj_out (final linear projection before unpatchify)
-        "proj_out": SequenceParallelOutput(gather_dim=1, expected_dims=3),
     }
 
     def __init__(
@@ -876,6 +871,84 @@ class WanTransformer3DModel(nn.Module):
         """Return the dtype of the model parameters."""
         return next(self.parameters()).dtype
 
+    def _frame_aligned_sp_shard(
+        self,
+        hidden_states: torch.Tensor,
+        freqs_cos: torch.Tensor,
+        freqs_sin: torch.Tensor,
+        tokens_per_frame: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        world_size = get_sequence_parallel_world_size()
+        if world_size == 1:
+            return hidden_states, freqs_cos, freqs_sin
+
+        if hidden_states.size(1) % tokens_per_frame != 0:
+            raise ValueError(
+                f"Hidden sequence length {hidden_states.size(1)} is not divisible by tokens_per_frame "
+                f"{tokens_per_frame}."
+            )
+
+        rank = get_sequence_parallel_rank()
+        frame_count = hidden_states.size(1) // tokens_per_frame
+        pad_frames = (-frame_count) % world_size
+        pad_tokens = pad_frames * tokens_per_frame
+
+        if pad_tokens > 0:
+            hidden_states = torch.cat(
+                [
+                    hidden_states,
+                    torch.zeros(
+                        hidden_states.size(0),
+                        pad_tokens,
+                        hidden_states.size(2),
+                        dtype=hidden_states.dtype,
+                        device=hidden_states.device,
+                    ),
+                ],
+                dim=1,
+            )
+            pad_shape = list(freqs_cos.shape)
+            pad_shape[1] = pad_tokens
+            freqs_cos = torch.cat(
+                [freqs_cos, torch.zeros(pad_shape, dtype=freqs_cos.dtype, device=freqs_cos.device)],
+                dim=1,
+            )
+            freqs_sin = torch.cat(
+                [freqs_sin, torch.zeros(pad_shape, dtype=freqs_sin.dtype, device=freqs_sin.device)],
+                dim=1,
+            )
+
+        shard_frames = (frame_count + pad_frames) // world_size
+        shard_tokens = shard_frames * tokens_per_frame
+        start = rank * shard_tokens
+
+        ctx = get_forward_context()
+        ctx.sp_original_seq_len = frame_count * tokens_per_frame
+        ctx.sp_padding_size = pad_tokens
+        ctx._sp_shard_depth += 1
+
+        return (
+            hidden_states.narrow(1, start, shard_tokens),
+            freqs_cos.narrow(1, start, shard_tokens),
+            freqs_sin.narrow(1, start, shard_tokens),
+        )
+
+    def _frame_aligned_sp_gather(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        world_size = get_sequence_parallel_world_size()
+        if world_size == 1:
+            return hidden_states
+
+        ctx = get_forward_context()
+        original_seq_len = ctx.sp_original_seq_len
+        hidden_states = sp_gather(hidden_states, dim=1, validate=False)
+        if original_seq_len is not None and hidden_states.size(1) > original_seq_len:
+            hidden_states = hidden_states.narrow(1, 0, original_seq_len)
+
+        ctx._sp_shard_depth = max(0, ctx._sp_shard_depth - 1)
+        ctx.sp_original_seq_len = None
+        ctx.sp_padding_size = 0
+        return hidden_states
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -890,9 +963,17 @@ class WanTransformer3DModel(nn.Module):
         post_patch_num_frames = num_frames // p_t
         post_patch_height = height // p_h
         post_patch_width = width // p_w
+        tokens_per_frame = post_patch_height * post_patch_width
 
         # Prepare patch embeddings and RoPE together so SP sees aligned outputs.
         hidden_states, freqs_cos, freqs_sin = self.patch_rope_prepare(hidden_states)
+        config = get_forward_context().omni_diffusion_config
+        parallel_config = config.parallel_config
+
+        if parallel_config is not None and parallel_config.sequence_parallel_size > 1:
+            hidden_states, freqs_cos, freqs_sin = self._frame_aligned_sp_shard(
+                hidden_states, freqs_cos, freqs_sin, tokens_per_frame=tokens_per_frame
+            )
         rotary_emb = (freqs_cos, freqs_sin)
 
         # Handle timestep shape
@@ -915,8 +996,6 @@ class WanTransformer3DModel(nn.Module):
 
         # Check for SP auto_pad: create attention mask dynamically if padding was applied
         hidden_states_mask = None  # default
-        config = get_forward_context().omni_diffusion_config
-        parallel_config = config.parallel_config
         if parallel_config is not None and parallel_config.sequence_parallel_size > 1:
             ctx = get_forward_context()
             if ctx.sp_original_seq_len is not None and ctx.sp_padding_size > 0:
@@ -939,6 +1018,9 @@ class WanTransformer3DModel(nn.Module):
         # Transformer blocks
         for block in self.blocks:
             hidden_states = block(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb, hidden_states_mask)
+
+        if parallel_config is not None and parallel_config.sequence_parallel_size > 1:
+            hidden_states = self._frame_aligned_sp_gather(hidden_states)
 
         # Output norm, projection & unpatchify
         shift, scale = self.output_scale_shift_prepare(temb)
