@@ -43,9 +43,13 @@ Usage:
 import argparse
 import ast
 import asyncio
+import base64
 import glob
 import json
+import logging
 import os
+import random
+import tempfile
 import time
 import uuid
 from abc import ABC, abstractmethod
@@ -57,7 +61,10 @@ import aiohttp
 import numpy as np
 import requests
 from backends import RequestFuncInput, RequestFuncOutput, backends_function_mapping
+from PIL import Image
 from tqdm.asyncio import tqdm
+
+logger = logging.getLogger(__name__)
 
 
 class BaseDataset(ABC):
@@ -495,6 +502,23 @@ class TraceDataset(BaseDataset):
             width = row_width
             height = row_height
 
+        standard_keys = {
+            "prompt",
+            "text",
+            "height",
+            "width",
+            "num_frames",
+            "num_inference_steps",
+            "seed",
+            "fps",
+            "timestamp",
+            "slo_ms",
+            "image_paths",
+            "request_id",
+            "_source",
+        }
+        extra_body = {k: v for k, v in row.items() if k not in standard_keys}
+
         return RequestFuncInput(
             prompt=str(prompt),
             api_url=self.api_url,
@@ -507,6 +531,7 @@ class TraceDataset(BaseDataset):
             fps=fps if fps is not None else self.args.fps,
             timestamp=timestamp,
             slo_ms=slo_ms,
+            extra_body=extra_body,
             image_paths=image_paths,
             request_id=str(row.get("request_id")) if row.get("request_id") is not None else str(uuid.uuid4()),
         )
@@ -516,26 +541,67 @@ class TraceDataset(BaseDataset):
 
 
 class RandomDataset(BaseDataset):
-    def __init__(self, args, api_url: str, model: str):
-        self.args = args
-        self.api_url = api_url
-        self.model = model
+    def __init__(self, args, api_url: str, model: str, enable_negative_prompt: bool = False):
+        super().__init__(args, api_url, model)
         self.num_prompts = args.num_prompts
+        self.enable_negative_prompt = enable_negative_prompt
+        self.random_request_config = getattr(args, "random_request_config", None)
+        if self.random_request_config:
+            self.random_request_config = json.loads(self.random_request_config)
+            self._weights = [p["weight"] for p in self.random_request_config]
+            self.random_request_config = [
+                {k: v for k, v in p.items() if k != "weight"} for p in self.random_request_config
+            ]
+            seed = getattr(args, "random_request_seed", 42)
+            self._rng = random.Random(seed)
+            self._sampled_requests = self._rng.choices(
+                self.random_request_config,
+                weights=self._weights,
+                k=self.num_prompts,
+            )
+        else:
+            self._sampled_requests = None
+
+        if self.args.task in ["i2v", "ti2v", "ti2i", "i2i"]:
+            img = Image.new("RGB", (512, 512), (255, 255, 255))
+            image_path = os.path.join(tempfile.gettempdir(), "diffusion_benchmark_random_image.png")
+            self._random_image_path = [image_path]
+            img.save(image_path)
+        else:
+            self._random_image_path = None
 
     def __len__(self) -> int:
         return self.num_prompts
 
     def __getitem__(self, idx: int) -> RequestFuncInput:
+        extra_body = {}
+        if self.enable_negative_prompt:
+            extra_body["negative_prompt"] = f"Negative prompt {idx} for benchmarking diffusion models"
+
+        params = {
+            "width": self.args.width,
+            "height": self.args.height,
+            "num_frames": self.args.num_frames,
+            "num_inference_steps": self.args.num_inference_steps,
+            "fps": self.args.fps,
+        }
+        if self._sampled_requests:
+            profile = self._sampled_requests[idx]
+            for key in ["width", "height", "num_frames", "num_inference_steps", "fps"]:
+                if key in profile:
+                    params[key] = profile[key]
+            extra_body.update(
+                {k: v for k, v in profile.items() if k not in {"width", "height", "num_frames", "num_inference_steps", "fps"}}
+            )
+
         return RequestFuncInput(
             prompt=f"Random prompt {idx} for benchmarking diffusion models",
             api_url=self.api_url,
             model=self.model,
-            width=self.args.width,
-            height=self.args.height,
-            num_frames=self.args.num_frames,
-            num_inference_steps=self.args.num_inference_steps,
             seed=self.args.seed,
-            fps=self.args.fps,
+            extra_body=extra_body,
+            image_paths=self._random_image_path,
+            **params,
         )
 
     def get_requests(self) -> list[RequestFuncInput]:
@@ -737,10 +803,71 @@ def wait_for_service(base_url: str, timeout: int = 120) -> None:
         time.sleep(1)
 
 
+def _sanitize_filename_part(value: str) -> str:
+    return "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in value)
+
+
+def _iter_embedded_media(response_body: dict[str, Any], default_suffix: str) -> list[tuple[str, bytes]]:
+    media_items: list[tuple[str, bytes]] = []
+    data_items = response_body.get("data")
+    if not isinstance(data_items, list):
+        return media_items
+
+    for item in data_items:
+        if not isinstance(item, dict):
+            continue
+        b64_json = item.get("b64_json")
+        if not isinstance(b64_json, str) or not b64_json:
+            continue
+        media_items.append((default_suffix, base64.b64decode(b64_json)))
+
+    return media_items
+
+
+def dump_response_payloads(
+    output_dir: str,
+    request_output_pairs: list[tuple[str, RequestFuncInput, RequestFuncOutput]],
+) -> int:
+    os.makedirs(output_dir, exist_ok=True)
+    dumped_media = 0
+
+    for phase, req, out in request_output_pairs:
+        if not out.success or not out.response_body:
+            continue
+
+        request_id = _sanitize_filename_part(req.request_id)
+        prefix = f"{phase}_{request_id}"
+        default_suffix = ".mp4" if req.api_url.endswith("/v1/videos") else ".png"
+        response_path = os.path.join(output_dir, f"{prefix}.json")
+        with open(response_path, "w") as f:
+            json.dump(out.response_body, f, indent=2)
+
+        for media_index, (suffix, payload) in enumerate(_iter_embedded_media(out.response_body, default_suffix)):
+            media_path = os.path.join(output_dir, f"{prefix}_{media_index}{suffix}")
+            with open(media_path, "wb") as f:
+                f.write(payload)
+            dumped_media += 1
+
+    return dumped_media
+
+
 async def benchmark(args):
     # Construct base_url if not provided
     if args.base_url is None:
         args.base_url = f"http://{args.host}:{args.port}"
+
+    VIDEO_TASKS = {"t2v", "i2v", "ti2v"}
+    IMAGE_TASKS = {"t2i", "i2i", "ti2i"}
+
+    if args.task in VIDEO_TASKS and args.backend != "v1/videos":
+        logger.warning(
+            f"Video task '{args.task}' requires backend 'v1/videos', "
+            f"but got '{args.backend}'. Overriding backend to 'v1/videos'."
+        )
+        args.backend = "v1/videos"
+    elif args.task in IMAGE_TASKS and args.backend == "v1/videos":
+        logger.warning(f"Image task '{args.task}' can not use backend 'v1/videos', Overriding backend to 'vllm-omni'.")
+        args.backend = "vllm-omni"
 
     # Setup API URL and request function based on backend
     request_func, api_url = backends_function_mapping[args.backend]
@@ -751,7 +878,7 @@ async def benchmark(args):
     elif args.dataset == "trace":
         dataset = TraceDataset(args, api_url, args.model)
     elif args.dataset == "random":
-        dataset = RandomDataset(args, api_url, args.model)
+        dataset = RandomDataset(args, api_url, args.model, args.enable_negative_prompt)
     else:
         raise ValueError(f"Unknown dataset: {args.dataset}")
 
@@ -775,7 +902,7 @@ async def benchmark(args):
     # Run benchmark
     pbar = tqdm(total=len(requests_list), disable=args.disable_tqdm)
 
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None)) as session:
         warmup_pairs: list[tuple[RequestFuncInput, RequestFuncOutput]] = []
         if args.warmup_requests and requests_list:
             print(
@@ -810,6 +937,13 @@ async def benchmark(args):
         total_duration = time.perf_counter() - start_time
 
     pbar.close()
+
+    if args.dump_responses_dir:
+        request_output_pairs = [("warmup", req, out) for req, out in warmup_pairs] + [
+            ("measured", req, out) for req, out in zip(requests_list, outputs)
+        ]
+        dumped_media = dump_response_payloads(args.dump_responses_dir, request_output_pairs)
+        print(f"Saved response payloads to {args.dump_responses_dir} ({dumped_media} decoded media file(s)).")
 
     # Calculate metrics
     metrics = calculate_metrics(outputs, total_duration, requests_list, args, args.slo)
@@ -883,7 +1017,7 @@ if __name__ == "__main__":
         "--backend",
         type=str,
         default="vllm-omni",
-        choices=["vllm-omni", "openai"],
+        choices=["vllm-omni", "openai", "v1/videos"],
         help="Backend to target the benchmark to.",
     )
     parser.add_argument(
@@ -957,6 +1091,15 @@ if __name__ == "__main__":
     parser.add_argument("--fps", type=int, default=None, help="FPS (for video).")
     parser.add_argument("--output-file", type=str, default=None, help="Output JSON file for metrics.")
     parser.add_argument(
+        "--dump-responses-dir",
+        type=str,
+        default=None,
+        help=(
+            "Optional directory to save successful warmup/measured response JSON payloads. "
+            "Embedded b64_json images/videos are also decoded to files for inspection."
+        ),
+    )
+    parser.add_argument(
         "--slo",
         action="store_true",
         help=(
@@ -972,6 +1115,22 @@ if __name__ == "__main__":
         help="SLO target multiplier: slo_ms = estimated_exec_time_ms * slo_scale (default: 3).",
     )
     parser.add_argument("--disable-tqdm", action="store_true", help="Disable progress bar.")
+    parser.add_argument(
+        "--enable-negative-prompt",
+        action="store_true",
+        default=False,
+        help="Generate negative prompts when using the random dataset.",
+    )
+    parser.add_argument(
+        "--random-request-config",
+        type=str,
+        default=None,
+        help=(
+            "JSON string defining random request profiles. "
+            "Each profile may contain: width, height, num_inference_steps, num_frames, fps, etc. "
+            "The 'weight' field controls sampling probability (relative weight)."
+        ),
+    )
 
     args = parser.parse_args()
 
