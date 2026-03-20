@@ -10,7 +10,7 @@ import torch.distributed as dist
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.parallel.base import ParallelAttentionContext
-from vllm_omni.diffusion.distributed.comm import SeqAllToAll4D
+from vllm_omni.diffusion.distributed.comm import SeqAllToAll4D, SeqAllToAll5D
 from vllm_omni.diffusion.distributed.group_coordinator import SequenceParallelGroupCoordinator
 
 
@@ -126,10 +126,17 @@ class UlyssesParallelAttention:
                 attn_metadata.joint_key = joint_tensor_key
                 attn_metadata.joint_value = joint_tensor_value
 
-        # (bs, seq_len/P, head_cnt, head_size) -> (bs, seq_len, head_cnt/P, head_size)
-        query = SeqAllToAll4D.apply(self._ulysses_pg, query, self._scatter_idx, self._gather_idx, self._use_sync)
-        key = SeqAllToAll4D.apply(self._ulysses_pg, key, self._scatter_idx, self._gather_idx, self._use_sync)
-        value = SeqAllToAll4D.apply(self._ulysses_pg, value, self._scatter_idx, self._gather_idx, self._use_sync)
+        # For self-attention with matched Q/K/V shapes, communicate all three
+        # tensors together to avoid per-tensor collective skew on NPU.
+        if not is_joint and query.shape == key.shape == value.shape:
+            qkv = torch.stack([query, key, value], dim=2)
+            qkv = SeqAllToAll5D.apply(self._ulysses_pg, qkv, 3, 1, self._use_sync)
+            query, key, value = qkv.unbind(dim=2)
+        else:
+            # (bs, seq_len/P, head_cnt, head_size) -> (bs, seq_len, head_cnt/P, head_size)
+            query = SeqAllToAll4D.apply(self._ulysses_pg, query, self._scatter_idx, self._gather_idx, self._use_sync)
+            key = SeqAllToAll4D.apply(self._ulysses_pg, key, self._scatter_idx, self._gather_idx, self._use_sync)
+            value = SeqAllToAll4D.apply(self._ulysses_pg, value, self._scatter_idx, self._gather_idx, self._use_sync)
 
         if is_joint:
             # Concatenate joint query AFTER AllToAll
