@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import math
+import os
 from collections.abc import Iterable
 from typing import Any
 
@@ -741,38 +742,47 @@ class WanTransformer3DModel(nn.Module):
     # - proj_out: Gather outputs after the final projection layer
     #
     # Note: _sp_plan corresponds to diffusers' _cp_plan (Context Parallelism)
-    _sp_plan = {
-        # Shard RoPE embeddings after rope module computes them
-        # auto_pad=True enables variable sequence length support
-        "rope": {
-            0: SequenceParallelInput(
-                split_dim=1, expected_dims=4, split_output=True, auto_pad=True
-            ),  # freqs_cos [1, seq, 1, dim]
-            1: SequenceParallelInput(
-                split_dim=1, expected_dims=4, split_output=True, auto_pad=True
-            ),  # freqs_sin [1, seq, 1, dim]
-        },
-        # Shard timestep_proj for TI2V models (4D tensor: [batch, seq_len, 6, inner_dim])
-        # This is only active when ts_seq_len is not None (TI2V mode)
-        # Output is a single tensor, shard along dim=1 (sequence dimension)
-        "timestep_proj_prepare": {
-            0: SequenceParallelInput(
-                split_dim=1, expected_dims=4, split_output=True, auto_pad=True
-            ),  # [B, seq, 6, dim]
-        },
-        # Shard hidden_states at first transformer block input
-        # (after patch_embedding + flatten + transpose)
-        "blocks.0": {
-            "hidden_states": SequenceParallelInput(split_dim=1, expected_dims=3, auto_pad=True),  # [B, seq, dim]
-        },
-        # Shard output scale/shift for TI2V (3D); T2V outputs 2D and skips sharding
-        "output_scale_shift_prepare": {
-            0: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True, auto_pad=True),
-            1: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True, auto_pad=True),
-        },
-        # Gather at proj_out (final linear projection before unpatchify)
-        "proj_out": SequenceParallelOutput(gather_dim=1, expected_dims=3),
-    }
+    @staticmethod
+    def _build_sp_plan(enable_rope_split: bool = True) -> dict[str, object]:
+        plan: dict[str, object] = {
+            # Shard timestep_proj for TI2V models (4D tensor: [batch, seq_len, 6, inner_dim])
+            # This is only active when ts_seq_len is not None (TI2V mode)
+            # Output is a single tensor, shard along dim=1 (sequence dimension)
+            "timestep_proj_prepare": {
+                0: SequenceParallelInput(
+                    split_dim=1, expected_dims=4, split_output=True, auto_pad=True
+                ),  # [B, seq, 6, dim]
+            },
+            # Shard hidden_states at first transformer block input
+            # (after patch_embedding + flatten + transpose)
+            "blocks.0": {
+                "hidden_states": SequenceParallelInput(split_dim=1, expected_dims=3, auto_pad=True),  # [B, seq, dim]
+            },
+            # Shard output scale/shift for TI2V (3D); T2V outputs 2D and skips sharding
+            "output_scale_shift_prepare": {
+                0: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True, auto_pad=True),
+                1: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True, auto_pad=True),
+            },
+            # Gather at proj_out (final linear projection before unpatchify)
+            "proj_out": SequenceParallelOutput(gather_dim=1, expected_dims=3),
+        }
+
+        if enable_rope_split:
+            # Shard RoPE embeddings after rope module computes them.
+            # We keep this runtime-toggleable so correctness regressions in
+            # Wan2.2 SP can be isolated without disabling USP entirely.
+            plan["rope"] = {
+                0: SequenceParallelInput(
+                    split_dim=1, expected_dims=4, split_output=True, auto_pad=True
+                ),  # freqs_cos [1, seq, 1, dim]
+                1: SequenceParallelInput(
+                    split_dim=1, expected_dims=4, split_output=True, auto_pad=True
+                ),  # freqs_sin [1, seq, 1, dim]
+            }
+
+        return plan
+
+    _sp_plan = _build_sp_plan(enable_rope_split=True)
 
     def __init__(
         self,
@@ -816,6 +826,17 @@ class WanTransformer3DModel(nn.Module):
                 "pos_embed_seq_len": pos_embed_seq_len,
             },
         )()
+
+        env_value = os.getenv("VLLM_WAN22_SP_SPLIT_ROPE", "1").strip().lower()
+        enable_rope_split = env_value not in {"0", "false", "off", "no"}
+        self._sp_plan = self._build_sp_plan(enable_rope_split=enable_rope_split)
+        if enable_rope_split:
+            logger.info("Wan2.2 SP rope splitting is enabled.")
+        else:
+            logger.warning(
+                "Wan2.2 SP rope splitting is disabled via VLLM_WAN22_SP_SPLIT_ROPE; "
+                "use this only for correctness debugging."
+            )
 
         inner_dim = num_attention_heads * attention_head_dim
         out_channels = out_channels or in_channels
