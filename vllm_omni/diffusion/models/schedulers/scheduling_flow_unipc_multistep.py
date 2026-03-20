@@ -131,6 +131,37 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
 
         BaseScheduler.__init__(self)
 
+    @staticmethod
+    def _solve_small_linear_system(R: torch.Tensor, b: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+        """Solve a tiny dense linear system without relying on device linalg kernels.
+
+        On NPU, `torch.linalg.solve` can fall back to CPU for small systems used by UniPC,
+        adding synchronization overhead every diffusion step. Handle 1x1 / 2x2 directly
+        and use a CPU solve fallback for larger systems.
+        """
+        if R.ndim != 2 or b.ndim != 1 or R.shape[0] != R.shape[1] or R.shape[0] != b.shape[0]:
+            raise ValueError(f"Expected square matrix and matching rhs, got R={tuple(R.shape)}, b={tuple(b.shape)}")
+
+        n = R.shape[0]
+        device = R.device
+
+        if n == 1:
+            solution = b[0] / R[0, 0]
+            return solution.reshape(1).to(device=device, dtype=out_dtype)
+
+        if n == 2:
+            a, b0 = R[0, 0], R[0, 1]
+            c, d = R[1, 0], R[1, 1]
+            det = a * d - b0 * c
+            rhs0, rhs1 = b[0], b[1]
+            solution = torch.stack(((d * rhs0 - b0 * rhs1) / det, (-c * rhs0 + a * rhs1) / det))
+            return solution.to(device=device, dtype=out_dtype)
+
+        # Larger systems are still tiny in practice; solve them on CPU to avoid
+        # device linalg fallback overhead on accelerators without native support.
+        solution_cpu = torch.linalg.solve(R.to("cpu", dtype=torch.float64), b.to("cpu", dtype=torch.float64))
+        return solution_cpu.to(device=device, dtype=out_dtype)
+
     @property
     def step_index(self) -> int | None:
         """The index counter for current timestep. Increases by 1 after each scheduler step."""
@@ -431,7 +462,7 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
                 rhos_p = torch.tensor([0.5], dtype=x.dtype, device=device)
             else:
                 assert isinstance(R, torch.Tensor)
-                rhos_p = torch.linalg.solve(R[:-1, :-1], b[:-1]).to(device).to(x.dtype)
+                rhos_p = self._solve_small_linear_system(R[:-1, :-1], b[:-1], x.dtype)
         else:
             D1s = None
 
@@ -565,7 +596,7 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
         if order == 1:
             rhos_c = torch.tensor([0.5], dtype=x.dtype, device=device)
         else:
-            rhos_c = torch.linalg.solve(R, b).to(device).to(x.dtype)
+            rhos_c = self._solve_small_linear_system(R, b, x.dtype)
 
         if self.predict_x0:
             x_t_ = sigma_t / sigma_s0 * x - alpha_t * h_phi_1 * m0
