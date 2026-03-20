@@ -63,6 +63,7 @@ Usage:
 import argparse
 import ast
 import asyncio
+import base64
 import glob
 import json
 import logging
@@ -804,6 +805,55 @@ def wait_for_service(base_url: str, timeout: int = 120) -> None:
         time.sleep(1)
 
 
+def _sanitize_filename_part(value: str) -> str:
+    return "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in value)
+
+
+def _iter_embedded_media(response_body: dict[str, Any], default_suffix: str) -> list[tuple[str, bytes]]:
+    media_items: list[tuple[str, bytes]] = []
+    data_items = response_body.get("data")
+    if not isinstance(data_items, list):
+        return media_items
+
+    for item in data_items:
+        if not isinstance(item, dict):
+            continue
+        b64_json = item.get("b64_json")
+        if not isinstance(b64_json, str) or not b64_json:
+            continue
+
+        media_items.append((default_suffix, base64.b64decode(b64_json)))
+
+    return media_items
+
+
+def dump_response_payloads(
+    output_dir: str,
+    request_output_pairs: list[tuple[str, RequestFuncInput, RequestFuncOutput]],
+) -> int:
+    os.makedirs(output_dir, exist_ok=True)
+    dumped_media = 0
+
+    for phase, req, out in request_output_pairs:
+        if not out.success or not out.response_body:
+            continue
+
+        request_id = _sanitize_filename_part(req.request_id)
+        prefix = f"{phase}_{request_id}"
+        default_suffix = ".mp4" if req.api_url.endswith("/v1/videos") else ".png"
+        response_path = os.path.join(output_dir, f"{prefix}.json")
+        with open(response_path, "w") as f:
+            json.dump(out.response_body, f, indent=2)
+
+        for media_index, (suffix, payload) in enumerate(_iter_embedded_media(out.response_body, default_suffix)):
+            media_path = os.path.join(output_dir, f"{prefix}_{media_index}{suffix}")
+            with open(media_path, "wb") as f:
+                f.write(payload)
+            dumped_media += 1
+
+    return dumped_media
+
+
 async def benchmark(args):
     # Construct base_url if not provided
     if args.base_url is None:
@@ -893,6 +943,15 @@ async def benchmark(args):
         total_duration = time.perf_counter() - start_time
 
     pbar.close()
+
+    if args.dump_responses_dir:
+        request_output_pairs = [
+            ("warmup", req, out) for req, out in warmup_pairs
+        ] + [
+            ("measured", req, out) for req, out in zip(requests_list, outputs)
+        ]
+        dumped_media = dump_response_payloads(args.dump_responses_dir, request_output_pairs)
+        print(f"Saved response payloads to {args.dump_responses_dir} ({dumped_media} decoded media file(s)).")
 
     # Calculate metrics
     metrics = calculate_metrics(outputs, total_duration, requests_list, args, args.slo)
@@ -1040,6 +1099,15 @@ if __name__ == "__main__":
     )
     parser.add_argument("--fps", type=int, default=None, help="FPS (for video).")
     parser.add_argument("--output-file", type=str, default=None, help="Output JSON file for metrics.")
+    parser.add_argument(
+        "--dump-responses-dir",
+        type=str,
+        default=None,
+        help=(
+            "Optional directory to save successful warmup/measured response JSON payloads. "
+            "Embedded b64_json images/videos are also decoded to files for inspection."
+        ),
+    )
     parser.add_argument(
         "--slo",
         action="store_true",
