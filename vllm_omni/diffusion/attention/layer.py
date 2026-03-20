@@ -36,6 +36,7 @@ class Attention(nn.Module):
         scatter_idx: int = 2,
         gather_idx: int = 1,
         use_sync: bool = False,
+        enable_sequence_parallel: bool = True,
     ):
         super().__init__()
         self.attn_backend = get_attn_backend(-1)
@@ -62,6 +63,7 @@ class Attention(nn.Module):
         self.gather_idx = gather_idx
         self.use_sync = use_sync
         self.causal = causal
+        self.enable_sequence_parallel = enable_sequence_parallel
 
         self.use_ring = False
         self.ring_pg = None
@@ -102,6 +104,8 @@ class Attention(nn.Module):
             ctx = get_forward_context()
             if not ctx.sp_active:
                 return self._no_parallel_strategy
+        if not self.enable_sequence_parallel:
+            return self._no_parallel_strategy
         return self.parallel_strategy
 
     def forward(
