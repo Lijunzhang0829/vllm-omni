@@ -829,6 +829,7 @@ class WanTransformer3DModel(nn.Module):
 
         env_value = os.getenv("VLLM_WAN22_SP_SPLIT_ROPE", "1").strip().lower()
         enable_rope_split = env_value not in {"0", "false", "off", "no"}
+        self._enable_sp_rope_split = enable_rope_split
         self._sp_plan = self._build_sp_plan(enable_rope_split=enable_rope_split)
         if enable_rope_split:
             logger.info("Wan2.2 SP rope splitting is enabled.")
@@ -881,6 +882,41 @@ class WanTransformer3DModel(nn.Module):
         """Return the dtype of the model parameters."""
         return next(self.parameters()).dtype
 
+    def _maybe_shard_rotary_emb_for_debug(
+        self,
+        rotary_emb: tuple[torch.Tensor, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Shard RoPE locally when hook-based rope splitting is disabled."""
+        if self._enable_sp_rope_split:
+            return rotary_emb
+
+        config = get_forward_context().omni_diffusion_config
+        parallel_config = config.parallel_config
+        if parallel_config is None or parallel_config.sequence_parallel_size <= 1:
+            return rotary_emb
+
+        from vllm_omni.diffusion.distributed.parallel_state import (
+            get_sequence_parallel_rank,
+            get_sequence_parallel_world_size,
+        )
+
+        world_size = get_sequence_parallel_world_size()
+        rank = get_sequence_parallel_rank()
+
+        sharded_rotary = []
+        for tensor in rotary_emb:
+            seq_len = tensor.size(1)
+            remainder = seq_len % world_size
+            if remainder != 0:
+                pad_size = world_size - remainder
+                pad_shape = list(tensor.shape)
+                pad_shape[1] = pad_size
+                padding = torch.zeros(pad_shape, dtype=tensor.dtype, device=tensor.device)
+                tensor = torch.cat([tensor, padding], dim=1)
+            sharded_rotary.append(tensor.chunk(world_size, dim=1)[rank])
+
+        return tuple(sharded_rotary)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -898,6 +934,7 @@ class WanTransformer3DModel(nn.Module):
 
         # Compute RoPE embeddings (sharded by _sp_plan via split_output=True)
         rotary_emb = self.rope(hidden_states)
+        rotary_emb = self._maybe_shard_rotary_emb_for_debug(rotary_emb)
 
         # Patch embedding and flatten to sequence
         # (hidden_states is sharded at blocks.0 input by _sp_plan)
