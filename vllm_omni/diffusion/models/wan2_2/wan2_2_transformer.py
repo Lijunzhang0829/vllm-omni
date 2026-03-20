@@ -412,6 +412,7 @@ class WanSelfAttention(nn.Module):
             num_kv_heads=self.num_kv_heads,
             softmax_scale=1.0 / (head_dim**0.5),
             causal=False,
+            force_sdpa_when_sequence_parallel=True,
         )
 
     def forward(

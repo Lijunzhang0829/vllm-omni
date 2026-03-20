@@ -19,6 +19,7 @@ from vllm_omni.diffusion.attention.parallel.ring import RingParallelAttention
 from vllm_omni.diffusion.attention.selector import get_attn_backend
 from vllm_omni.diffusion.distributed.parallel_state import get_sp_group
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
+from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
@@ -37,6 +38,7 @@ class Attention(nn.Module):
         gather_idx: int = 1,
         use_sync: bool = False,
         enable_sequence_parallel: bool = True,
+        force_sdpa_when_sequence_parallel: bool = False,
     ):
         super().__init__()
         self.attn_backend = get_attn_backend(-1)
@@ -64,6 +66,7 @@ class Attention(nn.Module):
         self.use_sync = use_sync
         self.causal = causal
         self.enable_sequence_parallel = enable_sequence_parallel
+        self.force_sdpa_when_sequence_parallel = force_sdpa_when_sequence_parallel
 
         self.use_ring = False
         self.ring_pg = None
@@ -127,7 +130,13 @@ class Attention(nn.Module):
         if self.use_ring and strategy is not self._no_parallel_strategy:
             out = self._run_ring_attention(query, key, value, attn_metadata)
         else:
-            out = self._run_local_attention(query, key, value, attn_metadata)
+            out = self._run_local_attention(
+                query,
+                key,
+                value,
+                attn_metadata,
+                sequence_parallel_active=(strategy is not self._no_parallel_strategy),
+            )
 
         # 3. Post-processing (Reverse Communication)
         # For Ulysses: AllToAll Output, and AllGather Joint Output
@@ -135,12 +144,16 @@ class Attention(nn.Module):
 
         return out
 
-    def _run_local_attention(self, query, key, value, attn_metadata):
+    def _run_local_attention(self, query, key, value, attn_metadata, sequence_parallel_active: bool = False):
         if query.dtype == torch.float32:
             logger.warning_once(
                 f"Only SDPA supports float32. Overriding user config {type(self.attention)} "
                 f"attention_backend='{self.backend_pref}' to 'sdpa' for dtype={query.dtype}."
             )
+            return self.sdpa_fallback.forward(query, key, value, attn_metadata)
+
+        if self.force_sdpa_when_sequence_parallel and sequence_parallel_active and current_omni_platform.is_npu():
+            logger.warning_once("Forcing SDPA for sequence-parallel attention on NPU.")
             return self.sdpa_fallback.forward(query, key, value, attn_metadata)
 
         # Fallback to standard attention
