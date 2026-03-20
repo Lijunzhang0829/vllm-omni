@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import math
-import os
 from collections.abc import Iterable
 from typing import Any
 
@@ -249,6 +248,27 @@ class WanImageEmbedding(nn.Module):
         hidden_states = self.ff(hidden_states)
         hidden_states = self.norm2(hidden_states)
         return hidden_states
+
+
+class WanPatchRopePrepare(nn.Module):
+    """Prepare patch-embedded hidden states and RoPE together for SP.
+
+    Wan2.2 applies RoPE over the flattened video-patch sequence. Under sequence
+    parallelism, hidden states and RoPE must be sharded with identical sequence
+    boundaries; otherwise later shards can receive mismatched positional
+    embeddings and corrupt temporal coherence.
+    """
+
+    def __init__(self, patch_embedding: nn.Module, rope: nn.Module):
+        super().__init__()
+        self.patch_embedding = patch_embedding
+        self.rope = rope
+
+    def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        freqs_cos, freqs_sin = self.rope(hidden_states)
+        hidden_states = self.patch_embedding(hidden_states)
+        hidden_states = hidden_states.flatten(2).transpose(1, 2)
+        return hidden_states, freqs_cos, freqs_sin
 
 
 class WanTimeTextImageEmbedding(nn.Module):
@@ -736,53 +756,36 @@ class WanTransformer3DModel(nn.Module):
     # Sequence Parallelism for Wan (following diffusers' _cp_plan pattern)
     #
     # The _sp_plan specifies sharding/gathering at module boundaries:
-    # - rope: Split both RoPE outputs (freqs_cos, freqs_sin) via split_output=True
+    # - patch_rope_prepare: split hidden_states and RoPE together
     # - timestep_proj_prepare: Split timestep_proj for TI2V models (4D tensor)
-    # - blocks.0: Split hidden_states input at the first transformer block
     # - proj_out: Gather outputs after the final projection layer
     #
     # Note: _sp_plan corresponds to diffusers' _cp_plan (Context Parallelism)
-    @staticmethod
-    def _build_sp_plan(enable_rope_split: bool = True) -> dict[str, object]:
-        plan: dict[str, object] = {
-            # Shard timestep_proj for TI2V models (4D tensor: [batch, seq_len, 6, inner_dim])
-            # This is only active when ts_seq_len is not None (TI2V mode)
-            # Output is a single tensor, shard along dim=1 (sequence dimension)
-            "timestep_proj_prepare": {
-                0: SequenceParallelInput(
-                    split_dim=1, expected_dims=4, split_output=True, auto_pad=True
-                ),  # [B, seq, 6, dim]
-            },
-            # Shard hidden_states at first transformer block input
-            # (after patch_embedding + flatten + transpose)
-            "blocks.0": {
-                "hidden_states": SequenceParallelInput(split_dim=1, expected_dims=3, auto_pad=True),  # [B, seq, dim]
-            },
-            # Shard output scale/shift for TI2V (3D); T2V outputs 2D and skips sharding
-            "output_scale_shift_prepare": {
-                0: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True, auto_pad=True),
-                1: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True, auto_pad=True),
-            },
-            # Gather at proj_out (final linear projection before unpatchify)
-            "proj_out": SequenceParallelOutput(gather_dim=1, expected_dims=3),
-        }
-
-        if enable_rope_split:
-            # Shard RoPE embeddings after rope module computes them.
-            # We keep this runtime-toggleable so correctness regressions in
-            # Wan2.2 SP can be isolated without disabling USP entirely.
-            plan["rope"] = {
-                0: SequenceParallelInput(
-                    split_dim=1, expected_dims=4, split_output=True, auto_pad=True
-                ),  # freqs_cos [1, seq, 1, dim]
-                1: SequenceParallelInput(
-                    split_dim=1, expected_dims=4, split_output=True, auto_pad=True
-                ),  # freqs_sin [1, seq, 1, dim]
-            }
-
-        return plan
-
-    _sp_plan = _build_sp_plan(enable_rope_split=True)
+    _sp_plan = {
+        # Shard patch-embedded hidden_states and RoPE with aligned sequence
+        # boundaries. This avoids correctness issues where hidden_states and
+        # rotary embeddings are split independently.
+        "patch_rope_prepare": {
+            0: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True, auto_pad=True),
+            1: SequenceParallelInput(split_dim=1, expected_dims=4, split_output=True, auto_pad=True),
+            2: SequenceParallelInput(split_dim=1, expected_dims=4, split_output=True, auto_pad=True),
+        },
+        # Shard timestep_proj for TI2V models (4D tensor: [batch, seq_len, 6, inner_dim])
+        # This is only active when ts_seq_len is not None (TI2V mode)
+        # Output is a single tensor, shard along dim=1 (sequence dimension)
+        "timestep_proj_prepare": {
+            0: SequenceParallelInput(
+                split_dim=1, expected_dims=4, split_output=True, auto_pad=True
+            ),  # [B, seq, 6, dim]
+        },
+        # Shard output scale/shift for TI2V (3D); T2V outputs 2D and skips sharding
+        "output_scale_shift_prepare": {
+            0: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True, auto_pad=True),
+            1: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True, auto_pad=True),
+        },
+        # Gather at proj_out (final linear projection before unpatchify)
+        "proj_out": SequenceParallelOutput(gather_dim=1, expected_dims=3),
+    }
 
     def __init__(
         self,
@@ -827,18 +830,6 @@ class WanTransformer3DModel(nn.Module):
             },
         )()
 
-        env_value = os.getenv("VLLM_WAN22_SP_SPLIT_ROPE", "1").strip().lower()
-        enable_rope_split = env_value not in {"0", "false", "off", "no"}
-        self._enable_sp_rope_split = enable_rope_split
-        self._sp_plan = self._build_sp_plan(enable_rope_split=enable_rope_split)
-        if enable_rope_split:
-            logger.info("Wan2.2 SP rope splitting is enabled.")
-        else:
-            logger.warning(
-                "Wan2.2 SP rope splitting is disabled via VLLM_WAN22_SP_SPLIT_ROPE; "
-                "use this only for correctness debugging."
-            )
-
         inner_dim = num_attention_heads * attention_head_dim
         out_channels = out_channels or in_channels
 
@@ -874,6 +865,7 @@ class WanTransformer3DModel(nn.Module):
         self.proj_out = nn.Linear(inner_dim, out_channels * math.prod(patch_size))
 
         # SP helper modules
+        self.patch_rope_prepare = WanPatchRopePrepare(self.patch_embedding, self.rope)
         self.timestep_proj_prepare = TimestepProjPrepare()
         self.output_scale_shift_prepare = OutputScaleShiftPrepare(inner_dim)
 
@@ -881,41 +873,6 @@ class WanTransformer3DModel(nn.Module):
     def dtype(self) -> torch.dtype:
         """Return the dtype of the model parameters."""
         return next(self.parameters()).dtype
-
-    def _maybe_shard_rotary_emb_for_debug(
-        self,
-        rotary_emb: tuple[torch.Tensor, torch.Tensor],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Shard RoPE locally when hook-based rope splitting is disabled."""
-        if self._enable_sp_rope_split:
-            return rotary_emb
-
-        config = get_forward_context().omni_diffusion_config
-        parallel_config = config.parallel_config
-        if parallel_config is None or parallel_config.sequence_parallel_size <= 1:
-            return rotary_emb
-
-        from vllm_omni.diffusion.distributed.parallel_state import (
-            get_sequence_parallel_rank,
-            get_sequence_parallel_world_size,
-        )
-
-        world_size = get_sequence_parallel_world_size()
-        rank = get_sequence_parallel_rank()
-
-        sharded_rotary = []
-        for tensor in rotary_emb:
-            seq_len = tensor.size(1)
-            remainder = seq_len % world_size
-            if remainder != 0:
-                pad_size = world_size - remainder
-                pad_shape = list(tensor.shape)
-                pad_shape[1] = pad_size
-                padding = torch.zeros(pad_shape, dtype=tensor.dtype, device=tensor.device)
-                tensor = torch.cat([tensor, padding], dim=1)
-            sharded_rotary.append(tensor.chunk(world_size, dim=1)[rank])
-
-        return tuple(sharded_rotary)
 
     def forward(
         self,
@@ -932,14 +889,9 @@ class WanTransformer3DModel(nn.Module):
         post_patch_height = height // p_h
         post_patch_width = width // p_w
 
-        # Compute RoPE embeddings (sharded by _sp_plan via split_output=True)
-        rotary_emb = self.rope(hidden_states)
-        rotary_emb = self._maybe_shard_rotary_emb_for_debug(rotary_emb)
-
-        # Patch embedding and flatten to sequence
-        # (hidden_states is sharded at blocks.0 input by _sp_plan)
-        hidden_states = self.patch_embedding(hidden_states)
-        hidden_states = hidden_states.flatten(2).transpose(1, 2)
+        # Prepare patch embeddings and RoPE together so SP sees aligned outputs.
+        hidden_states, freqs_cos, freqs_sin = self.patch_rope_prepare(hidden_states)
+        rotary_emb = (freqs_cos, freqs_sin)
 
         # Handle timestep shape
         if timestep.ndim == 2:
