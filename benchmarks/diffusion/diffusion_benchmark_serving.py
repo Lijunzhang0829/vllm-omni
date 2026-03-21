@@ -585,6 +585,7 @@ class RandomDataset(BaseDataset):
         if self.enable_negative_prompt:
             extra_body["negative_prompt"] = f"Negative prompt {idx} for benchmarking diffusion models"
 
+        prompt = self.args.prompt or f"Random prompt {idx} for benchmarking diffusion models"
         params = {
             "width": self.args.width,
             "height": self.args.height,
@@ -594,9 +595,10 @@ class RandomDataset(BaseDataset):
         }
         if self._sampled_requests:
             profile = self._sampled_requests[idx]
+            prompt = profile.get("prompt", prompt)
             params.update(profile)
         return RequestFuncInput(
-            prompt=f"Random prompt {idx} for benchmarking diffusion models",
+            prompt=prompt,
             api_url=self.api_url,
             model=self.model,
             seed=self.args.seed,
@@ -1184,12 +1186,18 @@ if __name__ == "__main__":
         default=None,
         help=(
             "JSON string defining random request profiles. "
-            "Each profile may contain: width, height, num_inference_steps, etc. "
+            "Each profile may contain: prompt, width, height, num_inference_steps, etc. "
             "The 'weight' field controls sampling probability (relative weight). "
             "Example: "
             '[{"width":512,"height":512,"num_inference_steps":20,"weight":0.15},'
             '{"width":768,"height":768,"num_inference_steps":20,"weight":0.85}]'
         ),
+    )
+    parser.add_argument(
+        "--prompt",
+        type=str,
+        default=None,
+        help="Fixed prompt text to use with the random dataset. Can be overridden by per-profile prompt in --random-request-config.",
     )
 
     args = parser.parse_args()
