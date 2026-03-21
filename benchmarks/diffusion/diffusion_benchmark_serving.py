@@ -809,20 +809,68 @@ def _sanitize_filename_part(value: str) -> str:
     return "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in value)
 
 
+def _decode_data_url(url: str) -> tuple[str, bytes] | None:
+    if not url.startswith("data:"):
+        return None
+
+    header, sep, payload = url.partition(",")
+    if not sep:
+        return None
+
+    media_type = "application/octet-stream"
+    if ";" in header:
+        media_type = header[5:].split(";", 1)[0] or media_type
+    elif len(header) > 5:
+        media_type = header[5:]
+
+    suffix = {
+        "image/png": ".png",
+        "image/jpeg": ".jpg",
+        "image/webp": ".webp",
+        "video/mp4": ".mp4",
+    }.get(media_type, ".bin")
+    return suffix, base64.b64decode(payload)
+
+
 def _iter_embedded_media(response_body: dict[str, Any], default_suffix: str) -> list[tuple[str, bytes]]:
     media_items: list[tuple[str, bytes]] = []
     data_items = response_body.get("data")
-    if not isinstance(data_items, list):
+    if isinstance(data_items, list):
+        for item in data_items:
+            if not isinstance(item, dict):
+                continue
+            b64_json = item.get("b64_json")
+            if not isinstance(b64_json, str) or not b64_json:
+                continue
+
+            media_items.append((default_suffix, base64.b64decode(b64_json)))
+
+    choices = response_body.get("choices")
+    if not isinstance(choices, list):
         return media_items
 
-    for item in data_items:
-        if not isinstance(item, dict):
+    for choice in choices:
+        if not isinstance(choice, dict):
             continue
-        b64_json = item.get("b64_json")
-        if not isinstance(b64_json, str) or not b64_json:
+        message = choice.get("message")
+        if not isinstance(message, dict):
             continue
-
-        media_items.append((default_suffix, base64.b64decode(b64_json)))
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for item in content:
+            if not isinstance(item, dict) or item.get("type") != "image_url":
+                continue
+            image_url = item.get("image_url")
+            if not isinstance(image_url, dict):
+                continue
+            url = image_url.get("url")
+            if not isinstance(url, str) or not url:
+                continue
+            decoded = _decode_data_url(url)
+            if decoded is None:
+                continue
+            media_items.append(decoded)
 
     return media_items
 
