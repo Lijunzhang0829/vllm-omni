@@ -32,7 +32,6 @@ from vllm_omni.diffusion.data import (
 )
 from vllm_omni.diffusion.distributed.parallel_state import (
     destroy_distributed_env,
-    get_world_group,
     init_distributed_environment,
     initialize_model_parallel,
 )
@@ -509,56 +508,6 @@ class WorkerProc:
             "Wan22Pipeline",
         }
 
-    def _get_preemption_min_free_memory_bytes(self) -> int:
-        configured_gb = getattr(self.od_config, "diffusion_preemption_min_free_memory_gb", None)
-        if configured_gb is None:
-            # NPU HSDP/FSDP unshard can require a sizable HCCL workspace at
-            # runtime, so a tiny default headroom is not enough to make
-            # arrival-time preemption decisions safe.
-            configured_gb = 4.0 if current_omni_platform.is_npu() else 0.0
-        return max(0, int(float(configured_gb) * GiB_bytes))
-
-    def _get_synced_min_free_memory_bytes(self) -> int | None:
-        free_bytes = current_omni_platform.get_free_memory(self.worker.device)
-        if not (
-            torch.distributed.is_available()
-            and torch.distributed.is_initialized()
-            and self.od_config.num_gpus
-            and self.od_config.num_gpus > 1
-        ):
-            return int(free_bytes)
-
-        world_group = get_world_group()
-        if current_omni_platform.is_npu():
-            # HCCL may need a large device-side workspace even for tiny tensors.
-            # Use the CPU/gloo world group for this diagnostic MIN reduction so
-            # the low-memory check itself does not trigger an NPU OOM.
-            free_tensor = torch.tensor([int(free_bytes)], dtype=torch.int64)
-            torch.distributed.all_reduce(
-                free_tensor,
-                op=torch.distributed.ReduceOp.MIN,
-                group=world_group.cpu_group,
-            )
-            return int(free_tensor.item())
-
-        free_tensor = torch.tensor([int(free_bytes)], device=self.worker.device, dtype=torch.int64)
-        torch.distributed.all_reduce(
-            free_tensor,
-            op=torch.distributed.ReduceOp.MIN,
-            group=world_group.device_group,
-        )
-        return int(free_tensor.item())
-
-    def _should_skip_preemption_due_to_memory(self) -> tuple[bool, int | None, int]:
-        min_required_bytes = self._get_preemption_min_free_memory_bytes()
-        if min_required_bytes <= 0:
-            return False, None, min_required_bytes
-
-        synced_free_bytes = self._get_synced_min_free_memory_bytes()
-        if synced_free_bytes is None:
-            return False, None, min_required_bytes
-        return synced_free_bytes < min_required_bytes, synced_free_bytes, min_required_bytes
-
     def _enqueue_generation_req(self, req: OmniDiffusionRequest) -> None:
         req.get_or_assign_priority()
         req.preempt_enabled = self._supports_step_preemption()
@@ -575,19 +524,6 @@ class WorkerProc:
             f"req_id={incoming_req_id} preempt_enabled={req.preempt_enabled}",
             flush=True,
         )
-        if self._current_req is not None and req.preempt_enabled:
-            skip_preempt, synced_free_bytes, min_required_bytes = self._should_skip_preemption_due_to_memory()
-            if skip_preempt:
-                self._scheduling_policy.defer_request(req)
-                if self.gpu_id == 0:
-                    print(
-                        f"[DiffusionPreemptSkip][{self._now_str()}][rank={self.gpu_id}] "
-                        f"req_id={incoming_req_id} reason=low_memory "
-                        f"free_gib={(synced_free_bytes or 0) / GiB_bytes:.2f} "
-                        f"threshold_gib={min_required_bytes / GiB_bytes:.2f}",
-                        flush=True,
-                    )
-                return
         decision = self._scheduling_policy.on_request_arrival(req, self._current_req)
         for dropped_id in self._scheduling_policy.consume_recent_dropped_request_ids():
             print(

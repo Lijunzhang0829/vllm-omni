@@ -441,7 +441,6 @@ class OmniDiffusionConfig:
 
     # Diffusion scheduling behavior
     disable_diffusion_preemption: bool = False
-    diffusion_preemption_min_free_memory_gb: float | None = None
 
     # Omni configuration (injected from stage config)
     omni_kv_config: dict[str, Any] = field(default_factory=dict)

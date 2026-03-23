@@ -7,6 +7,7 @@ from __future__ import annotations
 import argparse
 import os
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -50,10 +51,58 @@ def _parse_devices(devices_arg: str | None, num_servers: int) -> list[str]:
     return devices[:num_servers]
 
 
-def _wait_for_health(base_url: str, timeout_s: int) -> bool:
-    deadline = time.time() + timeout_s
+def _parse_cpu_range_list(value: str) -> list[int]:
+    nodes: list[int] = []
+    for part in value.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            start_str, end_str = part.split("-", 1)
+            start = int(start_str)
+            end = int(end_str)
+            nodes.extend(range(start, end + 1))
+        else:
+            nodes.append(int(part))
+    return nodes
+
+
+def _get_online_numa_nodes() -> list[int]:
+    online_path = Path("/sys/devices/system/node/online")
+    try:
+        return _parse_cpu_range_list(online_path.read_text(encoding="utf-8").strip())
+    except Exception:
+        return [0]
+
+
+def _pick_numa_node(device: str, index: int, numa_nodes: list[int]) -> int | None:
+    if len(numa_nodes) <= 1:
+        return None
+
+    try:
+        device_id = int(device)
+    except ValueError:
+        device_id = index
+
+    if device_id in numa_nodes:
+        return device_id
+    return numa_nodes[index % len(numa_nodes)]
+
+
+def _wrap_with_numa_binding(command: list[str], numa_node: int | None) -> list[str]:
+    if numa_node is None:
+        return command
+    return [
+        "numactl",
+        f"--cpunodebind={numa_node}",
+        f"--membind={numa_node}",
+        *command,
+    ]
+
+
+def _wait_for_health(base_url: str) -> bool:
     health_url = f"{base_url.rstrip('/')}/health"
-    while time.time() < deadline:
+    while True:
         try:
             with urllib.request.urlopen(health_url, timeout=5) as response:
                 if response.status == 200:
@@ -62,7 +111,6 @@ def _wait_for_health(base_url: str, timeout_s: int) -> bool:
             time.sleep(1)
             continue
         time.sleep(1)
-    return False
 
 
 def _start_process(
@@ -125,18 +173,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dispatcher-port", type=int, default=8090, help="Dispatcher port.")
     parser.add_argument("--dispatcher-host", default="0.0.0.0", help="Dispatcher listen host.")
     parser.add_argument(
-        "--max-inflight-per-backend",
-        type=int,
-        default=2,
-        help="Inflight cap passed to the dispatcher. Set <=0 to disable.",
-    )
-    parser.add_argument(
-        "--startup-timeout",
-        type=int,
-        default=600,
-        help="Per-backend health wait timeout in seconds.",
-    )
-    parser.add_argument(
         "--log-dir",
         default=None,
         help="Directory for server and dispatcher logs. Default: benchmarks/diffusion/logs/<timestamp>",
@@ -167,17 +203,20 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     devices = _parse_devices(args.devices, args.num_servers)
+    numa_nodes = _get_online_numa_nodes()
+    numactl_path = shutil.which("numactl")
+    enable_numa_binding = len(numa_nodes) > 1 and numactl_path is not None
     timestamp = time.strftime("%Y%m%d-%H%M%S")
     log_dir = Path(args.log_dir) if args.log_dir else DEFAULT_LOG_ROOT / f"multi-server-{timestamp}"
     extra_server_args = shlex.split(args.extra_server_args)
 
     backend_urls = []
-    backend_commands: list[tuple[str, list[str], str, str, Path]] = []
+    backend_commands: list[tuple[str, list[str], str, str, Path, int | None]] = []
     for index, device in enumerate(devices):
         port = args.base_port + index
         base_url = f"http://{args.host}:{port}"
         backend_urls.append(base_url)
-        command = [
+        base_command = [
             args.vllm_command,
             "serve",
             args.model,
@@ -188,8 +227,10 @@ def main() -> int:
             args.host,
             *extra_server_args,
         ]
+        numa_node = _pick_numa_node(device, index, numa_nodes) if enable_numa_binding else None
+        command = _wrap_with_numa_binding(base_command, numa_node)
         log_path = log_dir / f"server-{index}.log"
-        backend_commands.append((f"server-{index}", command, device, base_url, log_path))
+        backend_commands.append((f"server-{index}", command, device, base_url, log_path, numa_node))
 
     dispatcher_command = [
         sys.executable,
@@ -198,15 +239,14 @@ def main() -> int:
         args.dispatcher_host,
         "--port",
         str(args.dispatcher_port),
-        "--max-inflight-per-backend",
-        str(args.max_inflight_per_backend),
         "--backend-urls",
         *backend_urls,
     ]
 
     if args.print_commands_only:
-        for name, command, device, _base_url, log_path in backend_commands:
-            print(f"[{name}] device={device} log={log_path}")
+        for name, command, device, _base_url, log_path, numa_node in backend_commands:
+            numa_suffix = "" if numa_node is None else f" numa={numa_node}"
+            print(f"[{name}] device={device}{numa_suffix} log={log_path}")
             print(" ".join(shlex.quote(part) for part in command))
         if not args.no_dispatcher:
             print(f"[dispatcher] log={log_dir / 'dispatcher.log'}")
@@ -225,21 +265,28 @@ def main() -> int:
     signal.signal(signal.SIGTERM, _handle_signal)
 
     try:
-        for name, command, device, base_url, log_path in backend_commands:
+        if len(numa_nodes) > 1 and not enable_numa_binding:
+            print(
+                f"Warning: detected NUMA nodes {numa_nodes} but `numactl` is unavailable. "
+                "Backend servers will start without NUMA binding."
+            )
+
+        for name, command, device, base_url, log_path, numa_node in backend_commands:
             env = os.environ.copy()
             env["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
             env["ASCEND_RT_VISIBLE_DEVICES"] = device
             process = _start_process(name=name, command=command, env=env, log_path=log_path)
             processes.append(process)
-            print(f"Started {name} on device {device} at {base_url} -> log {log_path}")
+            numa_suffix = "" if numa_node is None else f" numa={numa_node}"
+            print(f"Started {name} on device {device}{numa_suffix} at {base_url} -> log {log_path}")
 
         for index, base_url in enumerate(backend_urls):
             if stop_requested:
                 break
             print(f"Waiting for server-{index} health: {base_url}/health")
-            healthy = _wait_for_health(base_url, args.startup_timeout)
+            healthy = _wait_for_health(base_url)
             if not healthy:
-                raise RuntimeError(f"server-{index} did not become healthy within {args.startup_timeout}s")
+                raise RuntimeError(f"server-{index} failed health check")
             print(f"server-{index} is healthy")
 
         if stop_requested:

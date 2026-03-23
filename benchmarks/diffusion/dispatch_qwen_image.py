@@ -78,23 +78,15 @@ class BackendState:
 
 
 class BackendPool:
-    def __init__(self, backend_urls: list[str], max_inflight_per_backend: int):
+    def __init__(self, backend_urls: list[str]):
         self.backends = [
             BackendState(name=f"server-{idx}", base_url=url.rstrip("/")) for idx, url in enumerate(backend_urls)
         ]
-        self.max_inflight_per_backend = max_inflight_per_backend
         self._lock = threading.Lock()
 
     def choose_backend(self, estimated_cost: int) -> BackendState:
         with self._lock:
-            candidates = [
-                backend
-                for backend in self.backends
-                if backend.healthy
-                and (self.max_inflight_per_backend <= 0 or backend.inflight_requests < self.max_inflight_per_backend)
-            ]
-            if not candidates:
-                candidates = [backend for backend in self.backends if backend.healthy]
+            candidates = [backend for backend in self.backends if backend.healthy]
             if not candidates:
                 raise RuntimeError("No healthy backends available")
 
@@ -296,12 +288,6 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help="Backend base URLs, e.g. http://127.0.0.1:8091 http://127.0.0.1:8092",
     )
-    parser.add_argument(
-        "--max-inflight-per-backend",
-        type=int,
-        default=2,
-        help="Inflight request cap per backend. Set <=0 to disable.",
-    )
     parser.add_argument("--healthcheck-interval", type=int, default=5, help="Healthcheck interval in seconds.")
     parser.add_argument("--healthcheck-timeout", type=int, default=5, help="Healthcheck timeout in seconds.")
     parser.add_argument(
@@ -315,7 +301,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    pool = BackendPool(args.backend_urls, max_inflight_per_backend=args.max_inflight_per_backend)
+    pool = BackendPool(args.backend_urls)
     DispatcherHandler.pool = pool
     DispatcherHandler.request_timeout_s = args.request_timeout
 
