@@ -89,15 +89,44 @@ def _pick_numa_node(device: str, index: int, numa_nodes: list[int]) -> int | Non
     return numa_nodes[index % len(numa_nodes)]
 
 
-def _wrap_with_numa_binding(command: list[str], numa_node: int | None) -> list[str]:
+def _require_numa_binding_mode(numa_nodes: list[int], numactl_path: str | None) -> str:
+    if len(numa_nodes) <= 1:
+        return "disabled"
+    if numactl_path is None:
+        raise RuntimeError(
+            f"Detected NUMA nodes {numa_nodes} but `numactl` is not installed. "
+            "Install `numactl` and restart the launcher."
+        )
+
+    probe_node = str(numa_nodes[0])
+
+    membind_probe = subprocess.run(
+        [numactl_path, f"--cpunodebind={probe_node}", f"--membind={probe_node}", "/bin/true"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    if membind_probe.returncode == 0:
+        return "cpu+membind"
+
+    raise RuntimeError(
+        f"Detected NUMA nodes {numa_nodes} but `numactl --cpunodebind={probe_node} --membind={probe_node}` "
+        "is not permitted in the current environment. Fix the container/host permissions "
+        "(for example `--privileged` or the required capabilities/cpuset settings) before launching."
+    )
+
+
+def _wrap_with_numa_binding(command: list[str], numa_node: int | None, binding_mode: str) -> list[str]:
     if numa_node is None:
         return command
-    return [
-        "numactl",
-        f"--cpunodebind={numa_node}",
-        f"--membind={numa_node}",
-        *command,
-    ]
+    if binding_mode == "cpu+membind":
+        return [
+            "numactl",
+            f"--cpunodebind={numa_node}",
+            f"--membind={numa_node}",
+            *command,
+        ]
+    return command
 
 
 def _wait_for_health(base_url: str) -> bool:
@@ -188,6 +217,11 @@ def parse_args() -> argparse.Namespace:
         help="Extra arguments appended to each `vllm serve` command.",
     )
     parser.add_argument(
+        "--disable-diffusion-preemption",
+        action="store_true",
+        help="Disable step-level diffusion preemption on every backend server.",
+    )
+    parser.add_argument(
         "--no-dispatcher",
         action="store_true",
         help="Only start backend servers, do not start the dispatcher.",
@@ -205,7 +239,8 @@ def main() -> int:
     devices = _parse_devices(args.devices, args.num_servers)
     numa_nodes = _get_online_numa_nodes()
     numactl_path = shutil.which("numactl")
-    enable_numa_binding = len(numa_nodes) > 1 and numactl_path is not None
+    numa_binding_mode = _require_numa_binding_mode(numa_nodes, numactl_path)
+    enable_numa_binding = numa_binding_mode != "disabled"
     timestamp = time.strftime("%Y%m%d-%H%M%S")
     log_dir = Path(args.log_dir) if args.log_dir else DEFAULT_LOG_ROOT / f"multi-server-{timestamp}"
     extra_server_args = shlex.split(args.extra_server_args)
@@ -227,8 +262,10 @@ def main() -> int:
             args.host,
             *extra_server_args,
         ]
+        if args.disable_diffusion_preemption:
+            base_command.append("--disable-diffusion-preemption")
         numa_node = _pick_numa_node(device, index, numa_nodes) if enable_numa_binding else None
-        command = _wrap_with_numa_binding(base_command, numa_node)
+        command = _wrap_with_numa_binding(base_command, numa_node, numa_binding_mode)
         log_path = log_dir / f"server-{index}.log"
         backend_commands.append((f"server-{index}", command, device, base_url, log_path, numa_node))
 
@@ -265,16 +302,11 @@ def main() -> int:
     signal.signal(signal.SIGTERM, _handle_signal)
 
     try:
-        if len(numa_nodes) > 1 and not enable_numa_binding:
-            print(
-                f"Warning: detected NUMA nodes {numa_nodes} but `numactl` is unavailable. "
-                "Backend servers will start without NUMA binding."
-            )
-
         for name, command, device, base_url, log_path, numa_node in backend_commands:
             env = os.environ.copy()
             env["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
             env["ASCEND_RT_VISIBLE_DEVICES"] = device
+            env["PYTHONUNBUFFERED"] = "1"
             process = _start_process(name=name, command=command, env=env, log_path=log_path)
             processes.append(process)
             numa_suffix = "" if numa_node is None else f" numa={numa_node}"
@@ -295,6 +327,7 @@ def main() -> int:
         if not args.no_dispatcher:
             dispatcher_log = log_dir / "dispatcher.log"
             dispatcher_env = os.environ.copy()
+            dispatcher_env["PYTHONUNBUFFERED"] = "1"
             dispatcher = _start_process(
                 name="dispatcher",
                 command=dispatcher_command,
