@@ -1194,6 +1194,12 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--random-request-seed",
+        type=int,
+        default=42,
+        help="Seed for sampling request profiles from --random-request-config.",
+    )
+    parser.add_argument(
         "--prompt",
         type=str,
         default=None,

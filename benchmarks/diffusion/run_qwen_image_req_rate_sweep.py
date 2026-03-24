@@ -75,6 +75,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset", type=str, default="random", help="Benchmark dataset.")
     parser.add_argument("--task", type=str, default="t2i", help="Benchmark task.")
     parser.add_argument("--num-prompts", type=int, default=200, help="Number of prompts per run.")
+    parser.add_argument("--seed", type=int, default=42, help="Diffusion generation seed passed to every request.")
+    parser.add_argument(
+        "--random-request-seed",
+        type=int,
+        default=42,
+        help="Seed for sampling request profiles from --random-request-config.",
+    )
     parser.add_argument("--max-concurrency", type=int, default=1000, help="Max in-flight requests.")
     parser.add_argument("--warmup-requests", type=int, default=1, help="Warmup request count.")
     parser.add_argument(
@@ -127,6 +134,10 @@ def build_command(args: argparse.Namespace, rate: str, metrics_path: Path, log_p
         args.task,
         "--num-prompts",
         str(args.num_prompts),
+        "--seed",
+        str(args.seed),
+        "--random-request-seed",
+        str(args.random_request_seed),
         "--max-concurrency",
         str(args.max_concurrency),
         "--request-rate",
