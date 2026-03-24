@@ -41,8 +41,10 @@ from vllm_omni.diffusion.profiler import CurrentProfiler
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.scheduling_policy import (
+    DelayXPolicy,
     DiffusionSchedulingPolicy,
     TargetFreeGlobalReorderPolicy,
+    estimate_remaining_cost,
     req_debug_id,
     req_step_index,
 )
@@ -364,11 +366,20 @@ class WorkerProc:
         self.worker = self._create_worker(gpu_id, od_config, worker_extension_cls, custom_pipeline_args)
         self._running = True
         self._current_req: OmniDiffusionRequest | None = None
-        self._scheduling_policy: DiffusionSchedulingPolicy = TargetFreeGlobalReorderPolicy(
-            aging_alpha=self.od_config.diffusion_request_aging_alpha,
-            aging_cap=self.od_config.diffusion_request_aging_cap,
-            aging_cost_ref=self.od_config.diffusion_request_aging_cost_ref,
-        )
+        scheduling_policy_name = getattr(self.od_config, "diffusion_scheduling_policy", "shortest-remaining")
+        normalized_policy = "delay-x" if scheduling_policy_name == "delay_x" else scheduling_policy_name
+        if normalized_policy == "delay-x":
+            self._scheduling_policy = DelayXPolicy(
+                quota_every=self.od_config.delay_x_quota_every,
+                quota_amount=self.od_config.delay_x_quota_amount,
+                tail_penalty=self.od_config.delay_x_tail_penalty,
+            )
+        else:
+            self._scheduling_policy = TargetFreeGlobalReorderPolicy(
+                aging_alpha=self.od_config.diffusion_request_aging_alpha,
+                aging_cap=self.od_config.diffusion_request_aging_cap,
+                aging_cost_ref=self.od_config.diffusion_request_aging_cost_ref,
+            )
 
     def _create_worker(
         self,
@@ -534,6 +545,12 @@ class WorkerProc:
                 f"[DiffusionDrop][{self._now_str()}][rank={self.gpu_id}] req_id={dropped_id} reason=aborted",
                 flush=True,
             )
+        for sacrificial_id in self._scheduling_policy.consume_recent_sacrificial_request_ids():
+            print(
+                f"[DiffusionDelayX][{self._now_str()}][rank={self.gpu_id}] "
+                f"req_id={sacrificial_id} marked=sacrificial",
+                flush=True,
+            )
         if decision.preemption is not None:
             preempted_req_id = self._req_debug_id(decision.preemption.preempted_req)
             current_step = self._req_step_index(decision.preemption.preempted_req)
@@ -550,7 +567,7 @@ class WorkerProc:
 
     def _schedule_next_after_finish(self) -> OmniDiffusionRequest | None:
         # Global rescheduling decision point #2: current request finished.
-        next_req = self._scheduling_policy.on_request_finish()
+        next_req = self._scheduling_policy.on_request_finish(self._current_req)
         for dropped_id in self._scheduling_policy.consume_recent_dropped_request_ids():
             print(
                 f"[DiffusionDrop][{self._now_str()}][rank={self.gpu_id}] req_id={dropped_id} reason=aborted",
@@ -723,7 +740,13 @@ class WorkerProc:
                 continue
 
             try:
+                before_cost = estimate_remaining_cost(self._current_req)
+                started_at_s = time.perf_counter()
                 output = self.worker.execute_model(self._current_req, self.od_config)
+                elapsed_s = time.perf_counter() - started_at_s
+                after_cost = 0.0 if output.finished else estimate_remaining_cost(self._current_req)
+                work_done = max(0.0, before_cost - after_cost)
+                self._scheduling_policy.observe_execution(self._current_req, elapsed_s, work_done)
             except Exception as e:
                 failed_req_id = self._req_debug_id(self._current_req)
                 failed_step = self._req_step_index(self._current_req)

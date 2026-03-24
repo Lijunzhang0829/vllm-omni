@@ -441,9 +441,13 @@ class OmniDiffusionConfig:
 
     # Diffusion scheduling behavior
     disable_diffusion_preemption: bool = False
+    diffusion_scheduling_policy: str = "shortest-remaining"
     diffusion_request_aging_alpha: float = 0.0
     diffusion_request_aging_cap: float = 8.0
     diffusion_request_aging_cost_ref: float = float(1024 * 1024 * 25)
+    delay_x_quota_every: int = 20
+    delay_x_quota_amount: int = 1
+    delay_x_tail_penalty: float = 100.0
 
     # Omni configuration (injected from stage config)
     omni_kv_config: dict[str, Any] = field(default_factory=dict)

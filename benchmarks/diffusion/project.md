@@ -59,11 +59,10 @@ python benchmarks/diffusion/launch_qwen_image_servers.py \
   --dispatcher-host 0.0.0.0 \
   --base-port 8091 \
   --dispatcher-port 8090 \
-  --dispatcher-scheduling-policy delay_x \
+  --diffusion-scheduling-policy delay_x \
   --delay-x-quota-every 20 \
   --delay-x-quota-amount 1 \
   --delay-x-tail-penalty 100 \
-  --delay-x-split-dispatch-loads \
   --extra-server-args "--dtype bfloat16 --vae-use-slicing --vae-use-tiling"
 ```
 

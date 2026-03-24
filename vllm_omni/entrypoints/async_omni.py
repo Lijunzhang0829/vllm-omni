@@ -183,11 +183,15 @@ class AsyncOmni(OmniBase):
                     "vae_use_slicing": kwargs.get("vae_use_slicing", False),
                     "vae_use_tiling": kwargs.get("vae_use_tiling", False),
                     "disable_diffusion_preemption": kwargs.get("disable_diffusion_preemption", False),
+                    "diffusion_scheduling_policy": kwargs.get("diffusion_scheduling_policy", "shortest-remaining"),
                     "diffusion_request_aging_alpha": kwargs.get("diffusion_request_aging_alpha", 0.0),
                     "diffusion_request_aging_cap": kwargs.get("diffusion_request_aging_cap", 8.0),
                     "diffusion_request_aging_cost_ref": kwargs.get(
                         "diffusion_request_aging_cost_ref", float(1024 * 1024 * 25)
                     ),
+                    "delay_x_quota_every": kwargs.get("delay_x_quota_every", 20),
+                    "delay_x_quota_amount": kwargs.get("delay_x_quota_amount", 1),
+                    "delay_x_tail_penalty": kwargs.get("delay_x_tail_penalty", 100.0),
                     "cache_backend": cache_backend,
                     "cache_config": cache_config,
                     "enable_cache_dit_summary": kwargs.get("enable_cache_dit_summary", False),

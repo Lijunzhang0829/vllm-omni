@@ -327,6 +327,13 @@ class OmniServeCommand(CLISubcommand):
             help="Disable step-level diffusion preemption for models that support it.",
         )
         omni_config_group.add_argument(
+            "--diffusion-scheduling-policy",
+            choices=["shortest-remaining", "delay-x", "delay_x"],
+            default="shortest-remaining",
+            help="Backend diffusion scheduling policy. `shortest-remaining` keeps the existing policy. "
+            "`delay_x` prioritizes the largest predicted delay and demotes sacrificial requests.",
+        )
+        omni_config_group.add_argument(
             "--diffusion-request-aging-alpha",
             type=float,
             default=0.0,
@@ -345,6 +352,24 @@ class OmniServeCommand(CLISubcommand):
             default=float(1024 * 1024 * 25),
             help="Reference work unit for diffusion request aging normalization. "
             "Default is the cost of 1024x1024 with 25 inference steps.",
+        )
+        omni_config_group.add_argument(
+            "--delay-x-quota-every",
+            type=int,
+            default=20,
+            help="For backend delay_x scheduling, issue sacrificial quota every N arrivals.",
+        )
+        omni_config_group.add_argument(
+            "--delay-x-quota-amount",
+            type=int,
+            default=1,
+            help="For backend delay_x scheduling, number of sacrificial marks issued per quota event.",
+        )
+        omni_config_group.add_argument(
+            "--delay-x-tail-penalty",
+            type=float,
+            default=100.0,
+            help="For backend delay_x scheduling, demote sacrificial requests by this factor while preserving order.",
         )
 
         # TTS-specific parameters

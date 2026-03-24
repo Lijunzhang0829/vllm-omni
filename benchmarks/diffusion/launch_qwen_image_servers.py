@@ -242,38 +242,33 @@ def parse_args() -> argparse.Namespace:
         "Default is the cost of 1024x1024 with 25 inference steps.",
     )
     parser.add_argument(
-        "--no-dispatcher",
-        action="store_true",
-        help="Only start backend servers, do not start the dispatcher.",
-    )
-    parser.add_argument(
-        "--dispatcher-scheduling-policy",
-        choices=["least-load", "shortest-remaining", "delay-x", "delay_x"],
-        default="least-load",
-        help="Scheduling policy passed to the dispatcher.",
+        "--diffusion-scheduling-policy",
+        choices=["shortest-remaining", "delay-x", "delay_x"],
+        default="shortest-remaining",
+        help="Backend diffusion scheduling policy forwarded to every backend server.",
     )
     parser.add_argument(
         "--delay-x-quota-every",
         type=int,
         default=20,
-        help="Generate one delay-x sacrificial quota every N arrivals.",
+        help="For backend delay_x scheduling, issue sacrificial quota every N arrivals.",
     )
     parser.add_argument(
         "--delay-x-quota-amount",
         type=int,
         default=1,
-        help="Delay-x sacrificial quota amount generated per period.",
+        help="For backend delay_x scheduling, number of sacrificial marks per quota event.",
     )
     parser.add_argument(
         "--delay-x-tail-penalty",
         type=float,
         default=100.0,
-        help="Delay-x tail penalty factor.",
+        help="For backend delay_x scheduling, demote sacrificial requests by this factor.",
     )
     parser.add_argument(
-        "--delay-x-split-dispatch-loads",
+        "--no-dispatcher",
         action="store_true",
-        help="Dispatch normal requests by normal-load and sacrificial requests by total-load in delay-x mode.",
+        help="Only start backend servers, do not start the dispatcher.",
     )
     parser.add_argument(
         "--print-commands-only",
@@ -285,7 +280,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    dispatcher_policy = "delay-x" if args.dispatcher_scheduling_policy == "delay_x" else args.dispatcher_scheduling_policy
+    backend_policy = "delay-x" if args.diffusion_scheduling_policy == "delay_x" else args.diffusion_scheduling_policy
     devices = _parse_devices(args.devices, args.num_servers)
     numa_nodes = _get_online_numa_nodes()
     numactl_path = shutil.which("numactl")
@@ -326,6 +321,24 @@ def main() -> int:
                     str(args.diffusion_request_aging_cost_ref),
                 ]
             )
+        if backend_policy != "shortest-remaining":
+            base_command.extend(
+                [
+                    "--diffusion-scheduling-policy",
+                    backend_policy,
+                ]
+            )
+        if backend_policy == "delay-x":
+            base_command.extend(
+                [
+                    "--delay-x-quota-every",
+                    str(args.delay_x_quota_every),
+                    "--delay-x-quota-amount",
+                    str(args.delay_x_quota_amount),
+                    "--delay-x-tail-penalty",
+                    str(args.delay_x_tail_penalty),
+                ]
+            )
         numa_node = _pick_numa_node(device, index, numa_nodes) if enable_numa_binding else None
         command = _wrap_with_numa_binding(base_command, numa_node, numa_binding_mode)
         log_path = log_dir / f"server-{index}.log"
@@ -338,24 +351,9 @@ def main() -> int:
         args.dispatcher_host,
         "--port",
         str(args.dispatcher_port),
-        "--scheduling-policy",
-        dispatcher_policy,
         "--backend-urls",
         *backend_urls,
     ]
-    if dispatcher_policy == "delay-x":
-        dispatcher_command.extend(
-            [
-                "--delay-x-quota-every",
-                str(args.delay_x_quota_every),
-                "--delay-x-quota-amount",
-                str(args.delay_x_quota_amount),
-                "--delay-x-tail-penalty",
-                str(args.delay_x_tail_penalty),
-            ]
-        )
-        if args.delay_x_split_dispatch_loads:
-            dispatcher_command.append("--delay-x-split-dispatch-loads")
 
     if args.print_commands_only:
         for name, command, device, _base_url, log_path, numa_node in backend_commands:
