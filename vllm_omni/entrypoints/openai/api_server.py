@@ -100,6 +100,7 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.serving_video import OmniOpenAIServingVideo
+from vllm_omni.diffusion.worker.scheduling_policy import DELAY_X_DISPATCHER_QUOTA_EXTRA_ARG_KEY
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams, OmniTextPrompt
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.lora.utils import stable_lora_int_id
@@ -1032,6 +1033,8 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
             gen_params, "seed", request.seed if request.seed is not None else random.randint(0, 2**32 - 1)
         )
         _update_if_not_none(gen_params, "generator_device", request.generator_device)
+        if request.dispatcher_delay_x_quota_amount is not None:
+            gen_params.extra_args[DELAY_X_DISPATCHER_QUOTA_EXTRA_ARG_KEY] = request.dispatcher_delay_x_quota_amount
 
         request_id = f"img_gen_{uuid.uuid4().hex}"
 

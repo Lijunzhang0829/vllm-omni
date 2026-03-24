@@ -19,6 +19,7 @@ QWEN_IMAGE_PROFILE_LATENCY_S: dict[tuple[int, int, int, int], float] = {
 }
 QWEN_IMAGE_FALLBACK_REFERENCE_KEY = (1024, 1024, 25, 1)
 QWEN_IMAGE_FALLBACK_REFERENCE_LATENCY_S = QWEN_IMAGE_PROFILE_LATENCY_S[QWEN_IMAGE_FALLBACK_REFERENCE_KEY]
+DELAY_X_DISPATCHER_QUOTA_EXTRA_ARG_KEY = "_delay_x_dispatcher_quota_amount"
 
 
 def req_debug_id(req: OmniDiffusionRequest) -> str:
@@ -298,6 +299,13 @@ class DelayXPolicy:
         if self._quota_every > 0 and self._arrival_counter % self._quota_every == 0:
             for _ in range(self._quota_amount):
                 self._issue_sacrificial_quota(current_req)
+        external_quota = req.sampling_params.extra_args.pop(DELAY_X_DISPATCHER_QUOTA_EXTRA_ARG_KEY, 0)
+        try:
+            external_quota_i = max(0, int(external_quota))
+        except Exception:
+            external_quota_i = 0
+        for _ in range(external_quota_i):
+            self._issue_sacrificial_quota(current_req)
 
         if current_req is None and not self._queued_request_keys:
             return ArrivalDecision(current_req=req)

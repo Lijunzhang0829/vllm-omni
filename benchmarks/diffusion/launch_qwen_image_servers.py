@@ -251,7 +251,9 @@ def parse_args() -> argparse.Namespace:
         "--delay-x-quota-every",
         type=int,
         default=20,
-        help="For backend delay_x scheduling, issue sacrificial quota every N arrivals.",
+        help="For delay_x scheduling, issue one sacrificial quota every N arrivals. "
+        "With dispatcher enabled, quotas are generated globally and RR-assigned to backends. "
+        "With --no-dispatcher, quotas are generated locally inside each backend.",
     )
     parser.add_argument(
         "--delay-x-quota-amount",
@@ -329,10 +331,11 @@ def main() -> int:
                 ]
             )
         if backend_policy == "delay-x":
+            backend_quota_every = args.delay_x_quota_every if args.no_dispatcher else 0
             base_command.extend(
                 [
                     "--delay-x-quota-every",
-                    str(args.delay_x_quota_every),
+                    str(backend_quota_every),
                     "--delay-x-quota-amount",
                     str(args.delay_x_quota_amount),
                     "--delay-x-tail-penalty",
@@ -354,6 +357,15 @@ def main() -> int:
         "--backend-urls",
         *backend_urls,
     ]
+    if backend_policy == "delay-x" and not args.no_dispatcher:
+        dispatcher_command.extend(
+            [
+                "--delay-x-quota-every",
+                str(args.delay_x_quota_every),
+                "--delay-x-quota-amount",
+                str(args.delay_x_quota_amount),
+            ]
+        )
 
     if args.print_commands_only:
         for name, command, device, _base_url, log_path, numa_node in backend_commands:

@@ -18,6 +18,7 @@ from vllm.renderers.protocol import BaseRenderer
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.protocol.chat_completion import OmniChatCompletionResponse
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
+from vllm_omni.diffusion.worker.scheduling_policy import DELAY_X_DISPATCHER_QUOTA_EXTRA_ARG_KEY
 
 try:
     import soundfile
@@ -2043,6 +2044,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 num_outputs_per_prompt=num_outputs_per_prompt,
                 seed=seed,
             )
+            dispatcher_delay_x_quota = extra_body.get(DELAY_X_DISPATCHER_QUOTA_EXTRA_ARG_KEY)
+            if dispatcher_delay_x_quota is not None:
+                gen_params.extra_args[DELAY_X_DISPATCHER_QUOTA_EXTRA_ARG_KEY] = dispatcher_delay_x_quota
 
             if guidance_scale is not None:
                 gen_params.guidance_scale = guidance_scale
