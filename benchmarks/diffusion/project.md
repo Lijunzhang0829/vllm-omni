@@ -59,6 +59,11 @@ python benchmarks/diffusion/launch_qwen_image_servers.py \
   --dispatcher-host 0.0.0.0 \
   --base-port 8091 \
   --dispatcher-port 8090 \
+  --dispatcher-scheduling-policy delay_x \
+  --delay-x-quota-every 20 \
+  --delay-x-quota-amount 1 \
+  --delay-x-tail-penalty 100 \
+  --delay-x-split-dispatch-loads \
   --extra-server-args "--dtype bfloat16 --vae-use-slicing --vae-use-tiling"
 ```
 
@@ -77,7 +82,7 @@ python benchmarks/diffusion/run_qwen_image_req_rate_sweep.py \
   --warmup-requests 1 \
   --enable-negative-prompt \
   --request-rates 0.1,0.25,0.4,0.55,0.7,0.85,1 \
-  --output-dir benchmarks/diffusion/results/qwen_image_preempt \
+  --output-dir benchmarks/diffusion/results/qwen_image_delay_x \
   --random-request-config '[
     {"width":512,"height":512,"num_inference_steps":20,"weight":0.15},
     {"width":768,"height":768,"num_inference_steps":20,"weight":0.25},

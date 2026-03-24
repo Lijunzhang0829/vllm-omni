@@ -218,6 +218,7 @@ ehthumbs.db
 Thumbs.db
 
 # Data files
+benchmarks/diffusion/sim/
 data/
 datasets/
 *.csv

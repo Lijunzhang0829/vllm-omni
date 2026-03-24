@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Least-load dispatcher for multiple Qwen-Image backends."""
+"""Dispatcher for multi-server Qwen-Image deployment."""
 
 from __future__ import annotations
 
@@ -10,13 +10,14 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 
 DEFAULT_REQUEST_TIMEOUT_S = 60 * 60
+DEFAULT_SECONDS_PER_COST_S = 33.9 / float(1024 * 1024 * 25)
 
 
 def _parse_size(size: str | None) -> tuple[int | None, int | None]:
@@ -61,6 +62,27 @@ def estimate_request_cost(payload: dict[str, Any]) -> int:
 
 
 @dataclass
+class PendingRequest:
+    request_id: int
+    path: str
+    body: bytes
+    headers: dict[str, str]
+    payload: dict[str, Any]
+    estimated_cost: int
+    estimated_service_s: float
+    arrival_time_s: float
+    sacrificial: bool = False
+    started_at_s: float | None = None
+    completed_at_s: float | None = None
+    backend_name: str = ""
+    response_status: int = 0
+    response_body: bytes = b""
+    response_headers: dict[str, str] = field(default_factory=dict)
+    error_message: str = ""
+    done_event: threading.Event = field(default_factory=threading.Event)
+
+
+@dataclass
 class BackendState:
     name: str
     base_url: str
@@ -72,9 +94,30 @@ class BackendState:
     latency_ema_s: float = 0.0
     last_error: str = ""
     last_healthcheck_ts: float = 0.0
+    active_request: PendingRequest | None = None
+    queued_requests: list[PendingRequest] = field(default_factory=list)
 
     def score(self) -> tuple[int, int, float, str]:
         return (self.inflight_cost, self.inflight_requests, self.latency_ema_s, self.name)
+
+
+def proxy_request(
+    method: str,
+    url: str,
+    body: bytes | None,
+    headers: dict[str, str],
+    timeout_s: int,
+) -> tuple[int, bytes, dict[str, str]]:
+    request = urllib.request.Request(url=url, data=body, method=method)
+    for key, value in headers.items():
+        if key.lower() == "host":
+            continue
+        request.add_header(key, value)
+
+    with urllib.request.urlopen(request, timeout=timeout_s) as response:
+        response_body = response.read()
+        response_headers = {key: value for key, value in response.headers.items()}
+        return response.status, response_body, response_headers
 
 
 class BackendPool:
@@ -143,27 +186,301 @@ class BackendPool:
             ]
 
 
-def proxy_request(
-    method: str,
-    url: str,
-    body: bytes | None,
-    headers: dict[str, str],
-    timeout_s: int,
-) -> tuple[int, bytes, dict[str, str]]:
-    request = urllib.request.Request(url=url, data=body, method=method)
-    for key, value in headers.items():
-        if key.lower() == "host":
-            continue
-        request.add_header(key, value)
+class QueuedBackendPool:
+    def __init__(
+        self,
+        backend_urls: list[str],
+        scheduling_policy: str,
+        request_timeout_s: int,
+        delay_x_quota_every: int,
+        delay_x_quota_amount: int,
+        delay_x_tail_penalty: float,
+        delay_x_split_dispatch_loads: bool,
+        initial_seconds_per_cost_s: float = DEFAULT_SECONDS_PER_COST_S,
+    ) -> None:
+        self.backends = [
+            BackendState(name=f"server-{idx}", base_url=url.rstrip("/")) for idx, url in enumerate(backend_urls)
+        ]
+        self.scheduling_policy = scheduling_policy
+        self.request_timeout_s = request_timeout_s
+        self.delay_x_quota_every = delay_x_quota_every
+        self.delay_x_quota_amount = delay_x_quota_amount
+        self.delay_x_tail_penalty = delay_x_tail_penalty
+        self.delay_x_split_dispatch_loads = delay_x_split_dispatch_loads
 
-    with urllib.request.urlopen(request, timeout=timeout_s) as response:
-        response_body = response.read()
-        response_headers = {key: value for key, value in response.headers.items()}
-        return response.status, response_body, response_headers
+        self._condition = threading.Condition()
+        self._shutdown = False
+        self._request_counter = 0
+        self._arrival_counter = 0
+        self._next_delay_x_backend_index = 0
+        self._seconds_per_cost_ema = initial_seconds_per_cost_s
+        self._workers = [
+            threading.Thread(target=self._backend_loop, args=(backend,), daemon=True) for backend in self.backends
+        ]
+        for worker in self._workers:
+            worker.start()
+
+    def _estimate_service_s_locked(self, estimated_cost: int) -> float:
+        return max(0.001, estimated_cost * self._seconds_per_cost_ema)
+
+    def _remaining_service_s_locked(self, request: PendingRequest, now_s: float) -> float:
+        if request.started_at_s is None:
+            return request.estimated_service_s
+        return max(0.0, request.estimated_service_s - (now_s - request.started_at_s))
+
+    def _predicted_latency_s_locked(self, request: PendingRequest, now_s: float) -> float:
+        return max(0.0, now_s - request.arrival_time_s) + self._remaining_service_s_locked(request, now_s)
+
+    def _normal_load_s_locked(self, backend: BackendState, now_s: float) -> float:
+        total = 0.0
+        if backend.active_request is not None and not backend.active_request.sacrificial:
+            total += self._remaining_service_s_locked(backend.active_request, now_s)
+        for request in backend.queued_requests:
+            if not request.sacrificial:
+                total += request.estimated_service_s
+        return total
+
+    def _total_load_s_locked(self, backend: BackendState, now_s: float) -> float:
+        total = 0.0
+        if backend.active_request is not None:
+            total += self._remaining_service_s_locked(backend.active_request, now_s)
+        for request in backend.queued_requests:
+            total += request.estimated_service_s
+        return total
+
+    def _request_priority_locked(self, request: PendingRequest, now_s: float) -> tuple[float, float, int]:
+        if self.scheduling_policy == "delay-x":
+            predicted_latency_s = self._predicted_latency_s_locked(request, now_s)
+            if request.sacrificial:
+                predicted_latency_s /= self.delay_x_tail_penalty
+            return (-predicted_latency_s, request.arrival_time_s, request.request_id)
+
+        remaining_service_s = self._remaining_service_s_locked(request, now_s)
+        return (remaining_service_s, request.arrival_time_s, request.request_id)
+
+    def _select_next_request_locked(self, backend: BackendState, now_s: float) -> PendingRequest | None:
+        if not backend.queued_requests:
+            return None
+        next_request = min(
+            backend.queued_requests,
+            key=lambda request: self._request_priority_locked(request, now_s),
+        )
+        backend.queued_requests.remove(next_request)
+        return next_request
+
+    def _delay_x_base_priority_locked(self, request: PendingRequest, now_s: float) -> tuple[float, float, int]:
+        predicted_latency_s = self._predicted_latency_s_locked(request, now_s)
+        return (-predicted_latency_s, request.arrival_time_s, request.request_id)
+
+    def _select_delay_x_sacrificial_candidate_locked(
+        self,
+        backend: BackendState,
+        now_s: float,
+    ) -> PendingRequest | None:
+        candidates = [request for request in backend.queued_requests if not request.sacrificial]
+        if not candidates:
+            return None
+
+        ordered = sorted(candidates, key=lambda request: self._delay_x_base_priority_locked(request, now_s))
+        active_remaining_s = 0.0
+        if backend.active_request is not None:
+            active_remaining_s = self._remaining_service_s_locked(backend.active_request, now_s)
+
+        cumulative_wait_s = active_remaining_s
+        selected: PendingRequest | None = None
+        selected_latency_s = -1.0
+        for request in ordered:
+            predicted_completion_latency_s = (
+                max(0.0, now_s - request.arrival_time_s) + cumulative_wait_s + request.estimated_service_s
+            )
+            if predicted_completion_latency_s > selected_latency_s:
+                selected = request
+                selected_latency_s = predicted_completion_latency_s
+            cumulative_wait_s += request.estimated_service_s
+        return selected
+
+    def _issue_delay_x_quota_locked(self) -> None:
+        if not self.backends:
+            return
+        backend = self.backends[self._next_delay_x_backend_index % len(self.backends)]
+        self._next_delay_x_backend_index = (self._next_delay_x_backend_index + 1) % len(self.backends)
+        candidate = self._select_delay_x_sacrificial_candidate_locked(backend, time.perf_counter())
+        if candidate is not None:
+            candidate.sacrificial = True
+
+    def _select_dispatch_backend_locked(self, sacrificial: bool) -> BackendState:
+        healthy_backends = [backend for backend in self.backends if backend.healthy]
+        if not healthy_backends:
+            raise RuntimeError("No healthy backends available")
+
+        now_s = time.perf_counter()
+        if self.scheduling_policy == "delay-x" and self.delay_x_split_dispatch_loads:
+            return min(
+                healthy_backends,
+                key=lambda backend: (
+                    self._total_load_s_locked(backend, now_s)
+                    if sacrificial
+                    else self._normal_load_s_locked(backend, now_s),
+                    len(backend.queued_requests) + (1 if backend.active_request is not None else 0),
+                    backend.name,
+                ),
+            )
+
+        return min(
+            healthy_backends,
+            key=lambda backend: (
+                self._total_load_s_locked(backend, now_s),
+                len(backend.queued_requests) + (1 if backend.active_request is not None else 0),
+                backend.name,
+            ),
+        )
+
+    def submit_request(
+        self,
+        path: str,
+        body: bytes,
+        headers: dict[str, str],
+        payload: dict[str, Any],
+    ) -> PendingRequest:
+        estimated_cost = estimate_request_cost(payload)
+        with self._condition:
+            if self.scheduling_policy == "delay-x":
+                self._arrival_counter += 1
+                if self.delay_x_quota_every > 0 and self._arrival_counter % self.delay_x_quota_every == 0:
+                    for _ in range(self.delay_x_quota_amount):
+                        self._issue_delay_x_quota_locked()
+            sacrificial = False
+            backend = self._select_dispatch_backend_locked(sacrificial)
+            self._request_counter += 1
+            request = PendingRequest(
+                request_id=self._request_counter,
+                path=path,
+                body=body,
+                headers=headers,
+                payload=payload,
+                estimated_cost=estimated_cost,
+                estimated_service_s=self._estimate_service_s_locked(estimated_cost),
+                arrival_time_s=time.perf_counter(),
+                sacrificial=sacrificial,
+                backend_name=backend.name,
+            )
+            backend.queued_requests.append(request)
+            self._condition.notify_all()
+            return request
+
+    def _backend_loop(self, backend: BackendState) -> None:
+        while True:
+            request: PendingRequest | None = None
+            with self._condition:
+                while True:
+                    if self._shutdown:
+                        return
+                    if backend.healthy and backend.active_request is None:
+                        request = self._select_next_request_locked(backend, time.perf_counter())
+                        if request is not None:
+                            backend.active_request = request
+                            backend.inflight_requests = 1
+                            backend.inflight_cost = request.estimated_cost
+                            request.started_at_s = time.perf_counter()
+                            break
+                    self._condition.wait()
+
+            assert request is not None
+            latency_s = 0.0
+            success = False
+            error = ""
+            try:
+                status, response_body, response_headers = proxy_request(
+                    "POST",
+                    f"{backend.base_url}{request.path}",
+                    request.body,
+                    request.headers,
+                    self.request_timeout_s,
+                )
+                latency_s = time.perf_counter() - request.started_at_s
+                success = True
+                request.response_status = status
+                request.response_body = response_body
+                request.response_headers = response_headers
+            except urllib.error.HTTPError as exc:
+                latency_s = time.perf_counter() - request.started_at_s
+                error = f"HTTP {exc.code}"
+                request.response_status = exc.code
+                request.response_body = exc.read()
+                request.response_headers = {"Content-Type": exc.headers.get_content_type()}
+            except Exception as exc:  # noqa: BLE001
+                latency_s = time.perf_counter() - request.started_at_s
+                error = str(exc)
+                request.error_message = error
+                request.response_status = HTTPStatus.BAD_GATEWAY
+                request.response_body = json.dumps({"error": f"{backend.name} failed: {error}"}).encode("utf-8")
+                request.response_headers = {"Content-Type": "application/json"}
+
+            with self._condition:
+                request.completed_at_s = time.perf_counter()
+                request.done_event.set()
+                backend.active_request = None
+                backend.inflight_requests = 0
+                backend.inflight_cost = 0
+                backend.last_error = error
+                if success:
+                    backend.completed_requests += 1
+                    backend.healthy = True
+                else:
+                    backend.failed_requests += 1
+                if latency_s > 0 and request.estimated_cost > 0:
+                    backend.latency_ema_s = latency_s if backend.latency_ema_s <= 0 else 0.8 * backend.latency_ema_s + 0.2 * latency_s
+                    observed_seconds_per_cost = latency_s / float(request.estimated_cost)
+                    self._seconds_per_cost_ema = 0.9 * self._seconds_per_cost_ema + 0.1 * observed_seconds_per_cost
+                self._condition.notify_all()
+
+    def set_health(self, backend: BackendState, healthy: bool, error: str = "") -> None:
+        with self._condition:
+            backend.healthy = healthy
+            backend.last_error = error
+            backend.last_healthcheck_ts = time.time()
+            self._condition.notify_all()
+
+    def snapshot(self) -> list[dict[str, Any]]:
+        with self._condition:
+            now_s = time.perf_counter()
+            return [
+                {
+                    "name": backend.name,
+                    "base_url": backend.base_url,
+                    "healthy": backend.healthy,
+                    "inflight_requests": backend.inflight_requests,
+                    "inflight_cost": backend.inflight_cost,
+                    "queued_requests": len(backend.queued_requests),
+                    "normal_load_s": round(self._normal_load_s_locked(backend, now_s), 4),
+                    "total_load_s": round(self._total_load_s_locked(backend, now_s), 4),
+                    "active_request_id": None if backend.active_request is None else backend.active_request.request_id,
+                    "completed_requests": backend.completed_requests,
+                    "failed_requests": backend.failed_requests,
+                    "latency_ema_s": round(backend.latency_ema_s, 4),
+                    "last_error": backend.last_error,
+                    "last_healthcheck_ts": backend.last_healthcheck_ts,
+                }
+                for backend in self.backends
+            ]
+
+    def pick_backend_for_get(self) -> BackendState:
+        with self._condition:
+            healthy_backends = [backend for backend in self.backends if backend.healthy]
+            if not healthy_backends:
+                raise RuntimeError("No healthy backends available")
+            now_s = time.perf_counter()
+            return min(
+                healthy_backends,
+                key=lambda backend: (
+                    self._total_load_s_locked(backend, now_s),
+                    backend.name,
+                ),
+            )
 
 
 class DispatcherHandler(BaseHTTPRequestHandler):
-    pool: BackendPool
+    pool: BackendPool | QueuedBackendPool
     request_timeout_s: int
 
     def _read_body(self) -> bytes:
@@ -197,11 +514,14 @@ class DispatcherHandler(BaseHTTPRequestHandler):
             return
 
         if self.path == "/v1/models":
-            backends = [backend for backend in self.pool.backends if backend.healthy]
-            if not backends:
-                self._json_error(HTTPStatus.SERVICE_UNAVAILABLE, "No healthy backends available")
+            try:
+                backend = self.pool.pick_backend_for_get() if isinstance(self.pool, QueuedBackendPool) else min(
+                    [item for item in self.pool.backends if item.healthy],
+                    key=lambda item: item.score(),
+                )
+            except Exception as exc:  # noqa: BLE001
+                self._json_error(HTTPStatus.SERVICE_UNAVAILABLE, str(exc))
                 return
-            backend = min(backends, key=lambda item: item.score())
             try:
                 status, body, headers = proxy_request(
                     "GET",
@@ -215,7 +535,7 @@ class DispatcherHandler(BaseHTTPRequestHandler):
             except urllib.error.HTTPError as exc:
                 self.pool.set_health(backend, False, f"HTTP {exc.code}")
                 self._write_response(exc.code, exc.read(), {"Content-Type": exc.headers.get_content_type()})
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 self.pool.set_health(backend, False, str(exc))
                 self._json_error(HTTPStatus.BAD_GATEWAY, str(exc))
             return
@@ -230,15 +550,31 @@ class DispatcherHandler(BaseHTTPRequestHandler):
         body = self._read_body()
         try:
             payload = json.loads(body.decode("utf-8")) if body else {}
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             self._json_error(HTTPStatus.BAD_REQUEST, f"Invalid JSON body: {exc}")
+            return
+
+        if isinstance(self.pool, QueuedBackendPool):
+            try:
+                request = self.pool.submit_request(
+                    path=self.path,
+                    body=body,
+                    headers=dict(self.headers.items()),
+                    payload=payload,
+                )
+            except Exception as exc:  # noqa: BLE001
+                self._json_error(HTTPStatus.SERVICE_UNAVAILABLE, str(exc))
+                return
+
+            request.done_event.wait()
+            self._write_response(request.response_status, request.response_body, request.response_headers)
             return
 
         estimated_cost = estimate_request_cost(payload)
         started_at = time.perf_counter()
         try:
             backend = self.pool.choose_backend(estimated_cost)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             self._json_error(HTTPStatus.SERVICE_UNAVAILABLE, str(exc))
             return
 
@@ -258,7 +594,7 @@ class DispatcherHandler(BaseHTTPRequestHandler):
             error_body = exc.read()
             self.pool.complete_backend(backend, estimated_cost, latency_s, False, f"HTTP {exc.code}")
             self._write_response(exc.code, error_body, {"Content-Type": exc.headers.get_content_type()})
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             latency_s = time.perf_counter() - started_at
             self.pool.complete_backend(backend, estimated_cost, latency_s, False, str(exc))
             self._json_error(HTTPStatus.BAD_GATEWAY, f"{backend.name} failed: {exc}")
@@ -267,19 +603,19 @@ class DispatcherHandler(BaseHTTPRequestHandler):
         return
 
 
-def healthcheck_loop(pool: BackendPool, interval_s: int, timeout_s: int) -> None:
+def healthcheck_loop(pool: BackendPool | QueuedBackendPool, interval_s: int, timeout_s: int) -> None:
     while True:
         for backend in pool.backends:
             try:
                 status, _, _ = proxy_request("GET", f"{backend.base_url}/health", None, {}, timeout_s)
                 pool.set_health(backend, status == HTTPStatus.OK, "" if status == HTTPStatus.OK else f"HTTP {status}")
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 pool.set_health(backend, False, str(exc))
         time.sleep(interval_s)
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Least-load dispatcher for multi-server Qwen-Image deployment.")
+    parser = argparse.ArgumentParser(description="Dispatcher for multi-server Qwen-Image deployment.")
     parser.add_argument("--host", default="0.0.0.0", help="Dispatcher listen host.")
     parser.add_argument("--port", type=int, default=8090, help="Dispatcher listen port.")
     parser.add_argument(
@@ -296,12 +632,55 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_REQUEST_TIMEOUT_S,
         help="Proxy request timeout in seconds.",
     )
+    parser.add_argument(
+        "--scheduling-policy",
+        choices=["least-load", "shortest-remaining", "delay-x", "delay_x"],
+        default="least-load",
+        help="Dispatcher scheduling policy. `least-load` preserves the original behavior. "
+        "`shortest-remaining` and `delay-x` use dispatcher-managed local queues.",
+    )
+    parser.add_argument(
+        "--delay-x-quota-every",
+        type=int,
+        default=20,
+        help="Generate delay-x sacrificial quota every N arrivals.",
+    )
+    parser.add_argument(
+        "--delay-x-quota-amount",
+        type=int,
+        default=1,
+        help="Delay-x sacrificial quota generated per period.",
+    )
+    parser.add_argument(
+        "--delay-x-tail-penalty",
+        type=float,
+        default=100.0,
+        help="Divide sacrificial predicted-delay score by this factor so it runs later but still preserves order.",
+    )
+    parser.add_argument(
+        "--delay-x-split-dispatch-loads",
+        action="store_true",
+        help="Dispatch normal requests by normal-load and sacrificial requests by total-load.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    pool = BackendPool(args.backend_urls)
+    normalized_policy = "delay-x" if args.scheduling_policy == "delay_x" else args.scheduling_policy
+    if args.scheduling_policy == "least-load":
+        pool: BackendPool | QueuedBackendPool = BackendPool(args.backend_urls)
+    else:
+        pool = QueuedBackendPool(
+            backend_urls=args.backend_urls,
+            scheduling_policy=normalized_policy,
+            request_timeout_s=args.request_timeout,
+            delay_x_quota_every=args.delay_x_quota_every,
+            delay_x_quota_amount=args.delay_x_quota_amount,
+            delay_x_tail_penalty=args.delay_x_tail_penalty,
+            delay_x_split_dispatch_loads=args.delay_x_split_dispatch_loads,
+        )
+
     DispatcherHandler.pool = pool
     DispatcherHandler.request_timeout_s = args.request_timeout
 
@@ -314,6 +693,7 @@ def main() -> None:
 
     server = ThreadingHTTPServer((args.host, args.port), DispatcherHandler)
     print(f"Dispatcher listening on http://{args.host}:{args.port}")
+    print(f"Scheduling policy: {normalized_policy}")
     for backend in pool.backends:
         print(f"  - {backend.name}: {backend.base_url}")
     server.serve_forever()
