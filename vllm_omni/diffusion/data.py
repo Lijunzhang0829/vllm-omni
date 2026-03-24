@@ -447,6 +447,7 @@ class OmniDiffusionConfig:
     diffusion_request_aging_cost_ref: float = float(1024 * 1024 * 25)
     delay_x_quota_every: int = 20
     delay_x_quota_amount: int = 1
+    delay_x_threshold_ratio: float = 0.8
     delay_x_tail_penalty: float = 100.0
 
     # Omni configuration (injected from stage config)

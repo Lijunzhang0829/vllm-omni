@@ -366,6 +366,13 @@ class OmniServeCommand(CLISubcommand):
             help="For backend delay_x scheduling, number of sacrificial marks issued per quota event.",
         )
         omni_config_group.add_argument(
+            "--delay-x-threshold-ratio",
+            type=float,
+            default=0.8,
+            help="For backend delay_x scheduling, mark a newly arrived request as sacrificial when its estimated "
+            "service is at least this fraction of the observed maximum service.",
+        )
+        omni_config_group.add_argument(
             "--delay-x-tail-penalty",
             type=float,
             default=100.0,

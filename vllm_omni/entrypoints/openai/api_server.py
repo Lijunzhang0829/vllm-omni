@@ -100,7 +100,7 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.serving_video import OmniOpenAIServingVideo
-from vllm_omni.diffusion.worker.scheduling_policy import DELAY_X_DISPATCHER_QUOTA_EXTRA_ARG_KEY
+from vllm_omni.diffusion.worker.scheduling_policy import DELAY_X_DISPATCHER_SACRIFICIAL_EXTRA_ARG_KEY
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams, OmniTextPrompt
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.lora.utils import stable_lora_int_id
@@ -150,8 +150,7 @@ def _remove_route_from_router(
 
 
 ENDPOINT_LOAD_METRICS_FORMAT_HEADER_LABEL = "endpoint-load-metrics-format"
-DELAY_X_MAX_ACTIVE_LATENCY_HEADER = "X-DelayX-Max-Active-Latency"
-DELAY_X_DISPATCHER_QUOTA_HEADER = "X-DelayX-Dispatcher-Quota-Amount"
+DELAY_X_DISPATCHER_SACRIFICIAL_HEADER = "X-DelayX-Sacrificial"
 
 
 def _remove_route_from_app(app, path: str, methods: set[str] | None = None):
@@ -167,34 +166,6 @@ def _remove_route_from_app(app, path: str, methods: set[str] | None = None):
 
     for route in routes_to_remove:
         app.routes.remove(route)
-
-
-def _delay_x_header_from_metrics(metrics: dict[str, Any] | None) -> dict[str, str]:
-    if not isinstance(metrics, dict):
-        return {}
-    value = metrics.get("delay_x_max_active_latency_s")
-    if value is None:
-        return {}
-    try:
-        value_f = max(0.0, float(value))
-    except Exception:
-        return {}
-    return {DELAY_X_MAX_ACTIVE_LATENCY_HEADER: f"{value_f:.6f}"}
-
-
-def _extract_result_metrics(result: Any) -> dict[str, Any] | None:
-    metrics = getattr(result, "metrics", None)
-    if isinstance(metrics, dict):
-        return metrics
-    request_output = getattr(result, "request_output", None)
-    metrics = getattr(request_output, "metrics", None)
-    if isinstance(metrics, dict):
-        return metrics
-    if isinstance(request_output, dict):
-        metrics = request_output.get("metrics")
-        if isinstance(metrics, dict):
-            return metrics
-    return None
 
 
 class _DiffusionServingModels:
@@ -828,7 +799,6 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         import json as json_lib
         import warnings as warnings_module
         response_headers = dict(metrics_header(metrics_header_format) or {})
-        response_headers.update(_delay_x_header_from_metrics(getattr(generator, "metrics", None)))
 
         # Temporarily suppress ALL Pydantic UserWarnings during serialization
         with warnings_module.catch_warnings():
@@ -1065,11 +1035,11 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
             gen_params, "seed", request.seed if request.seed is not None else random.randint(0, 2**32 - 1)
         )
         _update_if_not_none(gen_params, "generator_device", request.generator_device)
-        dispatcher_delay_x_quota = request.dispatcher_delay_x_quota_amount
-        if dispatcher_delay_x_quota is None:
-            dispatcher_delay_x_quota = raw_request.headers.get(DELAY_X_DISPATCHER_QUOTA_HEADER)
-        if dispatcher_delay_x_quota is not None:
-            gen_params.extra_args[DELAY_X_DISPATCHER_QUOTA_EXTRA_ARG_KEY] = dispatcher_delay_x_quota
+        dispatcher_delay_x_sacrificial = request.dispatcher_delay_x_sacrificial
+        if dispatcher_delay_x_sacrificial is None:
+            dispatcher_delay_x_sacrificial = raw_request.headers.get(DELAY_X_DISPATCHER_SACRIFICIAL_HEADER)
+        if dispatcher_delay_x_sacrificial is not None:
+            gen_params.extra_args[DELAY_X_DISPATCHER_SACRIFICIAL_EXTRA_ARG_KEY] = dispatcher_delay_x_sacrificial
 
         request_id = f"img_gen_{uuid.uuid4().hex}"
 
@@ -1104,7 +1074,6 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
         )
         return JSONResponse(
             content=response.model_dump(mode="json"),
-            headers=_delay_x_header_from_metrics(_extract_result_metrics(result)),
         )
 
     except HTTPException:
@@ -1269,7 +1238,6 @@ async def edit_images(
         )
         return JSONResponse(
             content=response.model_dump(mode="json"),
-            headers=_delay_x_header_from_metrics(_extract_result_metrics(result)),
         )
 
     except HTTPException:

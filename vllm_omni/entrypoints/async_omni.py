@@ -191,6 +191,7 @@ class AsyncOmni(OmniBase):
                     ),
                     "delay_x_quota_every": kwargs.get("delay_x_quota_every", 20),
                     "delay_x_quota_amount": kwargs.get("delay_x_quota_amount", 1),
+                    "delay_x_threshold_ratio": kwargs.get("delay_x_threshold_ratio", 0.8),
                     "delay_x_tail_penalty": kwargs.get("delay_x_tail_penalty", 100.0),
                     "cache_backend": cache_backend,
                     "cache_config": cache_config,

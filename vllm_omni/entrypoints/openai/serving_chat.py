@@ -18,7 +18,7 @@ from vllm.renderers.protocol import BaseRenderer
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.protocol.chat_completion import OmniChatCompletionResponse
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
-from vllm_omni.diffusion.worker.scheduling_policy import DELAY_X_DISPATCHER_QUOTA_EXTRA_ARG_KEY
+from vllm_omni.diffusion.worker.scheduling_policy import DELAY_X_DISPATCHER_SACRIFICIAL_EXTRA_ARG_KEY
 
 try:
     import soundfile
@@ -2044,11 +2044,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 num_outputs_per_prompt=num_outputs_per_prompt,
                 seed=seed,
             )
-            dispatcher_delay_x_quota = extra_body.get(DELAY_X_DISPATCHER_QUOTA_EXTRA_ARG_KEY)
-            if dispatcher_delay_x_quota is None and raw_request is not None:
-                dispatcher_delay_x_quota = raw_request.headers.get(DELAY_X_DISPATCHER_QUOTA_HEADER)
-            if dispatcher_delay_x_quota is not None:
-                gen_params.extra_args[DELAY_X_DISPATCHER_QUOTA_EXTRA_ARG_KEY] = dispatcher_delay_x_quota
+            dispatcher_delay_x_sacrificial = extra_body.get(DELAY_X_DISPATCHER_SACRIFICIAL_EXTRA_ARG_KEY)
+            if dispatcher_delay_x_sacrificial is None and raw_request is not None:
+                dispatcher_delay_x_sacrificial = raw_request.headers.get(DELAY_X_DISPATCHER_SACRIFICIAL_HEADER)
+            if dispatcher_delay_x_sacrificial is not None:
+                gen_params.extra_args[DELAY_X_DISPATCHER_SACRIFICIAL_EXTRA_ARG_KEY] = (
+                    dispatcher_delay_x_sacrificial
+                )
 
             if guidance_scale is not None:
                 gen_params.guidance_scale = guidance_scale
@@ -2323,4 +2325,4 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 code=status_code,
             )
         )
-DELAY_X_DISPATCHER_QUOTA_HEADER = "X-DelayX-Dispatcher-Quota-Amount"
+DELAY_X_DISPATCHER_SACRIFICIAL_HEADER = "X-DelayX-Sacrificial"

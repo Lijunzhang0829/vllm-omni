@@ -251,21 +251,34 @@ def parse_args() -> argparse.Namespace:
         "--delay-x-quota-every",
         type=int,
         default=20,
-        help="For delay_x scheduling, issue one sacrificial quota every N arrivals. "
-        "With dispatcher enabled, quotas are generated globally and RR-assigned to backends. "
-        "With --no-dispatcher, quotas are generated locally inside each backend.",
+        help="For delay_x scheduling, add one sacrificial credit every N arrivals. "
+        "With dispatcher enabled, credits are generated globally and used to statically mark "
+        "newly arrived heavy requests as sacrificial. With --no-dispatcher, credits are generated locally inside each backend.",
     )
     parser.add_argument(
         "--delay-x-quota-amount",
         type=int,
         default=1,
-        help="For backend delay_x scheduling, number of sacrificial marks per quota event.",
+        help="For delay_x scheduling, number of sacrificial credits generated per quota event.",
+    )
+    parser.add_argument(
+        "--delay-x-threshold-ratio",
+        type=float,
+        default=0.8,
+        help="For delay_x scheduling, mark a newly arrived request as sacrificial when its estimated service "
+        "is at least this fraction of the observed maximum service.",
     )
     parser.add_argument(
         "--delay-x-tail-penalty",
         type=float,
         default=100.0,
         help="For backend delay_x scheduling, demote sacrificial requests by this factor.",
+    )
+    parser.add_argument(
+        "--delay-x-sacrificial-load-factor",
+        type=float,
+        default=0.3,
+        help="For dispatcher routing, count sacrificial requests as this fraction of normal load.",
     )
     parser.add_argument(
         "--no-dispatcher",
@@ -338,6 +351,8 @@ def main() -> int:
                     str(backend_quota_every),
                     "--delay-x-quota-amount",
                     str(args.delay_x_quota_amount),
+                    "--delay-x-threshold-ratio",
+                    str(args.delay_x_threshold_ratio),
                     "--delay-x-tail-penalty",
                     str(args.delay_x_tail_penalty),
                 ]
@@ -364,6 +379,10 @@ def main() -> int:
                 str(args.delay_x_quota_every),
                 "--delay-x-quota-amount",
                 str(args.delay_x_quota_amount),
+                "--delay-x-threshold-ratio",
+                str(args.delay_x_threshold_ratio),
+                "--delay-x-sacrificial-load-factor",
+                str(args.delay_x_sacrificial_load_factor),
             ]
         )
 

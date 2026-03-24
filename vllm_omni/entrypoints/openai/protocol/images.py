@@ -108,10 +108,11 @@ class ImageGenerationRequest(BaseModel):
     # VAE memory optimizations (set at model init, included for completeness)
     vae_use_slicing: bool | None = Field(default=False, description="Enable VAE slicing")
     vae_use_tiling: bool | None = Field(default=False, description="Enable VAE tiling")
-    dispatcher_delay_x_quota_amount: int | None = Field(
+    dispatcher_delay_x_sacrificial: bool | None = Field(
         default=None,
         exclude=True,
-        description="Internal dispatcher metadata for delay_x quota propagation.",
+        validation_alias="dispatcher_delay_x_quota_amount",
+        description="Internal dispatcher metadata for delay_x sacrificial propagation.",
     )
 
 
