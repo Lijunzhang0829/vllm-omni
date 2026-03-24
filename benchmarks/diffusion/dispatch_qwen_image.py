@@ -18,6 +18,7 @@ from typing import Any
 
 DEFAULT_REQUEST_TIMEOUT_S = 60 * 60
 DELAY_X_DISPATCHER_QUOTA_EXTRA_BODY_KEY = "_delay_x_dispatcher_quota_amount"
+DELAY_X_MAX_ACTIVE_LATENCY_HEADER = "X-DelayX-Max-Active-Latency"
 
 
 def _parse_size(size: str | None) -> tuple[int | None, int | None]:
@@ -113,6 +114,7 @@ class BackendPool:
         self._arrival_counter = 0
         self._next_delay_x_backend_index = 0
         self._pending_delay_x_quotas: dict[str, int] = {backend.name: 0 for backend in self.backends}
+        self._max_active_latency_s: dict[str, float] = {backend.name: 0.0 for backend in self.backends}
 
     def choose_backend(self, estimated_cost: int) -> tuple[BackendState, int]:
         with self._lock:
@@ -122,9 +124,9 @@ class BackendPool:
                 and self._delay_x_quota_amount > 0
                 and self._arrival_counter % self._delay_x_quota_every == 0
             ):
-                quota_backend = self.backends[self._next_delay_x_backend_index % len(self.backends)]
-                self._next_delay_x_backend_index = (self._next_delay_x_backend_index + 1) % len(self.backends)
+                quota_backend = self._select_quota_backend_locked()
                 self._pending_delay_x_quotas[quota_backend.name] += self._delay_x_quota_amount
+                self._max_active_latency_s[quota_backend.name] = 0.0
 
             candidates = [backend for backend in self.backends if backend.healthy]
             if not candidates:
@@ -145,6 +147,7 @@ class BackendPool:
         latency_s: float,
         success: bool,
         error: str,
+        reported_max_active_latency_s: float | None = None,
     ) -> None:
         with self._lock:
             backend.inflight_requests = max(0, backend.inflight_requests - 1)
@@ -160,6 +163,9 @@ class BackendPool:
                     backend.latency_ema_s = latency_s
                 else:
                     backend.latency_ema_s = 0.8 * backend.latency_ema_s + 0.2 * latency_s
+            if reported_max_active_latency_s is not None:
+                backend_name = backend.name
+                self._max_active_latency_s[backend_name] = max(0.0, float(reported_max_active_latency_s))
 
     def set_health(self, backend: BackendState, healthy: bool, error: str = "") -> None:
         with self._lock:
@@ -180,11 +186,29 @@ class BackendPool:
                     "failed_requests": backend.failed_requests,
                     "latency_ema_s": round(backend.latency_ema_s, 4),
                     "pending_delay_x_quota": self._pending_delay_x_quotas.get(backend.name, 0),
+                    "max_active_latency_s": round(self._max_active_latency_s.get(backend.name, 0.0), 4),
                     "last_error": backend.last_error,
                     "last_healthcheck_ts": backend.last_healthcheck_ts,
                 }
                 for backend in self.backends
             ]
+
+    def _select_quota_backend_locked(self) -> BackendState:
+        healthy_backends = [backend for backend in self.backends if backend.healthy]
+        candidates = healthy_backends or self.backends
+        selected = max(
+            candidates,
+            key=lambda backend: (
+                self._max_active_latency_s.get(backend.name, 0.0),
+                -backend.inflight_cost,
+                -backend.inflight_requests,
+                -self.backends.index(backend),
+            ),
+        )
+        if self._max_active_latency_s.get(selected.name, 0.0) <= 0:
+            selected = self.backends[self._next_delay_x_backend_index % len(self.backends)]
+        self._next_delay_x_backend_index = (self._next_delay_x_backend_index + 1) % len(self.backends)
+        return selected
 
 
 def inject_delay_x_quota(path: str, payload: dict[str, Any], quota_amount: int) -> bytes:
@@ -204,6 +228,16 @@ def inject_delay_x_quota(path: str, payload: dict[str, Any], quota_amount: int) 
         payload_copy[DELAY_X_DISPATCHER_QUOTA_EXTRA_BODY_KEY] = quota_amount
 
     return json.dumps(payload_copy).encode("utf-8")
+
+
+def parse_delay_x_max_active_latency_s(headers: dict[str, str]) -> float | None:
+    value = headers.get(DELAY_X_MAX_ACTIVE_LATENCY_HEADER)
+    if value is None:
+        return None
+    try:
+        return max(0.0, float(value))
+    except Exception:
+        return None
 
 
 class DispatcherHandler(BaseHTTPRequestHandler):
@@ -299,12 +333,27 @@ class DispatcherHandler(BaseHTTPRequestHandler):
                 self.request_timeout_s,
             )
             latency_s = time.perf_counter() - started_at
-            self.pool.complete_backend(backend, estimated_cost, latency_s, True, "")
+            self.pool.complete_backend(
+                backend,
+                estimated_cost,
+                latency_s,
+                True,
+                "",
+                parse_delay_x_max_active_latency_s(response_headers),
+            )
             self._write_response(status, response_body, response_headers)
         except urllib.error.HTTPError as exc:
             latency_s = time.perf_counter() - started_at
             error_body = exc.read()
-            self.pool.complete_backend(backend, estimated_cost, latency_s, False, f"HTTP {exc.code}")
+            response_headers = {key: value for key, value in exc.headers.items()}
+            self.pool.complete_backend(
+                backend,
+                estimated_cost,
+                latency_s,
+                False,
+                f"HTTP {exc.code}",
+                parse_delay_x_max_active_latency_s(response_headers),
+            )
             self._write_response(exc.code, error_body, {"Content-Type": exc.headers.get_content_type()})
         except Exception as exc:  # noqa: BLE001
             latency_s = time.perf_counter() - started_at

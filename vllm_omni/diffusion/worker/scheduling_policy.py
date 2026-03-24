@@ -117,6 +117,9 @@ class DiffusionSchedulingPolicy(Protocol):
     def consume_recent_sacrificial_request_ids(self) -> list[str]:
         ...
 
+    def max_active_predicted_latency_s(self, current_req: OmniDiffusionRequest | None) -> float:
+        ...
+
 
 class TargetFreeGlobalReorderPolicy:
     """Global queue reorder policy with arrival/finish scheduling points."""
@@ -199,6 +202,21 @@ class TargetFreeGlobalReorderPolicy:
     def consume_recent_sacrificial_request_ids(self) -> list[str]:
         return []
 
+    def max_active_predicted_latency_s(self, current_req: OmniDiffusionRequest | None) -> float:
+        candidates: list[OmniDiffusionRequest] = []
+        if current_req is not None:
+            req_id = req_debug_id(current_req)
+            if req_id not in self._aborted_request_ids:
+                candidates.append(current_req)
+        for _, _, req in self._waiting_reqs:
+            req_id = req_debug_id(req)
+            if req_id in self._aborted_request_ids:
+                continue
+            candidates.append(req)
+        if not candidates:
+            return 0.0
+        return max(self._estimate_predicted_latency_s(req) for req in candidates)
+
     def _queue_request(self, req: OmniDiffusionRequest) -> None:
         req_id = req_debug_id(req)
         if req_id in self._aborted_request_ids:
@@ -251,6 +269,25 @@ class TargetFreeGlobalReorderPolicy:
             refreshed_heap.append((self._priority_cost(req), queue_seq, req))
         heapq.heapify(refreshed_heap)
         self._waiting_reqs = refreshed_heap
+
+    def _estimate_predicted_latency_s(self, req: OmniDiffusionRequest) -> float:
+        waited_work = max(
+            0.0,
+            self._cumulative_arrival_work - self._queued_arrival_work.get(req.request_key, self._cumulative_arrival_work),
+        )
+        if self._aging_cost_ref <= 0:
+            waited_service_s = 0.0
+        else:
+            waited_service_s = (
+                QWEN_IMAGE_FALLBACK_REFERENCE_LATENCY_S
+                * (waited_work / self._aging_cost_ref)
+            )
+        remaining_cost = estimate_remaining_cost(req)
+        total_cost = estimate_total_cost(req)
+        total_service_s = estimate_total_service_s(req)
+        if remaining_cost <= 0 or total_cost <= 0 or total_service_s <= 0:
+            return waited_service_s
+        return waited_service_s + total_service_s * (remaining_cost / total_cost)
 
 
 class DelayXPolicy:
@@ -379,6 +416,36 @@ class DelayXPolicy:
         sacrificial = self._recent_sacrificial_request_ids
         self._recent_sacrificial_request_ids = []
         return sacrificial
+
+    def max_active_predicted_latency_s(self, current_req: OmniDiffusionRequest | None) -> float:
+        active_requests: list[OmniDiffusionRequest] = []
+        if current_req is not None:
+            req_id = req_debug_id(current_req)
+            if (
+                req_id not in self._aborted_request_ids
+                and current_req.request_key not in self._sacrificial_request_keys
+            ):
+                active_requests.append(current_req)
+        for request_key in list(self._queued_request_keys):
+            if request_key in self._sacrificial_request_keys:
+                continue
+            req = self._request_by_key.get(request_key)
+            if req is None:
+                continue
+            if req_debug_id(req) in self._aborted_request_ids:
+                continue
+            active_requests.append(req)
+        if not active_requests:
+            return 0.0
+
+        ordered = sorted(active_requests, key=self._base_priority_tuple)
+        prefix_wait_s = 0.0
+        max_latency_s = 0.0
+        for req in ordered:
+            predicted_completion_latency_s = self._predicted_latency_s(req) + prefix_wait_s
+            max_latency_s = max(max_latency_s, predicted_completion_latency_s)
+            prefix_wait_s += self._remaining_service_s(req)
+        return max_latency_s
 
     def _queue_request(self, req: OmniDiffusionRequest) -> None:
         req_id = req_debug_id(req)

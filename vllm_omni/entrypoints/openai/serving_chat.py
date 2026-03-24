@@ -2224,7 +2224,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 stop_reason=None,
             )
 
-            response = ChatCompletionResponse(
+            response = OmniChatCompletionResponse(
                 id=request_id,
                 created=created_time,
                 model=self._diffusion_model_name,
@@ -2234,6 +2234,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     completion_tokens=1,
                     total_tokens=len(prompt.split()) + 1,
                 ),
+                metrics=getattr(result, "metrics", None),
             )
 
             logger.info(

@@ -399,6 +399,7 @@ class WorkerProc:
 
     def return_result(self, output: DiffusionOutput):
         """Reply to client, only on rank 0."""
+        output = self._attach_scheduler_metadata_to_result(output)
         request_key = None
         result_type = type(output).__name__
         if isinstance(output, dict):
@@ -446,6 +447,27 @@ class WorkerProc:
                 request_key,
             )
 
+    def _attach_scheduler_metadata_to_result(self, output: Any) -> Any:
+        if isinstance(output, DiffusionOutput):
+            output.scheduler_metadata = self._current_scheduler_metadata()
+            return output
+        if isinstance(output, dict) and isinstance(output.get("output"), DiffusionOutput):
+            prepared = dict(output)
+            prepared_output = prepared["output"]
+            prepared_output.scheduler_metadata = self._current_scheduler_metadata()
+            prepared["output"] = prepared_output
+            return prepared
+        return output
+
+    def _current_scheduler_metadata(self) -> dict[str, Any]:
+        try:
+            max_latency_s = float(self._scheduling_policy.max_active_predicted_latency_s(self._current_req))
+        except Exception:
+            max_latency_s = 0.0
+        return {
+            "delay_x_max_active_latency_s": max(0.0, max_latency_s),
+        }
+
     @staticmethod
     def _tensor_tree_to_cpu(value: Any) -> Any:
         if isinstance(value, torch.Tensor):
@@ -468,6 +490,7 @@ class WorkerProc:
             error=output.error,
             finished=output.finished,
             request_key=output.request_key,
+            scheduler_metadata=dict(output.scheduler_metadata),
             post_process_func=output.post_process_func,
         )
 

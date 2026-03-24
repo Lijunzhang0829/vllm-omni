@@ -150,6 +150,7 @@ def _remove_route_from_router(
 
 
 ENDPOINT_LOAD_METRICS_FORMAT_HEADER_LABEL = "endpoint-load-metrics-format"
+DELAY_X_MAX_ACTIVE_LATENCY_HEADER = "X-DelayX-Max-Active-Latency"
 
 
 def _remove_route_from_app(app, path: str, methods: set[str] | None = None):
@@ -165,6 +166,34 @@ def _remove_route_from_app(app, path: str, methods: set[str] | None = None):
 
     for route in routes_to_remove:
         app.routes.remove(route)
+
+
+def _delay_x_header_from_metrics(metrics: dict[str, Any] | None) -> dict[str, str]:
+    if not isinstance(metrics, dict):
+        return {}
+    value = metrics.get("delay_x_max_active_latency_s")
+    if value is None:
+        return {}
+    try:
+        value_f = max(0.0, float(value))
+    except Exception:
+        return {}
+    return {DELAY_X_MAX_ACTIVE_LATENCY_HEADER: f"{value_f:.6f}"}
+
+
+def _extract_result_metrics(result: Any) -> dict[str, Any] | None:
+    metrics = getattr(result, "metrics", None)
+    if isinstance(metrics, dict):
+        return metrics
+    request_output = getattr(result, "request_output", None)
+    metrics = getattr(request_output, "metrics", None)
+    if isinstance(metrics, dict):
+        return metrics
+    if isinstance(request_output, dict):
+        metrics = request_output.get("metrics")
+        if isinstance(metrics, dict):
+            return metrics
+    return None
 
 
 class _DiffusionServingModels:
@@ -797,6 +826,8 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         # by converting to dict first, then serializing with warnings suppressed
         import json as json_lib
         import warnings as warnings_module
+        response_headers = metrics_header(metrics_header_format)
+        response_headers.update(_delay_x_header_from_metrics(getattr(generator, "metrics", None)))
 
         # Temporarily suppress ALL Pydantic UserWarnings during serialization
         with warnings_module.catch_warnings():
@@ -807,7 +838,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
                 response_dict = generator.model_dump(mode="json", serialize_as_any=True, warnings="none")
                 return JSONResponse(
                     content=response_dict,
-                    headers=metrics_header(metrics_header_format),
+                    headers=response_headers,
                 )
             except Exception:
                 # Fallback: convert to JSON string and parse back to avoid any serialization issues
@@ -816,7 +847,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
                     response_dict = json_lib.loads(response_json)
                     return JSONResponse(
                         content=response_dict,
-                        headers=metrics_header(metrics_header_format),
+                        headers=response_headers,
                     )
                 except Exception:
                     # Last resort: regular dump with warnings suppressed
@@ -824,7 +855,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
                         warnings_module.filterwarnings("ignore", category=UserWarning)
                         return JSONResponse(
                             content=generator.model_dump(mode="json", warnings="none"),
-                            headers=metrics_header(metrics_header_format),
+                            headers=response_headers,
                         )
 
     return StreamingResponse(content=generator, media_type="text/event-stream")
@@ -1063,9 +1094,13 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
         # Encode images to base64
         image_data = [ImageData(b64_json=encode_image_base64(img), revised_prompt=None) for img in images]
 
-        return ImageGenerationResponse(
+        response = ImageGenerationResponse(
             created=int(time.time()),
             data=image_data,
+        )
+        return JSONResponse(
+            content=response.model_dump(mode="json"),
+            headers=_delay_x_header_from_metrics(_extract_result_metrics(result)),
         )
 
     except HTTPException:
@@ -1222,11 +1257,15 @@ async def edit_images(
             for img in images
         ]
 
-        return ImageGenerationResponse(
+        response = ImageGenerationResponse(
             created=int(time.time()),
             data=image_data,
             output_format=output_format,
             size=size_str,
+        )
+        return JSONResponse(
+            content=response.model_dump(mode="json"),
+            headers=_delay_x_header_from_metrics(_extract_result_metrics(result)),
         )
 
     except HTTPException:

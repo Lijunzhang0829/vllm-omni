@@ -107,6 +107,7 @@ class DiffusionEngine:
             "resolution": int(request.sampling_params.resolution),
             "postprocess_time_ms": postprocess_time * 1000,
         }
+        metrics.update(output.scheduler_metadata or {})
         if self.pre_process_func is not None:
             metrics["preprocessing_time_ms"] = preprocess_time * 1000
 

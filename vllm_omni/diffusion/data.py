@@ -625,6 +625,7 @@ class DiffusionOutput:
     error: str | None = None
     finished: bool = True
     request_key: str | None = None
+    scheduler_metadata: dict[str, Any] = field(default_factory=dict)
 
     post_process_func: Callable[..., Any] | None = None
 
