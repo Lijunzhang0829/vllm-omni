@@ -742,6 +742,17 @@ def calculate_metrics(
 ):
     success_outputs = [o for o in outputs if o.success]
     error_outputs = [o for o in outputs if not o.success]
+    failed_request_samples = [
+        {
+            "request_id": req.request_id,
+            "width": req.width,
+            "height": req.height,
+            "num_inference_steps": req.num_inference_steps,
+            "error": out.error,
+        }
+        for req, out in zip(requests_list, outputs)
+        if not out.success
+    ]
 
     num_success = len(success_outputs)
     latencies = [o.latency for o in success_outputs]
@@ -760,6 +771,7 @@ def calculate_metrics(
         "peak_memory_mb_max": max(peak_memories) if peak_memories else 0,
         "peak_memory_mb_mean": np.mean(peak_memories) if peak_memories else 0,
         "peak_memory_mb_median": np.median(peak_memories) if peak_memories else 0,
+        "failed_request_samples": failed_request_samples[:20],
     }
 
     if slo_enabled:
@@ -1052,6 +1064,17 @@ async def benchmark(args):
         print("{:<40} {:<15.2f}".format("Peak Memory Max (MB):", metrics["peak_memory_mb_max"]))
         print("{:<40} {:<15.2f}".format("Peak Memory Mean (MB):", metrics["peak_memory_mb_mean"]))
         print("{:<40} {:<15.2f}".format("Peak Memory Median (MB):", metrics["peak_memory_mb_median"]))
+
+    failed_request_samples = metrics.get("failed_request_samples", [])
+    if failed_request_samples:
+        print(f"{'-' * 50}")
+        print("Failed request samples:")
+        for item in failed_request_samples:
+            print(
+                "  - request_id={request_id} shape={width}x{height} steps={num_inference_steps} error={error}".format(
+                    **item
+                )
+            )
 
     print("\n" + "=" * 60)
 

@@ -66,15 +66,12 @@ def estimate_request_cost(payload: dict[str, Any]) -> int:
 class BackendState:
     name: str
     base_url: str
-    healthy: bool = True
     inflight_requests: int = 0
     inflight_cost: int = 0
     completed_requests: int = 0
     failed_requests: int = 0
     latency_ema_s: float = 0.0
     last_error: str = ""
-    last_healthcheck_ts: float = 0.0
-    consecutive_healthcheck_failures: int = 0
 
     def score(self) -> tuple[int, int, float, str]:
         return (self.inflight_cost, self.inflight_requests, self.latency_ema_s, self.name)
@@ -129,11 +126,7 @@ class BackendPool:
                 self._pending_delay_x_quotas[quota_backend.name] += self._delay_x_quota_amount
                 self._max_active_latency_s[quota_backend.name] = 0.0
 
-            candidates = [backend for backend in self.backends if backend.healthy]
-            if not candidates:
-                raise RuntimeError("No healthy backends available")
-
-            selected = min(candidates, key=lambda backend: backend.score())
+            selected = min(self.backends, key=lambda backend: backend.score())
             selected.inflight_requests += 1
             selected.inflight_cost += estimated_cost
             quota_amount = self._pending_delay_x_quotas.get(selected.name, 0)
@@ -156,8 +149,6 @@ class BackendPool:
             backend.last_error = error
             if success:
                 backend.completed_requests += 1
-                backend.healthy = True
-                backend.consecutive_healthcheck_failures = 0
             else:
                 backend.failed_requests += 1
             if latency_s > 0:
@@ -169,28 +160,12 @@ class BackendPool:
                 backend_name = backend.name
                 self._max_active_latency_s[backend_name] = max(0.0, float(reported_max_active_latency_s))
 
-    def set_health(self, backend: BackendState, healthy: bool, error: str = "") -> None:
-        with self._lock:
-            backend.last_error = error
-            backend.last_healthcheck_ts = time.time()
-            if healthy:
-                backend.healthy = True
-                backend.consecutive_healthcheck_failures = 0
-                return
-
-            backend.consecutive_healthcheck_failures += 1
-            # Avoid transient false negatives from briefly delayed /health responses
-            # under load. Only evict an idle backend after several consecutive failures.
-            if backend.inflight_requests == 0 and backend.consecutive_healthcheck_failures >= 3:
-                backend.healthy = False
-
     def snapshot(self) -> list[dict[str, Any]]:
         with self._lock:
             return [
                 {
                     "name": backend.name,
                     "base_url": backend.base_url,
-                    "healthy": backend.healthy,
                     "inflight_requests": backend.inflight_requests,
                     "inflight_cost": backend.inflight_cost,
                     "completed_requests": backend.completed_requests,
@@ -198,18 +173,14 @@ class BackendPool:
                     "latency_ema_s": round(backend.latency_ema_s, 4),
                     "pending_delay_x_quota": self._pending_delay_x_quotas.get(backend.name, 0),
                     "max_active_latency_s": round(self._max_active_latency_s.get(backend.name, 0.0), 4),
-                    "consecutive_healthcheck_failures": backend.consecutive_healthcheck_failures,
                     "last_error": backend.last_error,
-                    "last_healthcheck_ts": backend.last_healthcheck_ts,
                 }
                 for backend in self.backends
             ]
 
     def _select_quota_backend_locked(self) -> BackendState:
-        healthy_backends = [backend for backend in self.backends if backend.healthy]
-        candidates = healthy_backends or self.backends
         selected = max(
-            candidates,
+            self.backends,
             key=lambda backend: (
                 self._max_active_latency_s.get(backend.name, 0.0),
                 -backend.inflight_cost,
@@ -277,9 +248,7 @@ class DispatcherHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802
         if self.path == "/health":
-            healthy = any(item["healthy"] for item in self.pool.snapshot())
-            status = HTTPStatus.OK if healthy else HTTPStatus.SERVICE_UNAVAILABLE
-            self._write_response(status, b"ok" if healthy else b"unhealthy", {"Content-Type": "text/plain"})
+            self._write_response(HTTPStatus.OK, b"ok", {"Content-Type": "text/plain"})
             return
 
         if self.path == "/backends":
@@ -289,14 +258,7 @@ class DispatcherHandler(BaseHTTPRequestHandler):
 
         if self.path == "/v1/models":
             try:
-                backend = min(
-                    [item for item in self.pool.backends if item.healthy],
-                    key=lambda item: item.score(),
-                )
-            except Exception as exc:  # noqa: BLE001
-                self._json_error(HTTPStatus.SERVICE_UNAVAILABLE, str(exc))
-                return
-            try:
+                backend = min(self.pool.backends, key=lambda item: item.score())
                 status, body, headers = proxy_request(
                     "GET",
                     f"{backend.base_url}{self.path}",
@@ -304,13 +266,10 @@ class DispatcherHandler(BaseHTTPRequestHandler):
                     dict(self.headers.items()),
                     self.request_timeout_s,
                 )
-                self.pool.set_health(backend, True)
                 self._write_response(status, body, headers)
             except urllib.error.HTTPError as exc:
-                self.pool.set_health(backend, False, f"HTTP {exc.code}")
                 self._write_response(exc.code, exc.read(), {"Content-Type": exc.headers.get_content_type()})
             except Exception as exc:  # noqa: BLE001
-                self.pool.set_health(backend, False, str(exc))
                 self._json_error(HTTPStatus.BAD_GATEWAY, str(exc))
             return
 
@@ -377,22 +336,6 @@ class DispatcherHandler(BaseHTTPRequestHandler):
 
     def log_message(self, format: str, *args: Any) -> None:
         return
-
-
-def healthcheck_loop(pool: BackendPool, interval_s: int, timeout_s: int) -> None:
-    while True:
-        for backend in pool.backends:
-            try:
-                status, _, _ = proxy_request("GET", f"{backend.base_url}/health", None, {}, timeout_s)
-                pool.set_health(backend, status == HTTPStatus.OK, "" if status == HTTPStatus.OK else f"HTTP {status}")
-                if status != HTTPStatus.OK:
-                    print(f"[dispatcher] healthcheck backend={backend.name} status={status}", flush=True)
-            except Exception as exc:  # noqa: BLE001
-                pool.set_health(backend, False, str(exc))
-                print(f"[dispatcher] healthcheck backend={backend.name} exception: {exc}", flush=True)
-        time.sleep(interval_s)
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Dispatcher for multi-server Qwen-Image deployment.")
     parser.add_argument("--host", default="0.0.0.0", help="Dispatcher listen host.")
@@ -403,8 +346,6 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help="Backend base URLs, e.g. http://127.0.0.1:8091 http://127.0.0.1:8092",
     )
-    parser.add_argument("--healthcheck-interval", type=int, default=5, help="Healthcheck interval in seconds.")
-    parser.add_argument("--healthcheck-timeout", type=int, default=5, help="Healthcheck timeout in seconds.")
     parser.add_argument(
         "--request-timeout",
         type=int,
@@ -436,13 +377,6 @@ def main() -> None:
 
     DispatcherHandler.pool = pool
     DispatcherHandler.request_timeout_s = args.request_timeout
-
-    health_thread = threading.Thread(
-        target=healthcheck_loop,
-        args=(pool, args.healthcheck_interval, args.healthcheck_timeout),
-        daemon=True,
-    )
-    health_thread.start()
 
     server = ThreadingHTTPServer((args.host, args.port), DispatcherHandler)
     print(f"Dispatcher listening on http://{args.host}:{args.port}")
