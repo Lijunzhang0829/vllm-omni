@@ -32,6 +32,15 @@ def estimate_remaining_cost(req: OmniDiffusionRequest) -> float:
     return float(remaining_steps * width * height * num_frames)
 
 
+def estimate_total_cost(req: OmniDiffusionRequest) -> float:
+    """Simple estimator: total_steps * width * height * frames."""
+    total_steps = max(0, int(req.sampling_params.num_inference_steps or 0))
+    width = int(req.sampling_params.width or 1024)
+    height = int(req.sampling_params.height or 1024)
+    num_frames = int(req.sampling_params.num_frames or 1)
+    return float(total_steps * width * height * num_frames)
+
+
 @dataclass
 class PreemptionEvent:
     preempted_req: OmniDiffusionRequest
@@ -71,16 +80,22 @@ class DiffusionSchedulingPolicy(Protocol):
 class TargetFreeGlobalReorderPolicy:
     """Global queue reorder policy with arrival/finish scheduling points."""
 
-    def __init__(self) -> None:
+    def __init__(self, aging_alpha: float = 0.0, aging_cap: float = 8.0, aging_cost_ref: float = 1.0) -> None:
         self._waiting_reqs: list[tuple[float, int, OmniDiffusionRequest]] = []
         self._queued_request_keys: set[str] = set()
+        self._queued_arrival_work: dict[str, float] = {}
         self._queue_seq: int = 0
+        self._cumulative_arrival_work: float = 0.0
         self._aborted_request_ids: set[str] = set()
         self._recent_dropped_request_ids: list[str] = []
+        self._aging_alpha = max(0.0, float(aging_alpha))
+        self._aging_cap = max(0.0, float(aging_cap))
+        self._aging_cost_ref = max(1.0, float(aging_cost_ref))
 
     def on_request_arrival(
         self, req: OmniDiffusionRequest, current_req: OmniDiffusionRequest | None
     ) -> ArrivalDecision:
+        self._cumulative_arrival_work += estimate_total_cost(req)
         req_id = req_debug_id(req)
         if req_id in self._aborted_request_ids:
             self._recent_dropped_request_ids.append(req_id)
@@ -96,8 +111,8 @@ class TargetFreeGlobalReorderPolicy:
         if current_req is None:
             return ArrivalDecision(current_req=candidate)
 
-        current_cost = estimate_remaining_cost(current_req)
-        candidate_cost = estimate_remaining_cost(candidate)
+        current_cost = self._priority_cost(current_req)
+        candidate_cost = self._priority_cost(candidate)
         if candidate_cost < current_cost:
             self._queue_request(current_req)
             return ArrivalDecision(
@@ -105,8 +120,8 @@ class TargetFreeGlobalReorderPolicy:
                 preemption=PreemptionEvent(
                     preempted_req=current_req,
                     selected_req=candidate,
-                    preempted_cost=current_cost,
-                    selected_cost=candidate_cost,
+                    preempted_cost=estimate_remaining_cost(current_req),
+                    selected_cost=estimate_remaining_cost(candidate),
                 ),
             )
 
@@ -139,18 +154,48 @@ class TargetFreeGlobalReorderPolicy:
             return
         if req.request_key in self._queued_request_keys:
             return
-        cost = estimate_remaining_cost(req)
+        cost = self._priority_cost(req)
         heapq.heappush(self._waiting_reqs, (cost, self._queue_seq, req))
         self._queued_request_keys.add(req.request_key)
+        self._queued_arrival_work[req.request_key] = self._cumulative_arrival_work
         self._queue_seq += 1
 
     def _pop_best_waiting_request(self) -> OmniDiffusionRequest | None:
+        self._refresh_waiting_heap()
         while self._waiting_reqs:
             _, _, req = heapq.heappop(self._waiting_reqs)
             self._queued_request_keys.discard(req.request_key)
+            self._queued_arrival_work.pop(req.request_key, None)
             req_id = req_debug_id(req)
             if req_id in self._aborted_request_ids:
                 self._recent_dropped_request_ids.append(req_id)
                 continue
             return req
         return None
+
+    def _priority_cost(self, req: OmniDiffusionRequest) -> float:
+        remaining_cost = estimate_remaining_cost(req)
+        if remaining_cost <= 0:
+            return 0.0
+        if self._aging_alpha <= 0:
+            return remaining_cost
+
+        queued_arrival_work = self._queued_arrival_work.get(req.request_key, self._cumulative_arrival_work)
+        waited_work = max(0.0, self._cumulative_arrival_work - queued_arrival_work)
+        waited_work_units = waited_work / self._aging_cost_ref
+        aged_units = min(waited_work_units, self._aging_cap)
+        aging_boost = 1.0 + self._aging_alpha * aged_units
+        return remaining_cost / aging_boost
+
+    def _refresh_waiting_heap(self) -> None:
+        if len(self._waiting_reqs) <= 1 or self._aging_alpha <= 0:
+            return
+
+        refreshed_heap: list[tuple[float, int, OmniDiffusionRequest]] = []
+        while self._waiting_reqs:
+            _, queue_seq, req = heapq.heappop(self._waiting_reqs)
+            if req.request_key not in self._queued_request_keys:
+                continue
+            refreshed_heap.append((self._priority_cost(req), queue_seq, req))
+        heapq.heapify(refreshed_heap)
+        self._waiting_reqs = refreshed_heap

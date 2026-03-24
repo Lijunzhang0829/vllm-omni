@@ -26,7 +26,8 @@ python benchmarks/diffusion/run_qwen_image_req_rate_sweep.py \
   --backend vllm-omni \
   --dataset random \
   --task t2i \
-  --num-prompts 200 \
+  --num-prompts 500 \
+  --seed 42   --random-request-seed 42 \
   --max-concurrency 1000 \
   --warmup-requests 1 \
   --enable-negative-prompt \
@@ -70,7 +71,8 @@ python benchmarks/diffusion/run_qwen_image_req_rate_sweep.py \
   --backend vllm-omni \
   --dataset random \
   --task t2i \
-  --num-prompts 200 \
+  --num-prompts 500 \
+  --seed 42   --random-request-seed 42 \
   --max-concurrency 1000 \
   --warmup-requests 1 \
   --enable-negative-prompt \

@@ -222,6 +222,26 @@ def parse_args() -> argparse.Namespace:
         help="Disable step-level diffusion preemption on every backend server.",
     )
     parser.add_argument(
+        "--diffusion-request-aging-alpha",
+        type=float,
+        default=0.0,
+        help="Anti-starvation aging strength forwarded to every backend server. "
+        "0 keeps pure shortest-remaining-time-first behavior.",
+    )
+    parser.add_argument(
+        "--diffusion-request-aging-cap",
+        type=float,
+        default=8.0,
+        help="Maximum normalized waited-work units used by diffusion request aging.",
+    )
+    parser.add_argument(
+        "--diffusion-request-aging-cost-ref",
+        type=float,
+        default=float(1024 * 1024 * 25),
+        help="Reference work unit for diffusion request aging normalization. "
+        "Default is the cost of 1024x1024 with 25 inference steps.",
+    )
+    parser.add_argument(
         "--no-dispatcher",
         action="store_true",
         help="Only start backend servers, do not start the dispatcher.",
@@ -264,6 +284,17 @@ def main() -> int:
         ]
         if args.disable_diffusion_preemption:
             base_command.append("--disable-diffusion-preemption")
+        if args.diffusion_request_aging_alpha != 0.0:
+            base_command.extend(
+                [
+                    "--diffusion-request-aging-alpha",
+                    str(args.diffusion_request_aging_alpha),
+                    "--diffusion-request-aging-cap",
+                    str(args.diffusion_request_aging_cap),
+                    "--diffusion-request-aging-cost-ref",
+                    str(args.diffusion_request_aging_cost_ref),
+                ]
+            )
         numa_node = _pick_numa_node(device, index, numa_nodes) if enable_numa_binding else None
         command = _wrap_with_numa_binding(base_command, numa_node, numa_binding_mode)
         log_path = log_dir / f"server-{index}.log"

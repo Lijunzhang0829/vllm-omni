@@ -364,7 +364,11 @@ class WorkerProc:
         self.worker = self._create_worker(gpu_id, od_config, worker_extension_cls, custom_pipeline_args)
         self._running = True
         self._current_req: OmniDiffusionRequest | None = None
-        self._scheduling_policy: DiffusionSchedulingPolicy = TargetFreeGlobalReorderPolicy()
+        self._scheduling_policy: DiffusionSchedulingPolicy = TargetFreeGlobalReorderPolicy(
+            aging_alpha=self.od_config.diffusion_request_aging_alpha,
+            aging_cap=self.od_config.diffusion_request_aging_cap,
+            aging_cost_ref=self.od_config.diffusion_request_aging_cost_ref,
+        )
 
     def _create_worker(
         self,

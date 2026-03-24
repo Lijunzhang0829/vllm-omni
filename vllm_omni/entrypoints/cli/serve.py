@@ -326,6 +326,26 @@ class OmniServeCommand(CLISubcommand):
             action="store_true",
             help="Disable step-level diffusion preemption for models that support it.",
         )
+        omni_config_group.add_argument(
+            "--diffusion-request-aging-alpha",
+            type=float,
+            default=0.0,
+            help="Anti-starvation aging strength for diffusion scheduling. "
+            "0 keeps pure shortest-remaining-time-first behavior.",
+        )
+        omni_config_group.add_argument(
+            "--diffusion-request-aging-cap",
+            type=float,
+            default=8.0,
+            help="Maximum normalized waited-work units used by diffusion request aging.",
+        )
+        omni_config_group.add_argument(
+            "--diffusion-request-aging-cost-ref",
+            type=float,
+            default=float(1024 * 1024 * 25),
+            help="Reference work unit for diffusion request aging normalization. "
+            "Default is the cost of 1024x1024 with 25 inference steps.",
+        )
 
         # TTS-specific parameters
         omni_config_group.add_argument(

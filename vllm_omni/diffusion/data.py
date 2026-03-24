@@ -441,6 +441,9 @@ class OmniDiffusionConfig:
 
     # Diffusion scheduling behavior
     disable_diffusion_preemption: bool = False
+    diffusion_request_aging_alpha: float = 0.0
+    diffusion_request_aging_cap: float = 8.0
+    diffusion_request_aging_cost_ref: float = float(1024 * 1024 * 25)
 
     # Omni configuration (injected from stage config)
     omni_kv_config: dict[str, Any] = field(default_factory=dict)
@@ -571,6 +574,13 @@ class OmniDiffusionConfig:
             self.max_cpu_loras = 1
         elif self.max_cpu_loras < 1:
             raise ValueError("max_cpu_loras must be >= 1 for diffusion LoRA")
+
+        if self.diffusion_request_aging_alpha < 0:
+            raise ValueError("diffusion_request_aging_alpha must be >= 0")
+        if self.diffusion_request_aging_cap < 0:
+            raise ValueError("diffusion_request_aging_cap must be >= 0")
+        if self.diffusion_request_aging_cost_ref <= 0:
+            raise ValueError("diffusion_request_aging_cost_ref must be > 0")
 
     def update_multimodal_support(self) -> None:
         self.supports_multimodal_inputs = self.model_class_name in {"QwenImageEditPlusPipeline"}
