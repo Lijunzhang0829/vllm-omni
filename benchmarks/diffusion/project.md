@@ -26,9 +26,7 @@ python benchmarks/diffusion/run_qwen_image_req_rate_sweep.py \
   --backend vllm-omni \
   --dataset random \
   --task t2i \
-  --num-prompts 500 \
-  --seed 42 \
-  --random-request-seed 42 \
+  --num-prompts 200 \
   --max-concurrency 1000 \
   --warmup-requests 1 \
   --enable-negative-prompt \
@@ -60,7 +58,6 @@ python benchmarks/diffusion/launch_qwen_image_servers.py \
   --dispatcher-host 0.0.0.0 \
   --base-port 8091 \
   --dispatcher-port 8090 \
-  --diffusion-large-request-boost-exponent 0.1 \
   --extra-server-args "--dtype bfloat16 --vae-use-slicing --vae-use-tiling"
 ```
 
@@ -73,9 +70,7 @@ python benchmarks/diffusion/run_qwen_image_req_rate_sweep.py \
   --backend vllm-omni \
   --dataset random \
   --task t2i \
-  --num-prompts 500 \
-  --seed 42 \
-  --random-request-seed 42 \
+  --num-prompts 200 \
   --max-concurrency 1000 \
   --warmup-requests 1 \
   --enable-negative-prompt \

@@ -326,14 +326,6 @@ class OmniServeCommand(CLISubcommand):
             action="store_true",
             help="Disable step-level diffusion preemption for models that support it.",
         )
-        omni_config_group.add_argument(
-            "--diffusion-large-request-boost-exponent",
-            type=float,
-            default=0.0,
-            help="Large-request boost exponent for diffusion scheduling. "
-            "0 keeps the current shortest-remaining-time policy unchanged; "
-            "larger values increasingly favor larger requests.",
-        )
 
         # TTS-specific parameters
         omni_config_group.add_argument(
