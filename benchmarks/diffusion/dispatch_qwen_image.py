@@ -74,6 +74,7 @@ class BackendState:
     latency_ema_s: float = 0.0
     last_error: str = ""
     last_healthcheck_ts: float = 0.0
+    consecutive_healthcheck_failures: int = 0
 
     def score(self) -> tuple[int, int, float, str]:
         return (self.inflight_cost, self.inflight_requests, self.latency_ema_s, self.name)
@@ -156,6 +157,7 @@ class BackendPool:
             if success:
                 backend.completed_requests += 1
                 backend.healthy = True
+                backend.consecutive_healthcheck_failures = 0
             else:
                 backend.failed_requests += 1
             if latency_s > 0:
@@ -169,9 +171,18 @@ class BackendPool:
 
     def set_health(self, backend: BackendState, healthy: bool, error: str = "") -> None:
         with self._lock:
-            backend.healthy = healthy
             backend.last_error = error
             backend.last_healthcheck_ts = time.time()
+            if healthy:
+                backend.healthy = True
+                backend.consecutive_healthcheck_failures = 0
+                return
+
+            backend.consecutive_healthcheck_failures += 1
+            # Avoid transient false negatives from briefly delayed /health responses
+            # under load. Only evict an idle backend after several consecutive failures.
+            if backend.inflight_requests == 0 and backend.consecutive_healthcheck_failures >= 3:
+                backend.healthy = False
 
     def snapshot(self) -> list[dict[str, Any]]:
         with self._lock:
@@ -187,6 +198,7 @@ class BackendPool:
                     "latency_ema_s": round(backend.latency_ema_s, 4),
                     "pending_delay_x_quota": self._pending_delay_x_quotas.get(backend.name, 0),
                     "max_active_latency_s": round(self._max_active_latency_s.get(backend.name, 0.0), 4),
+                    "consecutive_healthcheck_failures": backend.consecutive_healthcheck_failures,
                     "last_error": backend.last_error,
                     "last_healthcheck_ts": backend.last_healthcheck_ts,
                 }
@@ -259,6 +271,7 @@ class DispatcherHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _json_error(self, status: int, message: str) -> None:
+        print(f"[dispatcher] {status} {message}", flush=True)
         body = json.dumps({"error": message}).encode("utf-8")
         self._write_response(status, body, {"Content-Type": "application/json"})
 
@@ -346,6 +359,7 @@ class DispatcherHandler(BaseHTTPRequestHandler):
             latency_s = time.perf_counter() - started_at
             error_body = exc.read()
             response_headers = {key: value for key, value in exc.headers.items()}
+            print(f"[dispatcher] backend={backend.name} HTTP {exc.code} path={self.path}", flush=True)
             self.pool.complete_backend(
                 backend,
                 estimated_cost,
@@ -358,6 +372,7 @@ class DispatcherHandler(BaseHTTPRequestHandler):
         except Exception as exc:  # noqa: BLE001
             latency_s = time.perf_counter() - started_at
             self.pool.complete_backend(backend, estimated_cost, latency_s, False, str(exc))
+            print(f"[dispatcher] backend={backend.name} exception path={self.path}: {exc}", flush=True)
             self._json_error(HTTPStatus.BAD_GATEWAY, f"{backend.name} failed: {exc}")
 
     def log_message(self, format: str, *args: Any) -> None:
@@ -370,8 +385,11 @@ def healthcheck_loop(pool: BackendPool, interval_s: int, timeout_s: int) -> None
             try:
                 status, _, _ = proxy_request("GET", f"{backend.base_url}/health", None, {}, timeout_s)
                 pool.set_health(backend, status == HTTPStatus.OK, "" if status == HTTPStatus.OK else f"HTTP {status}")
+                if status != HTTPStatus.OK:
+                    print(f"[dispatcher] healthcheck backend={backend.name} status={status}", flush=True)
             except Exception as exc:  # noqa: BLE001
                 pool.set_health(backend, False, str(exc))
+                print(f"[dispatcher] healthcheck backend={backend.name} exception: {exc}", flush=True)
         time.sleep(interval_s)
 
 

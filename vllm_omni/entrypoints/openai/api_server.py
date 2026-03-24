@@ -826,7 +826,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         # by converting to dict first, then serializing with warnings suppressed
         import json as json_lib
         import warnings as warnings_module
-        response_headers = metrics_header(metrics_header_format)
+        response_headers = dict(metrics_header(metrics_header_format) or {})
         response_headers.update(_delay_x_header_from_metrics(getattr(generator, "metrics", None)))
 
         # Temporarily suppress ALL Pydantic UserWarnings during serialization
