@@ -142,8 +142,6 @@ class Scheduler:
             self.mq.enqueue(request)
             logger.info("Scheduler enqueued generation request: request_key=%s", request_key)
 
-            start_time = time.monotonic()
-            next_wait_log = start_time + 5.0
             with self._result_cv:
                 while True:
                     if self._reader_error is not None:
@@ -151,14 +149,6 @@ class Scheduler:
                     if request_key in self._pending_results:
                         logger.info("Scheduler returning generation result: request_key=%s", request_key)
                         return self._pending_results.pop(request_key)
-                    now = time.monotonic()
-                    if now >= next_wait_log:
-                        logger.warning(
-                            "Scheduler still waiting for generation result: request_key=%s elapsed=%.2fs",
-                            request_key,
-                            now - start_time,
-                        )
-                        next_wait_log = now + 5.0
                     self._result_cv.wait(timeout=0.1)
         except zmq.error.Again:
             logger.error("Timeout waiting for response from scheduler.")

@@ -266,11 +266,15 @@ class DelayXPolicy:
         quota_amount: int = 1,
         tail_penalty: float = 100.0,
     ) -> None:
-        self._waiting_reqs: list[OmniDiffusionRequest] = []
+        self._normal_heap: list[tuple[float, int, int, str]] = []
+        self._sacrificial_heap: list[tuple[float, int, int, str]] = []
+        self._request_by_key: dict[str, OmniDiffusionRequest] = {}
         self._queued_request_keys: set[str] = set()
         self._arrival_completed_service_s: dict[str, float] = {}
         self._arrival_seq: dict[str, int] = {}
         self._sacrificial_request_keys: set[str] = set()
+        self._queued_remaining_service_s: dict[str, float] = {}
+        self._heap_versions: dict[str, int] = {}
         self._arrival_counter: int = 0
         self._arrival_seq_counter: int = 0
         self._completed_service_s: float = 0.0
@@ -295,7 +299,7 @@ class DelayXPolicy:
             for _ in range(self._quota_amount):
                 self._issue_sacrificial_quota(current_req)
 
-        if current_req is None and not self._waiting_reqs:
+        if current_req is None and not self._queued_request_keys:
             return ArrivalDecision(current_req=req)
 
         self._queue_request(req)
@@ -331,10 +335,14 @@ class DelayXPolicy:
         self._queue_request(req)
 
     def on_request_complete(self, req: OmniDiffusionRequest) -> None:
-        self._queued_request_keys.discard(req.request_key)
+        request_key = req.request_key
+        self._queued_request_keys.discard(request_key)
+        self._request_by_key.pop(request_key, None)
         self._arrival_completed_service_s.pop(req.request_key, None)
         self._arrival_seq.pop(req.request_key, None)
         self._sacrificial_request_keys.discard(req.request_key)
+        self._queued_remaining_service_s.pop(request_key, None)
+        self._heap_versions.pop(request_key, None)
 
     def observe_execution(self, req: OmniDiffusionRequest, elapsed_s: float, work_done: float) -> None:
         del elapsed_s
@@ -373,15 +381,42 @@ class DelayXPolicy:
         if req.request_key in self._queued_request_keys:
             return
         self._ensure_request_metadata(req)
-        self._waiting_reqs.append(req)
-        self._queued_request_keys.add(req.request_key)
+        request_key = req.request_key
+        self._queued_request_keys.add(request_key)
+        self._request_by_key[request_key] = req
+        self._queued_remaining_service_s[request_key] = self._compute_remaining_service_s(req)
+        next_version = self._heap_versions.get(request_key, 0) + 1
+        self._heap_versions[request_key] = next_version
+        heap = self._sacrificial_heap if request_key in self._sacrificial_request_keys else self._normal_heap
+        heapq.heappush(heap, self._heap_key(req, next_version))
 
     def _pop_best_waiting_request(self) -> OmniDiffusionRequest | None:
-        while self._waiting_reqs:
-            best_index = min(range(len(self._waiting_reqs)), key=lambda idx: self._priority_tuple(self._waiting_reqs[idx]))
-            req = self._waiting_reqs.pop(best_index)
-            self._queued_request_keys.discard(req.request_key)
+        req = self._pop_from_heap(self._normal_heap, sacrificial=False)
+        if req is not None:
+            return req
+        return self._pop_from_heap(self._sacrificial_heap, sacrificial=True)
+
+    def _pop_from_heap(
+        self,
+        heap: list[tuple[float, int, int, str]],
+        *,
+        sacrificial: bool,
+    ) -> OmniDiffusionRequest | None:
+        while heap:
+            _, _, version, request_key = heapq.heappop(heap)
+            if request_key not in self._queued_request_keys:
+                continue
+            if self._heap_versions.get(request_key) != version:
+                continue
+            if (request_key in self._sacrificial_request_keys) != sacrificial:
+                continue
+            req = self._request_by_key.get(request_key)
+            if req is None:
+                continue
             req_id = req_debug_id(req)
+            self._queued_request_keys.discard(request_key)
+            self._request_by_key.pop(request_key, None)
+            self._queued_remaining_service_s.pop(request_key, None)
             if req_id in self._aborted_request_ids:
                 self._recent_dropped_request_ids.append(req_id)
                 self.on_request_complete(req)
@@ -389,13 +424,18 @@ class DelayXPolicy:
             return req
         return None
 
-    def _remaining_service_s(self, req: OmniDiffusionRequest) -> float:
+    def _compute_remaining_service_s(self, req: OmniDiffusionRequest) -> float:
         remaining_cost = estimate_remaining_cost(req)
         total_cost = estimate_total_cost(req)
         total_service_s = estimate_total_service_s(req)
         if remaining_cost <= 0 or total_cost <= 0 or total_service_s <= 0:
             return 0.0
         return total_service_s * (remaining_cost / total_cost)
+
+    def _remaining_service_s(self, req: OmniDiffusionRequest) -> float:
+        if req.request_key in self._queued_request_keys:
+            return self._queued_remaining_service_s.get(req.request_key, 0.0)
+        return self._compute_remaining_service_s(req)
 
     def _predicted_latency_s(self, req: OmniDiffusionRequest) -> float:
         waited_service_s = max(
@@ -423,13 +463,31 @@ class DelayXPolicy:
             req.request_key,
         )
 
+    def _heap_key(self, req: OmniDiffusionRequest, version: int) -> tuple[float, int, int, str]:
+        # Waiting-queue ordering only depends on remaining_service - arrival_completed_service.
+        base_score = (
+            self._queued_remaining_service_s.get(req.request_key, 0.0)
+            - self._arrival_completed_service_s.get(req.request_key, self._completed_service_s)
+        )
+        return (
+            -base_score,
+            self._arrival_seq.get(req.request_key, 0),
+            version,
+            req.request_key,
+        )
+
     def _issue_sacrificial_quota(self, current_req: OmniDiffusionRequest | None) -> None:
         candidate = self._select_sacrificial_candidate(current_req)
         if candidate is None:
             return
-        if candidate.request_key in self._sacrificial_request_keys:
+        request_key = candidate.request_key
+        if request_key in self._sacrificial_request_keys:
             return
-        self._sacrificial_request_keys.add(candidate.request_key)
+        self._sacrificial_request_keys.add(request_key)
+        if request_key in self._queued_request_keys:
+            next_version = self._heap_versions.get(request_key, 0) + 1
+            self._heap_versions[request_key] = next_version
+            heapq.heappush(self._sacrificial_heap, self._heap_key(candidate, next_version))
         self._recent_sacrificial_request_ids.append(req_debug_id(candidate))
 
     def _select_sacrificial_candidate(
@@ -440,8 +498,11 @@ class DelayXPolicy:
         if current_req is not None and req_debug_id(current_req) not in self._aborted_request_ids:
             if current_req.request_key not in self._sacrificial_request_keys:
                 candidates.append(current_req)
-        for req in self._waiting_reqs:
-            if req.request_key in self._sacrificial_request_keys:
+        for request_key in list(self._queued_request_keys):
+            if request_key in self._sacrificial_request_keys:
+                continue
+            req = self._request_by_key.get(request_key)
+            if req is None:
                 continue
             if req_debug_id(req) in self._aborted_request_ids:
                 continue
@@ -473,3 +534,4 @@ class DelayXPolicy:
         if req.request_key not in self._arrival_seq:
             self._arrival_seq[req.request_key] = self._arrival_seq_counter
             self._arrival_seq_counter += 1
+        self._request_by_key[req.request_key] = req

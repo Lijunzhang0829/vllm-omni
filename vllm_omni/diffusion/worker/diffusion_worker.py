@@ -11,7 +11,6 @@ to DiffusionModelRunner.
 import gc
 import multiprocessing as mp
 import os
-import time
 from collections.abc import Iterable
 from contextlib import AbstractContextManager, nullcontext
 from datetime import datetime
@@ -742,12 +741,10 @@ class WorkerProc:
 
             try:
                 before_cost = estimate_remaining_cost(self._current_req)
-                started_at_s = time.perf_counter()
                 output = self.worker.execute_model(self._current_req, self.od_config)
-                elapsed_s = time.perf_counter() - started_at_s
                 after_cost = 0.0 if output.finished else estimate_remaining_cost(self._current_req)
                 work_done = max(0.0, before_cost - after_cost)
-                self._scheduling_policy.observe_execution(self._current_req, elapsed_s, work_done)
+                self._scheduling_policy.observe_execution(self._current_req, 0.0, work_done)
             except Exception as e:
                 failed_req_id = self._req_debug_id(self._current_req)
                 failed_step = self._req_step_index(self._current_req)
