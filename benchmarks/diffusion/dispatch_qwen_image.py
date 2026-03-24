@@ -146,7 +146,7 @@ class BackendPool:
         delay_x_quota_every: int = 0,
         delay_x_quota_amount: int = 0,
         delay_x_threshold_ratio: float = 0.8,
-        delay_x_sacrificial_load_factor: float = 0.3,
+        delay_x_sacrificial_load_factor: float = 0.1,
     ):
         self.backends = [
             BackendState(name=f"server-{idx}", base_url=url.rstrip("/")) for idx, url in enumerate(backend_urls)
@@ -400,7 +400,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--delay-x-sacrificial-load-factor",
         type=float,
-        default=0.3,
+        default=0.1,
         help="When dispatching sacrificial requests, count their load at this fraction of normal load.",
     )
     return parser.parse_args()

@@ -277,7 +277,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--delay-x-sacrificial-load-factor",
         type=float,
-        default=0.3,
+        default=0.1,
         help="For dispatcher routing, count sacrificial requests as this fraction of normal load.",
     )
     parser.add_argument(

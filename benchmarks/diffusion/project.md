@@ -62,7 +62,9 @@ python benchmarks/diffusion/launch_qwen_image_servers.py \
   --diffusion-scheduling-policy delay_x \
   --delay-x-quota-every 20 \
   --delay-x-quota-amount 1 \
+  --delay-x-threshold-ratio 0.8 \
   --delay-x-tail-penalty 100 \
+  --delay-x-sacrificial-load-factor 0.1 \
   --extra-server-args "--dtype bfloat16 --vae-use-slicing --vae-use-tiling"
 ```
 
