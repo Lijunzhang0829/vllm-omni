@@ -32,6 +32,15 @@ def estimate_remaining_cost(req: OmniDiffusionRequest) -> float:
     return float(remaining_steps * width * height * num_frames)
 
 
+def estimate_total_cost(req: OmniDiffusionRequest) -> float:
+    """Simple estimator: total_steps * width * height * frames."""
+    total_steps = max(0, int(req.sampling_params.num_inference_steps or 0))
+    width = int(req.sampling_params.width or 1024)
+    height = int(req.sampling_params.height or 1024)
+    num_frames = int(req.sampling_params.num_frames or 1)
+    return float(total_steps * width * height * num_frames)
+
+
 @dataclass
 class PreemptionEvent:
     preempted_req: OmniDiffusionRequest
@@ -71,12 +80,13 @@ class DiffusionSchedulingPolicy(Protocol):
 class TargetFreeGlobalReorderPolicy:
     """Global queue reorder policy with arrival/finish scheduling points."""
 
-    def __init__(self) -> None:
+    def __init__(self, large_request_boost_exponent: float = 0.0) -> None:
         self._waiting_reqs: list[tuple[float, int, OmniDiffusionRequest]] = []
         self._queued_request_keys: set[str] = set()
         self._queue_seq: int = 0
         self._aborted_request_ids: set[str] = set()
         self._recent_dropped_request_ids: list[str] = []
+        self._large_request_boost_exponent = max(0.0, float(large_request_boost_exponent))
 
     def on_request_arrival(
         self, req: OmniDiffusionRequest, current_req: OmniDiffusionRequest | None
@@ -96,8 +106,8 @@ class TargetFreeGlobalReorderPolicy:
         if current_req is None:
             return ArrivalDecision(current_req=candidate)
 
-        current_cost = estimate_remaining_cost(current_req)
-        candidate_cost = estimate_remaining_cost(candidate)
+        current_cost = self._priority_cost(current_req)
+        candidate_cost = self._priority_cost(candidate)
         if candidate_cost < current_cost:
             self._queue_request(current_req)
             return ArrivalDecision(
@@ -105,8 +115,8 @@ class TargetFreeGlobalReorderPolicy:
                 preemption=PreemptionEvent(
                     preempted_req=current_req,
                     selected_req=candidate,
-                    preempted_cost=current_cost,
-                    selected_cost=candidate_cost,
+                    preempted_cost=estimate_remaining_cost(current_req),
+                    selected_cost=estimate_remaining_cost(candidate),
                 ),
             )
 
@@ -139,7 +149,7 @@ class TargetFreeGlobalReorderPolicy:
             return
         if req.request_key in self._queued_request_keys:
             return
-        cost = estimate_remaining_cost(req)
+        cost = self._priority_cost(req)
         heapq.heappush(self._waiting_reqs, (cost, self._queue_seq, req))
         self._queued_request_keys.add(req.request_key)
         self._queue_seq += 1
@@ -154,3 +164,14 @@ class TargetFreeGlobalReorderPolicy:
                 continue
             return req
         return None
+
+    def _priority_cost(self, req: OmniDiffusionRequest) -> float:
+        remaining_cost = estimate_remaining_cost(req)
+        if remaining_cost <= 0:
+            return 0.0
+
+        if self._large_request_boost_exponent <= 0:
+            return remaining_cost
+
+        total_cost = max(1.0, estimate_total_cost(req))
+        return remaining_cost / (total_cost**self._large_request_boost_exponent)

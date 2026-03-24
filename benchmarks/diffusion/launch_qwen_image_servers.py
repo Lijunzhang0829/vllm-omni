@@ -222,6 +222,13 @@ def parse_args() -> argparse.Namespace:
         help="Disable step-level diffusion preemption on every backend server.",
     )
     parser.add_argument(
+        "--diffusion-large-request-boost-exponent",
+        type=float,
+        default=0.0,
+        help="Large-request boost exponent forwarded to every backend server. "
+        "0 keeps the default shortest-remaining-time behavior.",
+    )
+    parser.add_argument(
         "--no-dispatcher",
         action="store_true",
         help="Only start backend servers, do not start the dispatcher.",
@@ -264,6 +271,13 @@ def main() -> int:
         ]
         if args.disable_diffusion_preemption:
             base_command.append("--disable-diffusion-preemption")
+        if args.diffusion_large_request_boost_exponent != 0.0:
+            base_command.extend(
+                [
+                    "--diffusion-large-request-boost-exponent",
+                    str(args.diffusion_large_request_boost_exponent),
+                ]
+            )
         numa_node = _pick_numa_node(device, index, numa_nodes) if enable_numa_binding else None
         command = _wrap_with_numa_binding(base_command, numa_node, numa_binding_mode)
         log_path = log_dir / f"server-{index}.log"

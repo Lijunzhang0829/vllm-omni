@@ -183,6 +183,9 @@ class AsyncOmni(OmniBase):
                     "vae_use_slicing": kwargs.get("vae_use_slicing", False),
                     "vae_use_tiling": kwargs.get("vae_use_tiling", False),
                     "disable_diffusion_preemption": kwargs.get("disable_diffusion_preemption", False),
+                    "diffusion_large_request_boost_exponent": kwargs.get(
+                        "diffusion_large_request_boost_exponent", 0.0
+                    ),
                     "cache_backend": cache_backend,
                     "cache_config": cache_config,
                     "enable_cache_dit_summary": kwargs.get("enable_cache_dit_summary", False),
