@@ -17,7 +17,7 @@ from typing import Any
 
 
 DEFAULT_REQUEST_TIMEOUT_S = 60 * 60
-DELAY_X_DISPATCHER_QUOTA_EXTRA_BODY_KEY = "_delay_x_dispatcher_quota_amount"
+DELAY_X_DISPATCHER_QUOTA_HEADER = "X-DelayX-Dispatcher-Quota-Amount"
 DELAY_X_MAX_ACTIVE_LATENCY_HEADER = "X-DelayX-Max-Active-Latency"
 
 
@@ -86,7 +86,7 @@ def proxy_request(
 ) -> tuple[int, bytes, dict[str, str]]:
     request = urllib.request.Request(url=url, data=body, method=method)
     for key, value in headers.items():
-        if key.lower() == "host":
+        if key.lower() in {"host", "content-length", "transfer-encoding", "connection"}:
             continue
         request.add_header(key, value)
 
@@ -194,23 +194,12 @@ class BackendPool:
         return selected
 
 
-def inject_delay_x_quota(path: str, payload: dict[str, Any], quota_amount: int) -> bytes:
+def inject_delay_x_quota_header(headers: dict[str, str], quota_amount: int) -> dict[str, str]:
     if quota_amount <= 0:
-        return json.dumps(payload).encode("utf-8")
-
-    payload_copy = dict(payload)
-    if path == "/v1/chat/completions":
-        extra_body = payload_copy.get("extra_body")
-        if not isinstance(extra_body, dict):
-            extra_body = {}
-        else:
-            extra_body = dict(extra_body)
-        extra_body[DELAY_X_DISPATCHER_QUOTA_EXTRA_BODY_KEY] = quota_amount
-        payload_copy["extra_body"] = extra_body
-    elif path == "/v1/images/generations":
-        payload_copy[DELAY_X_DISPATCHER_QUOTA_EXTRA_BODY_KEY] = quota_amount
-
-    return json.dumps(payload_copy).encode("utf-8")
+        return headers
+    updated_headers = dict(headers)
+    updated_headers[DELAY_X_DISPATCHER_QUOTA_HEADER] = str(quota_amount)
+    return updated_headers
 
 
 def parse_delay_x_max_active_latency_s(headers: dict[str, str]) -> float | None:
@@ -295,13 +284,13 @@ class DispatcherHandler(BaseHTTPRequestHandler):
             self._json_error(HTTPStatus.SERVICE_UNAVAILABLE, str(exc))
             return
 
-        forward_body = inject_delay_x_quota(self.path, payload, quota_amount)
+        forward_headers = inject_delay_x_quota_header(dict(self.headers.items()), quota_amount)
         try:
             status, response_body, response_headers = proxy_request(
                 "POST",
                 f"{backend.base_url}{self.path}",
-                forward_body,
-                dict(self.headers.items()),
+                body,
+                forward_headers,
                 self.request_timeout_s,
             )
             latency_s = time.perf_counter() - started_at

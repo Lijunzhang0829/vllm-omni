@@ -151,6 +151,7 @@ def _remove_route_from_router(
 
 ENDPOINT_LOAD_METRICS_FORMAT_HEADER_LABEL = "endpoint-load-metrics-format"
 DELAY_X_MAX_ACTIVE_LATENCY_HEADER = "X-DelayX-Max-Active-Latency"
+DELAY_X_DISPATCHER_QUOTA_HEADER = "X-DelayX-Dispatcher-Quota-Amount"
 
 
 def _remove_route_from_app(app, path: str, methods: set[str] | None = None):
@@ -1064,8 +1065,11 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
             gen_params, "seed", request.seed if request.seed is not None else random.randint(0, 2**32 - 1)
         )
         _update_if_not_none(gen_params, "generator_device", request.generator_device)
-        if request.dispatcher_delay_x_quota_amount is not None:
-            gen_params.extra_args[DELAY_X_DISPATCHER_QUOTA_EXTRA_ARG_KEY] = request.dispatcher_delay_x_quota_amount
+        dispatcher_delay_x_quota = request.dispatcher_delay_x_quota_amount
+        if dispatcher_delay_x_quota is None:
+            dispatcher_delay_x_quota = raw_request.headers.get(DELAY_X_DISPATCHER_QUOTA_HEADER)
+        if dispatcher_delay_x_quota is not None:
+            gen_params.extra_args[DELAY_X_DISPATCHER_QUOTA_EXTRA_ARG_KEY] = dispatcher_delay_x_quota
 
         request_id = f"img_gen_{uuid.uuid4().hex}"
 

@@ -2045,6 +2045,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 seed=seed,
             )
             dispatcher_delay_x_quota = extra_body.get(DELAY_X_DISPATCHER_QUOTA_EXTRA_ARG_KEY)
+            if dispatcher_delay_x_quota is None and raw_request is not None:
+                dispatcher_delay_x_quota = raw_request.headers.get(DELAY_X_DISPATCHER_QUOTA_HEADER)
             if dispatcher_delay_x_quota is not None:
                 gen_params.extra_args[DELAY_X_DISPATCHER_QUOTA_EXTRA_ARG_KEY] = dispatcher_delay_x_quota
 
@@ -2321,3 +2323,4 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 code=status_code,
             )
         )
+DELAY_X_DISPATCHER_QUOTA_HEADER = "X-DelayX-Dispatcher-Quota-Amount"
