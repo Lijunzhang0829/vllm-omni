@@ -11,6 +11,7 @@ to DiffusionModelRunner.
 import gc
 import multiprocessing as mp
 import os
+import time
 from collections.abc import Iterable
 from contextlib import AbstractContextManager, nullcontext
 from datetime import datetime
