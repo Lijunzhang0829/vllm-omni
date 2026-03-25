@@ -100,7 +100,11 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.serving_video import OmniOpenAIServingVideo
-from vllm_omni.diffusion.worker.scheduling_policy import DELAY_X_DISPATCHER_SACRIFICIAL_EXTRA_ARG_KEY
+from vllm_omni.diffusion.worker.scheduling_policy import (
+    DELAY_X_DISPATCHER_SACRIFICIAL_EXTRA_ARG_KEY,
+    DELAY_X_NORMAL_LOAD_METRIC_KEY,
+    DELAY_X_SACRIFICIAL_LOAD_METRIC_KEY,
+)
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams, OmniTextPrompt
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.lora.utils import stable_lora_int_id
@@ -151,6 +155,21 @@ def _remove_route_from_router(
 
 ENDPOINT_LOAD_METRICS_FORMAT_HEADER_LABEL = "endpoint-load-metrics-format"
 DELAY_X_DISPATCHER_SACRIFICIAL_HEADER = "X-DelayX-Sacrificial"
+DELAY_X_NORMAL_LOAD_HEADER = "X-DelayX-Normal-Load-S"
+DELAY_X_SACRIFICIAL_LOAD_HEADER = "X-DelayX-Sacrificial-Load-S"
+
+
+def _delay_x_load_headers_from_metrics(metrics: Any) -> dict[str, str]:
+    if not isinstance(metrics, dict):
+        return {}
+    headers: dict[str, str] = {}
+    normal_load_s = metrics.get(DELAY_X_NORMAL_LOAD_METRIC_KEY)
+    sacrificial_load_s = metrics.get(DELAY_X_SACRIFICIAL_LOAD_METRIC_KEY)
+    if isinstance(normal_load_s, (int, float)):
+        headers[DELAY_X_NORMAL_LOAD_HEADER] = f"{float(normal_load_s):.6f}"
+    if isinstance(sacrificial_load_s, (int, float)):
+        headers[DELAY_X_SACRIFICIAL_LOAD_HEADER] = f"{float(sacrificial_load_s):.6f}"
+    return headers
 
 
 def _remove_route_from_app(app, path: str, methods: set[str] | None = None):
@@ -799,6 +818,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         import json as json_lib
         import warnings as warnings_module
         response_headers = dict(metrics_header(metrics_header_format) or {})
+        response_headers.update(_delay_x_load_headers_from_metrics(getattr(generator, "metrics", None)))
 
         # Temporarily suppress ALL Pydantic UserWarnings during serialization
         with warnings_module.catch_warnings():
@@ -1074,6 +1094,7 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
         )
         return JSONResponse(
             content=response.model_dump(mode="json"),
+            headers=_delay_x_load_headers_from_metrics(getattr(result, "metrics", None)),
         )
 
     except HTTPException:

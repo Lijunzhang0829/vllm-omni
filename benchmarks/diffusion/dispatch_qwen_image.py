@@ -18,6 +18,8 @@ from typing import Any
 
 DEFAULT_REQUEST_TIMEOUT_S = 60 * 60
 DELAY_X_DISPATCHER_SACRIFICIAL_HEADER = "X-DelayX-Sacrificial"
+DELAY_X_NORMAL_LOAD_HEADER = "X-DelayX-Normal-Load-S"
+DELAY_X_SACRIFICIAL_LOAD_HEADER = "X-DelayX-Sacrificial-Load-S"
 QWEN_IMAGE_PROFILE_LATENCY_S: dict[tuple[int, int, int, int], float] = {
     (512, 512, 20, 1): 22.35,
     (768, 768, 20, 1): 20.62,
@@ -99,21 +101,21 @@ class BackendState:
     name: str
     base_url: str
     inflight_normal_requests: int = 0
-    inflight_normal_cost: int = 0
+    inflight_normal_load_s: float = 0.0
     inflight_sacrificial_requests: int = 0
-    inflight_sacrificial_cost: int = 0
+    inflight_sacrificial_load_s: float = 0.0
     completed_requests: int = 0
     failed_requests: int = 0
     latency_ema_s: float = 0.0
     last_error: str = ""
 
-    def normal_score(self) -> tuple[int, int, float, str]:
-        return (self.inflight_normal_cost, self.inflight_normal_requests, self.latency_ema_s, self.name)
+    def normal_score(self) -> tuple[float, int, float, str]:
+        return (self.inflight_normal_load_s, self.inflight_normal_requests, self.latency_ema_s, self.name)
 
     def effective_total_score(self, sacrificial_load_factor: float) -> tuple[float, float, float, str]:
         factor = max(0.0, float(sacrificial_load_factor))
         return (
-            self.inflight_normal_cost + factor * self.inflight_sacrificial_cost,
+            self.inflight_normal_load_s + factor * self.inflight_sacrificial_load_s,
             self.inflight_normal_requests + factor * self.inflight_sacrificial_requests,
             self.latency_ema_s,
             self.name,
@@ -185,28 +187,36 @@ class BackendPool:
             )
             if mark_sacrificial:
                 selected.inflight_sacrificial_requests += 1
-                selected.inflight_sacrificial_cost += estimated_cost
+                selected.inflight_sacrificial_load_s += estimated_service_s
             else:
                 selected.inflight_normal_requests += 1
-                selected.inflight_normal_cost += estimated_cost
+                selected.inflight_normal_load_s += estimated_service_s
             return selected, mark_sacrificial
 
     def complete_backend(
         self,
         backend: BackendState,
-        estimated_cost: int,
+        estimated_service_s: float,
         sacrificial: bool,
         latency_s: float,
         success: bool,
         error: str,
+        response_headers: dict[str, str] | None = None,
     ) -> None:
         with self._lock:
             if sacrificial:
                 backend.inflight_sacrificial_requests = max(0, backend.inflight_sacrificial_requests - 1)
-                backend.inflight_sacrificial_cost = max(0, backend.inflight_sacrificial_cost - estimated_cost)
+                backend.inflight_sacrificial_load_s = max(0.0, backend.inflight_sacrificial_load_s - estimated_service_s)
             else:
                 backend.inflight_normal_requests = max(0, backend.inflight_normal_requests - 1)
-                backend.inflight_normal_cost = max(0, backend.inflight_normal_cost - estimated_cost)
+                backend.inflight_normal_load_s = max(0.0, backend.inflight_normal_load_s - estimated_service_s)
+            if response_headers:
+                normal_load_s = _parse_float_header(response_headers.get(DELAY_X_NORMAL_LOAD_HEADER))
+                sacrificial_load_s = _parse_float_header(response_headers.get(DELAY_X_SACRIFICIAL_LOAD_HEADER))
+                if normal_load_s is not None:
+                    backend.inflight_normal_load_s = max(0.0, normal_load_s)
+                if sacrificial_load_s is not None:
+                    backend.inflight_sacrificial_load_s = max(0.0, sacrificial_load_s)
             backend.last_error = error
             if success:
                 backend.completed_requests += 1
@@ -225,9 +235,9 @@ class BackendPool:
                     "name": backend.name,
                     "base_url": backend.base_url,
                     "inflight_normal_requests": backend.inflight_normal_requests,
-                    "inflight_normal_cost": backend.inflight_normal_cost,
+                    "inflight_normal_load_s": round(backend.inflight_normal_load_s, 4),
                     "inflight_sacrificial_requests": backend.inflight_sacrificial_requests,
-                    "inflight_sacrificial_cost": backend.inflight_sacrificial_cost,
+                    "inflight_sacrificial_load_s": round(backend.inflight_sacrificial_load_s, 4),
                     "completed_requests": backend.completed_requests,
                     "failed_requests": backend.failed_requests,
                     "latency_ema_s": round(backend.latency_ema_s, 4),
@@ -246,6 +256,15 @@ def inject_delay_x_sacrificial_header(headers: dict[str, str], mark_sacrificial:
     updated_headers = dict(headers)
     updated_headers[DELAY_X_DISPATCHER_SACRIFICIAL_HEADER] = "1"
     return updated_headers
+
+
+def _parse_float_header(value: str | None) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except Exception:
+        return None
 
 
 class DispatcherHandler(BaseHTTPRequestHandler):
@@ -333,11 +352,12 @@ class DispatcherHandler(BaseHTTPRequestHandler):
             latency_s = time.perf_counter() - started_at
             self.pool.complete_backend(
                 backend,
-                estimated_cost,
+                estimated_service_s,
                 mark_sacrificial,
                 latency_s,
                 True,
                 "",
+                response_headers,
             )
             self._write_response(status, response_body, response_headers)
         except urllib.error.HTTPError as exc:
@@ -347,16 +367,17 @@ class DispatcherHandler(BaseHTTPRequestHandler):
             print(f"[dispatcher] backend={backend.name} HTTP {exc.code} path={self.path}", flush=True)
             self.pool.complete_backend(
                 backend,
-                estimated_cost,
+                estimated_service_s,
                 mark_sacrificial,
                 latency_s,
                 False,
                 f"HTTP {exc.code}",
+                response_headers,
             )
             self._write_response(exc.code, error_body, {"Content-Type": exc.headers.get_content_type()})
         except Exception as exc:  # noqa: BLE001
             latency_s = time.perf_counter() - started_at
-            self.pool.complete_backend(backend, estimated_cost, mark_sacrificial, latency_s, False, str(exc))
+            self.pool.complete_backend(backend, estimated_service_s, mark_sacrificial, latency_s, False, str(exc))
             print(f"[dispatcher] backend={backend.name} exception path={self.path}: {exc}", flush=True)
             self._json_error(HTTPStatus.BAD_GATEWAY, f"{backend.name} failed: {exc}")
 

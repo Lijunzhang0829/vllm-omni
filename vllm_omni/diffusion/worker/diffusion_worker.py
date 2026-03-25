@@ -41,6 +41,8 @@ from vllm_omni.diffusion.profiler import CurrentProfiler
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.scheduling_policy import (
+    DELAY_X_NORMAL_LOAD_METRIC_KEY,
+    DELAY_X_SACRIFICIAL_LOAD_METRIC_KEY,
     DelayXPolicy,
     DiffusionSchedulingPolicy,
     TargetFreeGlobalReorderPolicy,
@@ -586,6 +588,16 @@ class WorkerProc:
         )
         return next_req
 
+    def _attach_scheduler_load_metadata(
+        self,
+        output: DiffusionOutput,
+        next_req: OmniDiffusionRequest | None,
+    ) -> DiffusionOutput:
+        normal_load_s, sacrificial_load_s = self._scheduling_policy.local_loads_s(next_req)
+        output.scheduler_metadata[DELAY_X_NORMAL_LOAD_METRIC_KEY] = float(max(0.0, normal_load_s))
+        output.scheduler_metadata[DELAY_X_SACRIFICIAL_LOAD_METRIC_KEY] = float(max(0.0, sacrificial_load_s))
+        return output
+
     @staticmethod
     def _req_debug_id(req: OmniDiffusionRequest) -> str:
         return req_debug_id(req)
@@ -772,6 +784,8 @@ class WorkerProc:
                     f"req_id={finished_req_id} status={status} step={finished_step}",
                     flush=True,
                 )
+                next_req = self._schedule_next_after_finish()
+                output = self._attach_scheduler_load_metadata(output, next_req)
                 try:
                     self.return_result(
                         {
@@ -782,7 +796,7 @@ class WorkerProc:
                     )
                 except zmq.ZMQError as e:
                     logger.error("ZMQ error sending reply: %s", e)
-                self._current_req = self._schedule_next_after_finish()
+                self._current_req = next_req
                 continue
 
         logger.info("event loop terminated.")

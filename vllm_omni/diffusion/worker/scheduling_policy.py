@@ -20,6 +20,8 @@ QWEN_IMAGE_PROFILE_LATENCY_S: dict[tuple[int, int, int, int], float] = {
 QWEN_IMAGE_FALLBACK_REFERENCE_KEY = (1024, 1024, 25, 1)
 QWEN_IMAGE_FALLBACK_REFERENCE_LATENCY_S = QWEN_IMAGE_PROFILE_LATENCY_S[QWEN_IMAGE_FALLBACK_REFERENCE_KEY]
 DELAY_X_DISPATCHER_SACRIFICIAL_EXTRA_ARG_KEY = "_delay_x_dispatcher_sacrificial"
+DELAY_X_NORMAL_LOAD_METRIC_KEY = "delay_x_normal_load_s"
+DELAY_X_SACRIFICIAL_LOAD_METRIC_KEY = "delay_x_sacrificial_load_s"
 
 
 def req_debug_id(req: OmniDiffusionRequest) -> str:
@@ -120,6 +122,9 @@ class DiffusionSchedulingPolicy(Protocol):
     def max_active_predicted_latency_s(self, current_req: OmniDiffusionRequest | None) -> float:
         ...
 
+    def local_loads_s(self, current_req: OmniDiffusionRequest | None) -> tuple[float, float]:
+        ...
+
 
 class TargetFreeGlobalReorderPolicy:
     """Global queue reorder policy with arrival/finish scheduling points."""
@@ -216,6 +221,23 @@ class TargetFreeGlobalReorderPolicy:
         if not candidates:
             return 0.0
         return max(self._estimate_predicted_latency_s(req) for req in candidates)
+
+    def local_loads_s(self, current_req: OmniDiffusionRequest | None) -> tuple[float, float]:
+        normal_load_s = 0.0
+        if current_req is not None:
+            req_id = req_debug_id(current_req)
+            if req_id not in self._aborted_request_ids:
+                normal_load_s += estimate_total_service_s(current_req) * (
+                    estimate_remaining_cost(current_req) / max(1.0, estimate_total_cost(current_req))
+                )
+        for _, _, req in self._waiting_reqs:
+            req_id = req_debug_id(req)
+            if req_id in self._aborted_request_ids:
+                continue
+            normal_load_s += estimate_total_service_s(req) * (
+                estimate_remaining_cost(req) / max(1.0, estimate_total_cost(req))
+            )
+        return normal_load_s, 0.0
 
     def _queue_request(self, req: OmniDiffusionRequest) -> None:
         req_id = req_debug_id(req)
@@ -315,6 +337,8 @@ class DelayXPolicy:
         self._sacrificial_request_keys: set[str] = set()
         self._queued_remaining_service_s: dict[str, float] = {}
         self._heap_versions: dict[str, int] = {}
+        self._queued_normal_load_s: float = 0.0
+        self._queued_sacrificial_load_s: float = 0.0
         self._arrival_counter: int = 0
         self._arrival_seq_counter: int = 0
         self._current_time_s: float = 0.0
@@ -397,12 +421,10 @@ class DelayXPolicy:
 
     def on_request_complete(self, req: OmniDiffusionRequest) -> None:
         request_key = req.request_key
-        self._queued_request_keys.discard(request_key)
-        self._request_by_key.pop(request_key, None)
+        self._remove_queued_request(request_key)
         self._arrival_time_s.pop(req.request_key, None)
         self._arrival_seq.pop(req.request_key, None)
         self._sacrificial_request_keys.discard(req.request_key)
-        self._queued_remaining_service_s.pop(request_key, None)
         self._heap_versions.pop(request_key, None)
 
     def observe_execution(self, req: OmniDiffusionRequest, elapsed_s: float, work_done: float) -> None:
@@ -448,6 +470,19 @@ class DelayXPolicy:
             max_latency_s = max(max_latency_s, self._predicted_latency_s(best_waiting))
         return max_latency_s
 
+    def local_loads_s(self, current_req: OmniDiffusionRequest | None) -> tuple[float, float]:
+        normal_load_s = self._queued_normal_load_s
+        sacrificial_load_s = self._queued_sacrificial_load_s
+        if current_req is not None:
+            req_id = req_debug_id(current_req)
+            if req_id not in self._aborted_request_ids:
+                remaining_service_s = self._remaining_service_s(current_req)
+                if current_req.request_key in self._sacrificial_request_keys:
+                    sacrificial_load_s += remaining_service_s
+                else:
+                    normal_load_s += remaining_service_s
+        return max(0.0, normal_load_s), max(0.0, sacrificial_load_s)
+
     def _queue_request(self, req: OmniDiffusionRequest) -> None:
         req_id = req_debug_id(req)
         if req_id in self._aborted_request_ids:
@@ -460,7 +495,12 @@ class DelayXPolicy:
         request_key = req.request_key
         self._queued_request_keys.add(request_key)
         self._request_by_key[request_key] = req
-        self._queued_remaining_service_s[request_key] = self._compute_remaining_service_s(req)
+        queued_remaining_service_s = self._compute_remaining_service_s(req)
+        self._queued_remaining_service_s[request_key] = queued_remaining_service_s
+        if request_key in self._sacrificial_request_keys:
+            self._queued_sacrificial_load_s += queued_remaining_service_s
+        else:
+            self._queued_normal_load_s += queued_remaining_service_s
         next_version = self._heap_versions.get(request_key, 0) + 1
         self._heap_versions[request_key] = next_version
         heap = self._sacrificial_heap if request_key in self._sacrificial_request_keys else self._normal_heap
@@ -490,9 +530,7 @@ class DelayXPolicy:
             if req is None:
                 continue
             req_id = req_debug_id(req)
-            self._queued_request_keys.discard(request_key)
-            self._request_by_key.pop(request_key, None)
-            self._queued_remaining_service_s.pop(request_key, None)
+            self._remove_queued_request(request_key)
             if req_id in self._aborted_request_ids:
                 self._recent_dropped_request_ids.append(req_id)
                 self.on_request_complete(req)
@@ -523,9 +561,7 @@ class DelayXPolicy:
                 continue
             if req_debug_id(req) in self._aborted_request_ids:
                 heapq.heappop(heap)
-                self._queued_request_keys.discard(request_key)
-                self._request_by_key.pop(request_key, None)
-                self._queued_remaining_service_s.pop(request_key, None)
+                self._remove_queued_request(request_key)
                 self.on_request_complete(req)
                 continue
             return req
@@ -590,12 +626,28 @@ class DelayXPolicy:
         request_key = req.request_key
         if request_key in self._sacrificial_request_keys:
             return
+        queued_remaining_service_s = self._queued_remaining_service_s.get(request_key, 0.0)
+        if request_key in self._queued_request_keys and queued_remaining_service_s > 0:
+            self._queued_normal_load_s = max(0.0, self._queued_normal_load_s - queued_remaining_service_s)
+            self._queued_sacrificial_load_s += queued_remaining_service_s
         self._sacrificial_request_keys.add(request_key)
         if request_key in self._queued_request_keys:
             next_version = self._heap_versions.get(request_key, 0) + 1
             self._heap_versions[request_key] = next_version
             heapq.heappush(self._sacrificial_heap, self._heap_key(req, next_version))
         self._recent_sacrificial_request_ids.append(req_debug_id(req))
+
+    def _remove_queued_request(self, request_key: str) -> None:
+        if request_key not in self._queued_request_keys:
+            return
+        queued_remaining_service_s = self._queued_remaining_service_s.get(request_key, 0.0)
+        if request_key in self._sacrificial_request_keys:
+            self._queued_sacrificial_load_s = max(0.0, self._queued_sacrificial_load_s - queued_remaining_service_s)
+        else:
+            self._queued_normal_load_s = max(0.0, self._queued_normal_load_s - queued_remaining_service_s)
+        self._queued_request_keys.discard(request_key)
+        self._request_by_key.pop(request_key, None)
+        self._queued_remaining_service_s.pop(request_key, None)
 
     @staticmethod
     def _parse_sacrificial_flag(value: object) -> bool:
