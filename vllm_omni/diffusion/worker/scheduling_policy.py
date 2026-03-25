@@ -406,10 +406,15 @@ class DelayXPolicy:
         self._heap_versions.pop(request_key, None)
 
     def observe_execution(self, req: OmniDiffusionRequest, elapsed_s: float, work_done: float) -> None:
-        self._current_time_s += max(0.0, float(elapsed_s))
+        del elapsed_s
         if work_done <= 0:
             return
-        del req, work_done
+        total_cost = estimate_total_cost(req)
+        total_service_s = estimate_total_service_s(req)
+        if total_cost <= 0 or total_service_s <= 0:
+            return
+        estimated_elapsed_service_s = total_service_s * (max(0.0, float(work_done)) / total_cost)
+        self._current_time_s += max(0.0, estimated_elapsed_service_s)
 
     def abort_request_ids(self, request_ids: list[str]) -> None:
         for rid in request_ids:
