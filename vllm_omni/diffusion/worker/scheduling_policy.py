@@ -558,10 +558,16 @@ class DelayXPolicy:
     def _priority_tuple(self, req: OmniDiffusionRequest) -> tuple[int, float, int, str]:
         predicted_latency_s = self._predicted_latency_s(req)
         sacrificial = req.request_key in self._sacrificial_request_keys
-        scaled_latency_s = predicted_latency_s / self._tail_penalty if sacrificial else predicted_latency_s
+        if sacrificial:
+            return (
+                1,
+                predicted_latency_s / self._tail_penalty,
+                self._arrival_seq.get(req.request_key, 0),
+                req.request_key,
+            )
         return (
-            1 if sacrificial else 0,
-            -scaled_latency_s,
+            0,
+            -predicted_latency_s,
             self._arrival_seq.get(req.request_key, 0),
             req.request_key,
         )

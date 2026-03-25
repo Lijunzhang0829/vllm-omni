@@ -179,15 +179,14 @@ class BackendPool:
             if mark_sacrificial:
                 self._delay_x_credits = max(0, self._delay_x_credits - 1)
 
+            selected = min(
+                self.backends,
+                key=lambda backend: backend.effective_total_score(self._delay_x_sacrificial_load_factor),
+            )
             if mark_sacrificial:
-                selected = min(
-                    self.backends,
-                    key=lambda backend: backend.effective_total_score(self._delay_x_sacrificial_load_factor),
-                )
                 selected.inflight_sacrificial_requests += 1
                 selected.inflight_sacrificial_cost += estimated_cost
             else:
-                selected = min(self.backends, key=lambda backend: backend.normal_score())
                 selected.inflight_normal_requests += 1
                 selected.inflight_normal_cost += estimated_cost
             return selected, mark_sacrificial
