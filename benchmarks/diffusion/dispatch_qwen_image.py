@@ -10,6 +10,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from contextlib import closing
 from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -122,6 +123,20 @@ class BackendState:
         )
 
 
+def build_proxy_request(
+    method: str,
+    url: str,
+    body: bytes | None,
+    headers: dict[str, str],
+) -> urllib.request.Request:
+    request = urllib.request.Request(url=url, data=body, method=method)
+    for key, value in headers.items():
+        if key.lower() in {"host", "content-length", "transfer-encoding", "connection"}:
+            continue
+        request.add_header(key, value)
+    return request
+
+
 def proxy_request(
     method: str,
     url: str,
@@ -129,11 +144,7 @@ def proxy_request(
     headers: dict[str, str],
     timeout_s: int,
 ) -> tuple[int, bytes, dict[str, str]]:
-    request = urllib.request.Request(url=url, data=body, method=method)
-    for key, value in headers.items():
-        if key.lower() in {"host", "content-length", "transfer-encoding", "connection"}:
-            continue
-        request.add_header(key, value)
+    request = build_proxy_request(method, url, body, headers)
 
     with urllib.request.urlopen(request, timeout=timeout_s) as response:
         response_body = response.read()
@@ -285,6 +296,19 @@ class DispatcherHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _write_streaming_response(self, status: int, source, headers: dict[str, str] | None = None) -> None:
+        self.send_response(status)
+        for key, value in (headers or {}).items():
+            if key.lower() in {"transfer-encoding", "connection"}:
+                continue
+            self.send_header(key, value)
+        self.end_headers()
+        while True:
+            chunk = source.read(64 * 1024)
+            if not chunk:
+                break
+            self.wfile.write(chunk)
+
     def _json_error(self, status: int, message: str) -> None:
         print(f"[dispatcher] {status} {message}", flush=True)
         body = json.dumps({"error": message}).encode("utf-8")
@@ -342,27 +366,22 @@ class DispatcherHandler(BaseHTTPRequestHandler):
 
         forward_headers = inject_delay_x_sacrificial_header(dict(self.headers.items()), mark_sacrificial)
         try:
-            status, response_body, response_headers = proxy_request(
-                "POST",
-                f"{backend.base_url}{self.path}",
-                body,
-                forward_headers,
-                self.request_timeout_s,
-            )
-            latency_s = time.perf_counter() - started_at
-            self.pool.complete_backend(
-                backend,
-                estimated_service_s,
-                mark_sacrificial,
-                latency_s,
-                True,
-                "",
-                response_headers,
-            )
-            self._write_response(status, response_body, response_headers)
+            request = build_proxy_request("POST", f"{backend.base_url}{self.path}", body, forward_headers)
+            with closing(urllib.request.urlopen(request, timeout=self.request_timeout_s)) as response:
+                response_headers = {key: value for key, value in response.headers.items()}
+                latency_s = time.perf_counter() - started_at
+                self.pool.complete_backend(
+                    backend,
+                    estimated_service_s,
+                    mark_sacrificial,
+                    latency_s,
+                    True,
+                    "",
+                    response_headers,
+                )
+                self._write_streaming_response(response.status, response, response_headers)
         except urllib.error.HTTPError as exc:
             latency_s = time.perf_counter() - started_at
-            error_body = exc.read()
             response_headers = {key: value for key, value in exc.headers.items()}
             print(f"[dispatcher] backend={backend.name} HTTP {exc.code} path={self.path}", flush=True)
             self.pool.complete_backend(
@@ -374,7 +393,8 @@ class DispatcherHandler(BaseHTTPRequestHandler):
                 f"HTTP {exc.code}",
                 response_headers,
             )
-            self._write_response(exc.code, error_body, {"Content-Type": exc.headers.get_content_type()})
+            with closing(exc):
+                self._write_streaming_response(exc.code, exc, response_headers)
         except Exception as exc:  # noqa: BLE001
             latency_s = time.perf_counter() - started_at
             self.pool.complete_backend(backend, estimated_service_s, mark_sacrificial, latency_s, False, str(exc))
