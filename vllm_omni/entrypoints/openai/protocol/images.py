@@ -111,7 +111,7 @@ class ImageGenerationRequest(BaseModel):
     dispatcher_delay_x_sacrificial: bool | None = Field(
         default=None,
         exclude=True,
-        validation_alias="dispatcher_delay_x_quota_amount",
+        validation_alias="dispatcher_delay_x_sacrificial",
         description="Internal dispatcher metadata for delay_x sacrificial propagation.",
     )
 

@@ -533,59 +533,18 @@ class WorkerProc:
         req.preempt_step_chunk_size = max(1, int(req.preempt_step_chunk_size))
         incoming_req_id = self._req_debug_id(req)
         if self._scheduling_policy.is_aborted(incoming_req_id):
-            print(
-                f"[DiffusionDrop][{self._now_str()}][rank={self.gpu_id}] req_id={incoming_req_id} reason=aborted",
-                flush=True,
-            )
             return
-        print(
-            f"[DiffusionArrive][{self._now_str()}][rank={self.gpu_id}] "
-            f"req_id={incoming_req_id} preempt_enabled={req.preempt_enabled}",
-            flush=True,
-        )
         decision = self._scheduling_policy.on_request_arrival(req, self._current_req)
-        for dropped_id in self._scheduling_policy.consume_recent_dropped_request_ids():
-            print(
-                f"[DiffusionDrop][{self._now_str()}][rank={self.gpu_id}] req_id={dropped_id} reason=aborted",
-                flush=True,
-            )
-        for sacrificial_id in self._scheduling_policy.consume_recent_sacrificial_request_ids():
-            print(
-                f"[DiffusionDelayX][{self._now_str()}][rank={self.gpu_id}] "
-                f"req_id={sacrificial_id} marked=sacrificial",
-                flush=True,
-            )
-        if decision.preemption is not None:
-            preempted_req_id = self._req_debug_id(decision.preemption.preempted_req)
-            current_step = self._req_step_index(decision.preemption.preempted_req)
-            candidate_req_id = self._req_debug_id(decision.preemption.selected_req)
-            print(
-                f"[DiffusionPreempt][{self._now_str()}][rank={self.gpu_id}] "
-                f"preempt req_id={preempted_req_id} at step={current_step}; "
-                f"switch_to req_id={candidate_req_id} "
-                f"cost_cur={decision.preemption.preempted_cost:.0f} "
-                f"cost_new={decision.preemption.selected_cost:.0f}",
-                flush=True,
-            )
+        self._scheduling_policy.consume_recent_dropped_request_ids()
+        self._scheduling_policy.consume_recent_sacrificial_request_ids()
         self._current_req = decision.current_req
 
     def _schedule_next_after_finish(self) -> OmniDiffusionRequest | None:
         # Global rescheduling decision point #2: current request finished.
         next_req = self._scheduling_policy.on_request_finish(self._current_req)
-        for dropped_id in self._scheduling_policy.consume_recent_dropped_request_ids():
-            print(
-                f"[DiffusionDrop][{self._now_str()}][rank={self.gpu_id}] req_id={dropped_id} reason=aborted",
-                flush=True,
-            )
+        self._scheduling_policy.consume_recent_dropped_request_ids()
         if next_req is None:
             return None
-        next_req_id = self._req_debug_id(next_req)
-        next_step = self._req_step_index(next_req)
-        print(
-            f"[DiffusionResume][{self._now_str()}][rank={self.gpu_id}] "
-            f"resume req_id={next_req_id} from step={next_step}",
-            flush=True,
-        )
         return next_req
 
     def _attach_scheduler_load_metadata(
@@ -614,9 +573,6 @@ class WorkerProc:
         if not request_ids:
             return
         self._scheduling_policy.abort_request_ids(request_ids)
-        for rid in request_ids:
-            if isinstance(rid, str):
-                print(f"[DiffusionAbort][{self._now_str()}][rank={self.gpu_id}] req_id={rid}", flush=True)
 
         if self._current_req is not None:
             cur_id = self._req_debug_id(self._current_req)
@@ -762,13 +718,10 @@ class WorkerProc:
             except Exception as e:
                 failed_req_id = self._req_debug_id(self._current_req)
                 failed_step = self._req_step_index(self._current_req)
-                print(
-                    f"[DiffusionError][{self._now_str()}][rank={self.gpu_id}] "
-                    f"req_id={failed_req_id} step={failed_step} error={e}",
-                    flush=True,
-                )
                 logger.error(
-                    "Error executing forward in event loop: %s",
+                    "Error executing forward in event loop: req_id=%s step=%s error=%s",
+                    failed_req_id,
+                    failed_step,
                     e,
                     exc_info=True,
                 )
@@ -776,14 +729,6 @@ class WorkerProc:
                 self._report_request_error_to_parent(self._current_req.request_key, str(e))
 
             if output.finished:
-                finished_req_id = self._req_debug_id(self._current_req)
-                finished_step = self._req_step_index(self._current_req)
-                status = "error" if output.error else "ok"
-                print(
-                    f"[DiffusionFinish][{self._now_str()}][rank={self.gpu_id}] "
-                    f"req_id={finished_req_id} status={status} step={finished_step}",
-                    flush=True,
-                )
                 next_req = self._schedule_next_after_finish()
                 output = self._attach_scheduler_load_metadata(output, next_req)
                 try:

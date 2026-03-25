@@ -503,8 +503,9 @@ class DelayXPolicy:
             self._queued_normal_load_s += queued_remaining_service_s
         next_version = self._heap_versions.get(request_key, 0) + 1
         self._heap_versions[request_key] = next_version
-        heap = self._sacrificial_heap if request_key in self._sacrificial_request_keys else self._normal_heap
-        heapq.heappush(heap, self._heap_key(req, next_version))
+        sacrificial = request_key in self._sacrificial_request_keys
+        heap = self._sacrificial_heap if sacrificial else self._normal_heap
+        heapq.heappush(heap, self._heap_key(req, next_version, sacrificial=sacrificial))
 
     def _pop_best_waiting_request(self) -> OmniDiffusionRequest | None:
         req = self._pop_from_heap(self._normal_heap, sacrificial=False)
@@ -608,15 +609,22 @@ class DelayXPolicy:
             req.request_key,
         )
 
-    def _heap_key(self, req: OmniDiffusionRequest, version: int) -> tuple[float, int, int, str]:
+    def _heap_key(
+        self,
+        req: OmniDiffusionRequest,
+        version: int,
+        *,
+        sacrificial: bool,
+    ) -> tuple[float, int, int, str]:
         # Waiting-queue ordering only depends on remaining_service - arrival_time,
         # because current_time is a common offset across waiting requests.
         base_score = (
             self._queued_remaining_service_s.get(req.request_key, 0.0)
             - self._arrival_time_s.get(req.request_key, self._current_time_s)
         )
+        primary = base_score if sacrificial else -base_score
         return (
-            -base_score,
+            primary,
             self._arrival_seq.get(req.request_key, 0),
             version,
             req.request_key,
@@ -634,7 +642,7 @@ class DelayXPolicy:
         if request_key in self._queued_request_keys:
             next_version = self._heap_versions.get(request_key, 0) + 1
             self._heap_versions[request_key] = next_version
-            heapq.heappush(self._sacrificial_heap, self._heap_key(req, next_version))
+            heapq.heappush(self._sacrificial_heap, self._heap_key(req, next_version, sacrificial=True))
         self._recent_sacrificial_request_ids.append(req_debug_id(req))
 
     def _remove_queued_request(self, request_key: str) -> None:
