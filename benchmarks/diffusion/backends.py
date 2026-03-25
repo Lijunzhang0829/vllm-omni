@@ -10,6 +10,17 @@ import aiohttp
 from tqdm import tqdm
 
 
+DELAY_X_ESTIMATED_SERVICE_HEADER = "X-DelayX-Estimated-Service-S"
+QWEN_IMAGE_PROFILE_LATENCY_S: dict[tuple[int, int, int, int], float] = {
+    (512, 512, 20, 1): 22.35,
+    (768, 768, 20, 1): 20.62,
+    (1024, 1024, 25, 1): 33.90,
+    (1536, 1536, 35, 1): 102.66,
+}
+QWEN_IMAGE_FALLBACK_REFERENCE_KEY = (1024, 1024, 25, 1)
+QWEN_IMAGE_FALLBACK_REFERENCE_LATENCY_S = QWEN_IMAGE_PROFILE_LATENCY_S[QWEN_IMAGE_FALLBACK_REFERENCE_KEY]
+
+
 @dataclass
 class RequestFuncInput:
     prompt: str
@@ -37,6 +48,31 @@ class RequestFuncOutput:
     response_body: dict[str, Any] = field(default_factory=dict)
     peak_memory_mb: float = 0.0
     slo_achieved: bool | None = None
+
+
+def estimate_request_service_s(input: RequestFuncInput) -> float:
+    width = int(input.width or 1024)
+    height = int(input.height or 1024)
+    steps = int(input.num_inference_steps or 50)
+    num_frames = int(input.num_frames or 1)
+    profile_key = (width, height, steps, num_frames)
+    if profile_key in QWEN_IMAGE_PROFILE_LATENCY_S:
+        return QWEN_IMAGE_PROFILE_LATENCY_S[profile_key]
+
+    total_cost = max(1, width * height * steps * num_frames)
+    reference_cost = (
+        QWEN_IMAGE_FALLBACK_REFERENCE_KEY[0]
+        * QWEN_IMAGE_FALLBACK_REFERENCE_KEY[1]
+        * QWEN_IMAGE_FALLBACK_REFERENCE_KEY[2]
+        * QWEN_IMAGE_FALLBACK_REFERENCE_KEY[3]
+    )
+    return QWEN_IMAGE_FALLBACK_REFERENCE_LATENCY_S * (float(total_cost) / float(reference_cost))
+
+
+def build_delay_x_hint_headers(input: RequestFuncInput) -> dict[str, str]:
+    return {
+        DELAY_X_ESTIMATED_SERVICE_HEADER: f"{estimate_request_service_s(input):.6f}",
+    }
 
 
 def _guess_mime_type(path: str) -> str:
@@ -101,7 +137,7 @@ async def async_request_chat_completions(
         payload["extra_body"] = extra_body
 
     try:
-        async with session.post(input.api_url, json=payload) as response:
+        async with session.post(input.api_url, json=payload, headers=build_delay_x_hint_headers(input)) as response:
             if response.status == 200:
                 resp_json = await response.json()
                 output.response_body = resp_json
@@ -165,6 +201,7 @@ async def async_request_openai_images(
         "Content-Type": "application/json",
         "Authorization": "Bearer EMPTY",
     }
+    headers.update(build_delay_x_hint_headers(input))
 
     try:
         async with session.post(input.api_url, json=payload, headers=headers) as response:
@@ -231,7 +268,7 @@ async def async_request_v1_videos(
         )
 
     try:
-        async with session.post(input.api_url, data=form) as response:
+        async with session.post(input.api_url, data=form, headers=build_delay_x_hint_headers(input)) as response:
             if response.status == 200:
                 resp_json = await response.json()
                 output.response_body = resp_json

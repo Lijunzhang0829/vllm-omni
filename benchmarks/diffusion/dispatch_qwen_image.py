@@ -21,6 +21,7 @@ DEFAULT_REQUEST_TIMEOUT_S = 60 * 60
 DELAY_X_DISPATCHER_SACRIFICIAL_HEADER = "X-DelayX-Sacrificial"
 DELAY_X_NORMAL_LOAD_HEADER = "X-DelayX-Normal-Load-S"
 DELAY_X_SACRIFICIAL_LOAD_HEADER = "X-DelayX-Sacrificial-Load-S"
+DELAY_X_ESTIMATED_SERVICE_HEADER = "X-DelayX-Estimated-Service-S"
 QWEN_IMAGE_PROFILE_LATENCY_S: dict[tuple[int, int, int, int], float] = {
     (512, 512, 20, 1): 22.35,
     (768, 768, 20, 1): 20.62,
@@ -349,14 +350,16 @@ class DispatcherHandler(BaseHTTPRequestHandler):
             return
 
         body = self._read_body()
-        try:
-            payload = json.loads(body.decode("utf-8")) if body else {}
-        except Exception as exc:  # noqa: BLE001
-            self._json_error(HTTPStatus.BAD_REQUEST, f"Invalid JSON body: {exc}")
-            return
-
-        estimated_cost = estimate_request_cost(payload)
-        estimated_service_s = estimate_request_service_s(payload)
+        estimated_service_s = _parse_float_header(self.headers.get(DELAY_X_ESTIMATED_SERVICE_HEADER))
+        estimated_cost = 0
+        if estimated_service_s is None:
+            try:
+                payload = json.loads(body.decode("utf-8")) if body else {}
+            except Exception as exc:  # noqa: BLE001
+                self._json_error(HTTPStatus.BAD_REQUEST, f"Invalid JSON body: {exc}")
+                return
+            estimated_cost = estimate_request_cost(payload)
+            estimated_service_s = estimate_request_service_s(payload)
         started_at = time.perf_counter()
         try:
             backend, mark_sacrificial = self.pool.choose_backend(estimated_cost, estimated_service_s)
