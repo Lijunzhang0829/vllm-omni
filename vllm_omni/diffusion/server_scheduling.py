@@ -7,46 +7,100 @@ import heapq
 import threading
 from dataclasses import dataclass, field
 
+from vllm.logger import init_logger
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.super_p95 import (
     SuperP95LoadSnapshot,
     get_super_p95_request_metadata,
 )
 
-# Qwen-Image service-time anchors from benchmarks/diffusion/super_p95_strategy.md.
-_KNOWN_SERVICE_TIME_ANCHORS_S: dict[tuple[int, int], tuple[int, float]] = {
-    (512, 512): (20, 22.35),
-    (768, 768): (20, 20.62),
-    (1024, 1024): (25, 33.90),
-    (1536, 1536): (35, 102.66),
+logger = init_logger(__name__)
+
+DEFAULT_SUPER_P95_HARDWARE_PROFILE = "910B2"
+_KNOWN_SUPER_P95_HARDWARE_PROFILES = {"910B2", "910B3"}
+
+# Qwen-Image service-time anchors for the supported NPU hardware profiles.
+_HARDWARE_ANCHORS_S: dict[str, dict[tuple[int, int], tuple[int, float]]] = {
+    "910B2": {
+        (512, 512): (20, 8.60),
+        (768, 768): (20, 8.94),
+        (1024, 1024): (25, 14.22),
+        (1536, 1536): (35, 43.22),
+    },
+    "910B3": {
+        (512, 512): (20, 8.00),
+        (768, 768): (20, 9.00),
+        (1024, 1024): (25, 22.11),
+        (1536, 1536): (35, 71.68),
+    },
 }
 
 _FALLBACK_BASE_RESOLUTION = (1024, 1024)
 _FALLBACK_BASE_STEPS = 25
-_FALLBACK_BASE_SERVICE_S = 33.90
+_PER_PIXEL_STEP_MS: dict[str, dict[tuple[int, int], float]] = {
+    hardware_profile: {
+        resolution: (anchor_latency_s * 1000.0) / (resolution[0] * resolution[1] * anchor_steps)
+        for resolution, (anchor_steps, anchor_latency_s) in anchors.items()
+    }
+    for hardware_profile, anchors in _HARDWARE_ANCHORS_S.items()
+}
+_WARNED_SUPER_P95_HARDWARE_MESSAGES: set[str] = set()
 
 
-def estimate_service_time_s(request: OmniDiffusionRequest) -> float:
+def normalize_super_p95_hardware_profile(hardware_profile: str | None) -> str:
+    normalized = (hardware_profile or DEFAULT_SUPER_P95_HARDWARE_PROFILE).strip().upper()
+    if normalized in _KNOWN_SUPER_P95_HARDWARE_PROFILES:
+        return normalized
+    return DEFAULT_SUPER_P95_HARDWARE_PROFILE
+
+
+def resolve_super_p95_hardware_profile(
+    hardware_profile: str | None,
+    *,
+    warn_on_default: bool = False,
+    context: str = "super_p95",
+) -> str:
+    raw_value = hardware_profile.strip() if isinstance(hardware_profile, str) else None
+    if not raw_value:
+        if warn_on_default:
+            _warn_super_p95_hardware_once(
+                f"{context}: super_p95 hardware profile was not specified; defaulting to {DEFAULT_SUPER_P95_HARDWARE_PROFILE}."
+            )
+        return DEFAULT_SUPER_P95_HARDWARE_PROFILE
+
+    normalized = raw_value.upper()
+    if normalized in _KNOWN_SUPER_P95_HARDWARE_PROFILES:
+        return normalized
+
+    _warn_super_p95_hardware_once(
+        f"{context}: unknown super_p95 hardware profile {hardware_profile!r}; "
+        f"defaulting to {DEFAULT_SUPER_P95_HARDWARE_PROFILE}."
+    )
+    return DEFAULT_SUPER_P95_HARDWARE_PROFILE
+
+
+def _warn_super_p95_hardware_once(message: str) -> None:
+    if message in _WARNED_SUPER_P95_HARDWARE_MESSAGES:
+        return
+    _WARNED_SUPER_P95_HARDWARE_MESSAGES.add(message)
+    logger.warning(message)
+
+
+def estimate_service_time_s(
+    request: OmniDiffusionRequest,
+    hardware_profile: str | None = None,
+) -> float:
     params = request.sampling_params
     width = int(params.width or params.resolution or _FALLBACK_BASE_RESOLUTION[0])
     height = int(params.height or params.resolution or _FALLBACK_BASE_RESOLUTION[1])
     steps = max(int(params.num_inference_steps or _FALLBACK_BASE_STEPS), 1)
     frames = max(int(params.num_frames or 1), 1)
 
-    anchor = _KNOWN_SERVICE_TIME_ANCHORS_S.get((width, height))
-    if anchor is not None:
-        anchor_steps, anchor_latency_s = anchor
-        return anchor_latency_s * (steps / anchor_steps) * frames
-
-    return (
-        _FALLBACK_BASE_SERVICE_S
-        * (width * height * steps * frames)
-        / (
-            _FALLBACK_BASE_RESOLUTION[0]
-            * _FALLBACK_BASE_RESOLUTION[1]
-            * _FALLBACK_BASE_STEPS
-        )
-    )
+    profile = normalize_super_p95_hardware_profile(hardware_profile)
+    per_pixel_step_ms = _PER_PIXEL_STEP_MS[profile].get((width, height))
+    if per_pixel_step_ms is None:
+        per_pixel_step_ms = _PER_PIXEL_STEP_MS[profile][_FALLBACK_BASE_RESOLUTION]
+    return per_pixel_step_ms * width * height * steps * frames / 1000.0
 
 
 @dataclass(order=True)
@@ -77,19 +131,20 @@ class ScheduledRequest:
 
 
 class PredictedLatencyPolicy:
-    def __init__(self) -> None:
+    def __init__(self, *, hardware_profile: str | None = None) -> None:
         self._normal_pending: list[ScheduledRequest] = []
         self._sacrificial_pending: list[ScheduledRequest] = []
         self._arrival_seq = 0
         self.current_time_s = 0.0
         self._normal_load_s = 0.0
         self._sacrificial_load_s = 0.0
+        self._hardware_profile = normalize_super_p95_hardware_profile(hardware_profile)
 
     def add_request(self, request: OmniDiffusionRequest) -> ScheduledRequest:
         extra_args = getattr(request.sampling_params, "extra_args", None)
         is_sacrificial, estimated_service_s = get_super_p95_request_metadata(extra_args)
         if estimated_service_s is None:
-            estimated_service_s = estimate_service_time_s(request)
+            estimated_service_s = estimate_service_time_s(request, hardware_profile=self._hardware_profile)
         total_steps = max(int(request.sampling_params.num_inference_steps or 1), 1)
         scheduled = ScheduledRequest(
             arrival_seq=self._arrival_seq,

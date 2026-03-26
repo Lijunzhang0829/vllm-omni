@@ -18,6 +18,7 @@ from vllm_omni.diffusion.super_p95 import (
 def test_dispatcher_marks_large_request_sacrificial_after_credit_replenish():
     dispatcher = SuperP95Dispatcher(
         backend_urls=["http://backend-0", "http://backend-1"],
+        backend_hardware_profiles=None,
         quota_every=2,
         quota_amount=1,
         threshold_ratio=0.8,
@@ -46,6 +47,7 @@ def test_dispatcher_marks_large_request_sacrificial_after_credit_replenish():
 def test_dispatcher_routes_to_lower_weighted_load_backend():
     dispatcher = SuperP95Dispatcher(
         backend_urls=["http://backend-0", "http://backend-1"],
+        backend_hardware_profiles=None,
         quota_every=20,
         quota_amount=1,
         threshold_ratio=0.8,
@@ -85,6 +87,7 @@ def test_build_dispatcher_from_args_managed_launch_defaults():
         model="Qwen/Qwen-Image",
         backend_host="127.0.0.1",
         backend_start_port=8091,
+        backend_hardware_profiles=None,
         backend_args="--omni --vae-use-slicing --vae-use-tiling",
         backend_env=["VLLM_PLUGINS=ascend"],
         device_env_var="ASCEND_RT_VISIBLE_DEVICES",
@@ -106,6 +109,7 @@ def test_build_dispatcher_from_args_managed_launch_defaults():
     ]
     assert dispatcher._backend_launcher is not None
     assert [spec.device_id for spec in dispatcher._backend_launcher.specs] == ["0", "1"]
+    assert [spec.hardware_profile for spec in dispatcher._backend_launcher.specs] == ["910B2", "910B2"]
     assert dispatcher._backend_launcher.backend_args == ["--omni", "--vae-use-slicing", "--vae-use-tiling"]
     assert dispatcher._backend_launcher.backend_env["VLLM_PLUGINS"] == "ascend"
 
@@ -118,6 +122,7 @@ def test_build_dispatcher_from_args_rejects_manual_and_managed_mix():
         model="Qwen/Qwen-Image",
         backend_host="127.0.0.1",
         backend_start_port=8091,
+        backend_hardware_profiles=None,
         backend_args="--omni",
         backend_env=[],
         device_env_var="ASCEND_RT_VISIBLE_DEVICES",
@@ -177,8 +182,8 @@ def test_managed_backend_launcher_builds_expected_command_and_env(tmp_path, monk
 
     launcher = ManagedBackendLauncher(
         specs=[
-            ManagedBackendSpec(device_id="0", port=8091, base_url="http://127.0.0.1:8091"),
-            ManagedBackendSpec(device_id="1", port=8092, base_url="http://127.0.0.1:8092"),
+            ManagedBackendSpec(device_id="0", port=8091, base_url="http://127.0.0.1:8091", hardware_profile="910B2"),
+            ManagedBackendSpec(device_id="1", port=8092, base_url="http://127.0.0.1:8092", hardware_profile="910B3"),
         ],
         model="Qwen/Qwen-Image",
         backend_args=["--omni", "--vae-use-slicing", "--vae-use-tiling"],
@@ -193,8 +198,82 @@ def test_managed_backend_launcher_builds_expected_command_and_env(tmp_path, monk
     launcher.stop_all()
 
     assert [call["cmd"] for call in popen_calls] == [
-        ["vllm", "serve", "Qwen/Qwen-Image", "--port", "8091", "--omni", "--vae-use-slicing", "--vae-use-tiling"],
-        ["vllm", "serve", "Qwen/Qwen-Image", "--port", "8092", "--omni", "--vae-use-slicing", "--vae-use-tiling"],
+        [
+            "vllm",
+            "serve",
+            "Qwen/Qwen-Image",
+            "--port",
+            "8091",
+            "--super-p95-hardware-profile",
+            "910B2",
+            "--omni",
+            "--vae-use-slicing",
+            "--vae-use-tiling",
+        ],
+        [
+            "vllm",
+            "serve",
+            "Qwen/Qwen-Image",
+            "--port",
+            "8092",
+            "--super-p95-hardware-profile",
+            "910B3",
+            "--omni",
+            "--vae-use-slicing",
+            "--vae-use-tiling",
+        ],
     ]
     assert [call["env_device"] for call in popen_calls] == ["0", "1"]
     assert all(call["env_plugin"] == "ascend" for call in popen_calls)
+
+
+def test_build_dispatcher_from_args_applies_backend_hardware_profiles():
+    args = Namespace(
+        backend_urls=None,
+        num_servers=2,
+        device_ids="0,1",
+        model="Qwen/Qwen-Image",
+        backend_host="127.0.0.1",
+        backend_start_port=8091,
+        backend_hardware_profiles="910B2,910B3",
+        backend_args="--omni",
+        backend_env=[],
+        device_env_var="ASCEND_RT_VISIBLE_DEVICES",
+        backend_health_timeout_s=900.0,
+        backend_health_poll_interval_s=5.0,
+        backend_log_dir="/tmp/super_p95_test_logs",
+        quota_every=20,
+        quota_amount=1,
+        threshold_ratio=0.8,
+        sacrificial_load_factor=0.1,
+        request_timeout_s=600.0,
+    )
+
+    dispatcher = build_dispatcher_from_args(args)
+
+    assert [backend.hardware_profile for backend in dispatcher.backends] == ["910B2", "910B3"]
+
+
+def test_dispatcher_estimates_service_time_per_backend_profile():
+    dispatcher = SuperP95Dispatcher(
+        backend_urls=["http://backend-0", "http://backend-1"],
+        backend_hardware_profiles=["910B2", "910B3"],
+        quota_every=20,
+        quota_amount=1,
+        threshold_ratio=0.8,
+        sacrificial_load_factor=0.1,
+        request_timeout_s=30.0,
+    )
+    dispatcher.backends[0].normal_load_s = 30.0
+    dispatcher.backends[1].normal_load_s = 0.0
+
+    async def _run():
+        return await dispatcher._choose_backend(
+            "/v1/chat/completions",
+            {"extra_body": {"width": 1024, "height": 1024, "num_inference_steps": 25}},
+        )
+
+    decision = asyncio.run(_run())
+
+    assert decision.backend_index == 1
+    assert decision.estimated_service_s == pytest.approx(22.11)

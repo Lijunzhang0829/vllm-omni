@@ -22,7 +22,11 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.diffusion.server_scheduling import estimate_service_time_s
+from vllm_omni.diffusion.server_scheduling import (
+    estimate_service_time_s,
+    normalize_super_p95_hardware_profile,
+    resolve_super_p95_hardware_profile,
+)
 from vllm_omni.diffusion.super_p95 import (
     HEADER_SUPER_P95_ESTIMATED_SERVICE_S,
     HEADER_SUPER_P95_SACRIFICIAL,
@@ -35,6 +39,7 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 class BackendState:
     name: str
     base_url: str
+    hardware_profile: str = "910B2"
     normal_load_s: float = 0.0
     sacrificial_load_s: float = 0.0
     inflight_normal_requests: int = 0
@@ -67,6 +72,7 @@ class ManagedBackendSpec:
     device_id: str
     port: int
     base_url: str
+    hardware_profile: str
 
 
 @dataclass
@@ -141,6 +147,8 @@ class ManagedBackendLauncher:
             self.model,
             "--port",
             str(spec.port),
+            "--super-p95-hardware-profile",
+            spec.hardware_profile,
             *self.backend_args,
         ]
         process = subprocess.Popen(
@@ -193,6 +201,7 @@ class SuperP95Dispatcher:
         self,
         backend_urls: list[str],
         *,
+        backend_hardware_profiles: list[str] | None,
         quota_every: int,
         quota_amount: int,
         threshold_ratio: float,
@@ -202,9 +211,15 @@ class SuperP95Dispatcher:
     ) -> None:
         if not 1 <= len(backend_urls) <= 8:
             raise ValueError("super_p95 dispatcher supports 1 to 8 backends")
+        hardware_profiles = _parse_backend_hardware_profiles(backend_hardware_profiles, len(backend_urls))
 
         self.backends = [
-            BackendState(name=f"backend-{idx}", base_url=url.rstrip("/")) for idx, url in enumerate(backend_urls)
+            BackendState(
+                name=f"backend-{idx}",
+                base_url=url.rstrip("/"),
+                hardware_profile=hardware_profiles[idx],
+            )
+            for idx, url in enumerate(backend_urls)
         ]
         self.quota_every = max(quota_every, 1)
         self.quota_amount = max(quota_amount, 0)
@@ -285,9 +300,12 @@ class SuperP95Dispatcher:
         )
 
     async def _choose_backend(self, path: str, body: dict[str, Any]) -> DispatchDecision:
-        estimated_service_s = self._estimate_service_s(path, body)
+        estimated_service_s_by_backend = [
+            self._estimate_service_s(path, body, backend.hardware_profile) for backend in self.backends
+        ]
         async with self._lock:
             self.arrival_counter += 1
+            estimated_service_s = min(estimated_service_s_by_backend)
             if self.arrival_counter % self.quota_every == 0:
                 self.credits += self.quota_amount
 
@@ -305,16 +323,17 @@ class SuperP95Dispatcher:
                 key=lambda idx: self.backends[idx].score_tuple(self.sacrificial_load_factor),
             )
             backend = self.backends[backend_index]
+            selected_estimated_service_s = estimated_service_s_by_backend[backend_index]
             if is_sacrificial:
-                backend.sacrificial_load_s += estimated_service_s
+                backend.sacrificial_load_s += selected_estimated_service_s
                 backend.inflight_sacrificial_requests += 1
             else:
-                backend.normal_load_s += estimated_service_s
+                backend.normal_load_s += selected_estimated_service_s
                 backend.inflight_normal_requests += 1
 
             return DispatchDecision(
                 backend_index=backend_index,
-                estimated_service_s=estimated_service_s,
+                estimated_service_s=selected_estimated_service_s,
                 is_sacrificial=is_sacrificial,
             )
 
@@ -384,7 +403,7 @@ class SuperP95Dispatcher:
         return headers
 
     @staticmethod
-    def _estimate_service_s(path: str, body: dict[str, Any]) -> float:
+    def _estimate_service_s(path: str, body: dict[str, Any], hardware_profile: str) -> float:
         if path == "/v1/chat/completions":
             extra_body = body.get("extra_body") or {}
             return _estimate_service_s_from_values(
@@ -392,6 +411,7 @@ class SuperP95Dispatcher:
                 height=extra_body.get("height"),
                 num_inference_steps=extra_body.get("num_inference_steps"),
                 num_frames=extra_body.get("num_frames"),
+                hardware_profile=hardware_profile,
             )
 
         if path == "/v1/images/generations":
@@ -401,6 +421,7 @@ class SuperP95Dispatcher:
                 height=height,
                 num_inference_steps=body.get("num_inference_steps"),
                 num_frames=body.get("num_frames"),
+                hardware_profile=hardware_profile,
             )
 
         raise HTTPException(status_code=400, detail=f"Unsupported super_p95 path: {path}")
@@ -422,6 +443,7 @@ def _estimate_service_s_from_values(
     height: Any,
     num_inference_steps: Any,
     num_frames: Any,
+    hardware_profile: str,
 ) -> float:
     sampling_params = OmniDiffusionSamplingParams(
         width=int(width) if width is not None else None,
@@ -430,7 +452,7 @@ def _estimate_service_s_from_values(
         num_frames=int(num_frames) if num_frames is not None else 1,
     )
     request = OmniDiffusionRequest(prompts=["super_p95"], sampling_params=sampling_params, request_ids=["super_p95"])
-    return estimate_service_time_s(request)
+    return estimate_service_time_s(request, hardware_profile=hardware_profile)
 
 
 def build_app(dispatcher: SuperP95Dispatcher) -> FastAPI:
@@ -483,6 +505,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", help="Model name for managed backend launch, e.g. Qwen/Qwen-Image.")
     parser.add_argument("--backend-host", default="127.0.0.1", help="Host used for managed backend URLs.")
     parser.add_argument("--backend-start-port", type=int, default=8091, help="Starting port for managed backends.")
+    parser.add_argument(
+        "--backend-hardware-profiles",
+        help=(
+            "Comma-separated hardware profiles for backends, e.g. 910B2,910B3. "
+            "Defaults to 910B2 for every backend."
+        ),
+    )
     parser.add_argument(
         "--backend-args",
         default="--omni",
@@ -546,12 +575,45 @@ def _parse_device_ids(device_ids: str | None, num_servers: int) -> list[str]:
     return parsed
 
 
-def _build_managed_specs(host: str, start_port: int, device_ids: list[str]) -> list[ManagedBackendSpec]:
+def _parse_backend_hardware_profiles(raw: list[str] | None | str, num_backends: int) -> list[str]:
+    if raw is None:
+        return [
+            resolve_super_p95_hardware_profile(
+                None,
+                warn_on_default=True,
+                context="dispatcher",
+            )
+        ] * num_backends
+    if isinstance(raw, str):
+        parsed = [item.strip() for item in raw.split(",") if item.strip()]
+    else:
+        parsed = [item.strip() for item in raw if item.strip()]
+    if len(parsed) == 1 and num_backends > 1:
+        parsed = parsed * num_backends
+    if len(parsed) != num_backends:
+        raise ValueError(f"--backend-hardware-profiles must provide exactly {num_backends} entries")
+    return [
+        resolve_super_p95_hardware_profile(
+            item,
+            warn_on_default=False,
+            context=f"dispatcher backend-{idx}",
+        )
+        for idx, item in enumerate(parsed)
+    ]
+
+
+def _build_managed_specs(
+    host: str,
+    start_port: int,
+    device_ids: list[str],
+    hardware_profiles: list[str],
+) -> list[ManagedBackendSpec]:
     return [
         ManagedBackendSpec(
             device_id=device_id,
             port=start_port + idx,
             base_url=f"http://{host}:{start_port + idx}",
+            hardware_profile=hardware_profiles[idx],
         )
         for idx, device_id in enumerate(device_ids)
     ]
@@ -560,6 +622,7 @@ def _build_managed_specs(host: str, start_port: int, device_ids: list[str]) -> l
 def build_dispatcher_from_args(args: argparse.Namespace) -> SuperP95Dispatcher:
     manual_urls = [url.rstrip("/") for url in (args.backend_urls or [])]
     use_managed = args.num_servers is not None or args.model is not None or args.device_ids is not None
+    backend_hardware_profiles_arg = getattr(args, "backend_hardware_profiles", None)
 
     if manual_urls and use_managed:
         raise ValueError("Choose either --backend-url or managed launch args, not both")
@@ -573,7 +636,8 @@ def build_dispatcher_from_args(args: argparse.Namespace) -> SuperP95Dispatcher:
         if not 1 <= args.num_servers <= 8:
             raise ValueError("--num-servers must be between 1 and 8")
         device_ids = _parse_device_ids(args.device_ids, args.num_servers)
-        specs = _build_managed_specs(args.backend_host, args.backend_start_port, device_ids)
+        hardware_profiles = _parse_backend_hardware_profiles(backend_hardware_profiles_arg, args.num_servers)
+        specs = _build_managed_specs(args.backend_host, args.backend_start_port, device_ids, hardware_profiles)
         backend_urls = [spec.base_url for spec in specs]
         backend_launcher = ManagedBackendLauncher(
             specs=specs,
@@ -588,6 +652,7 @@ def build_dispatcher_from_args(args: argparse.Namespace) -> SuperP95Dispatcher:
 
     return SuperP95Dispatcher(
         backend_urls=backend_urls,
+        backend_hardware_profiles=_parse_backend_hardware_profiles(backend_hardware_profiles_arg, len(backend_urls)),
         quota_every=args.quota_every,
         quota_amount=args.quota_amount,
         threshold_ratio=args.threshold_ratio,

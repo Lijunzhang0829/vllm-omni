@@ -644,3 +644,191 @@ then sacrificial
 - 默认 step-level preemption
 
 这样更容易复现策略本身，也更容易排查性能问题。
+
+
+## 15. Qwen-Image P95 Sweep Commands
+
+目标：
+
+- 横轴：`request_rate = 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8`
+- 纵轴：`latency_p95`
+- 对比：`baseline` vs `super_p95`
+
+说明：
+
+- 当前 benchmark 的 `--request-rate` 实现是固定间隔发请求，不是 Poisson。
+- 建议两组实验都使用相同 workload、相同 seed、相同 `random_request_seed`。
+- 默认 sweep 配置使用 `500` 条请求。
+- `baseline` 和 `super_p95` 都通过同一个 dispatcher 统一对外暴露 `8080`。
+- `baseline` 只是关闭 sacrificial 分类，保持双卡、统一入口和相同 backend 启动方式。
+
+### 15.1 固定 workload
+
+```bash
+export QWEN_IMAGE_RANDOM4='[
+  {"width":512,"height":512,"num_inference_steps":20,"weight":0.15},
+  {"width":768,"height":768,"num_inference_steps":20,"weight":0.25},
+  {"width":1024,"height":1024,"num_inference_steps":25,"weight":0.45},
+  {"width":1536,"height":1536,"num_inference_steps":35,"weight":0.15}
+]'
+```
+
+### 15.2 Baseline Server Command
+
+```bash
+env NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost \
+python benchmarks/diffusion/super_p95_dispatcher.py \
+  --host 127.0.0.1 \
+  --port 8080 \
+  --num-servers 2 \
+  --device-ids 0,1 \
+  --backend-hardware-profiles 910B2,910B2 \
+  --model Qwen/Qwen-Image \
+  --backend-start-port 8091 \
+  --backend-args "--omni --vae-use-slicing --vae-use-tiling" \
+  --backend-env VLLM_PLUGINS=ascend \
+  --backend-env HF_HUB_OFFLINE=1 \
+  --quota-every 20 \
+  --quota-amount 0 \
+  --threshold-ratio 0.8 \
+  --sacrificial-load-factor 0.1
+```
+
+### 15.3 Super-P95 Server Command
+
+```bash
+env NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost \
+python benchmarks/diffusion/super_p95_dispatcher.py \
+  --host 127.0.0.1 \
+  --port 8080 \
+  --num-servers 2 \
+  --device-ids 0,1 \
+  --backend-hardware-profiles 910B2,910B2 \
+  --model Qwen/Qwen-Image \
+  --backend-start-port 8091 \
+  --backend-args "--omni --vae-use-slicing --vae-use-tiling" \
+  --backend-env VLLM_PLUGINS=ascend \
+  --backend-env HF_HUB_OFFLINE=1 \
+  --quota-every 20 \
+  --quota-amount 1 \
+  --threshold-ratio 0.8 \
+  --sacrificial-load-factor 0.1
+```
+
+### 15.4 Baseline Benchmark Command
+
+```bash
+mkdir -p /tmp/super_p95_plot/baseline
+
+for rate in 0.2 0.3 0.4 0.5 0.6 0.7 0.8; do
+  env NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost \
+  python benchmarks/diffusion/diffusion_benchmark_serving.py \
+    --base-url http://127.0.0.1:8080 \
+    --model Qwen/Qwen-Image \
+    --backend vllm-omni \
+    --dataset random \
+    --task t2i \
+    --num-prompts 500 \
+    --max-concurrency 1000 \
+    --request-rate "${rate}" \
+    --warmup-requests 1 \
+    --warmup-num-inference-steps 1 \
+    --seed 0 \
+    --random-request-seed 8 \
+    --random-request-config "${QWEN_IMAGE_RANDOM4}" \
+    --disable-tqdm \
+    --run-label baseline \
+    --output-file "/tmp/super_p95_plot/baseline/rate_${rate}.json"
+done
+```
+
+### 15.5 Super-P95 Benchmark Command
+
+```bash
+mkdir -p /tmp/super_p95_plot/super_p95
+
+for rate in 0.2 0.3 0.4 0.5 0.6 0.7 0.8; do
+  env NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost \
+  python benchmarks/diffusion/diffusion_benchmark_serving.py \
+    --base-url http://127.0.0.1:8080 \
+    --model Qwen/Qwen-Image \
+    --backend vllm-omni \
+    --dataset random \
+    --task t2i \
+    --num-prompts 500 \
+    --max-concurrency 1000 \
+    --request-rate "${rate}" \
+    --warmup-requests 1 \
+    --warmup-num-inference-steps 1 \
+    --seed 0 \
+    --random-request-seed 8 \
+    --random-request-config "${QWEN_IMAGE_RANDOM4}" \
+    --disable-tqdm \
+    --run-label super_p95 \
+    --output-file "/tmp/super_p95_plot/super_p95/rate_${rate}.json"
+done
+```
+
+### 15.6 Smoke Test
+
+先做命令连通性验证时，可以把 `num-prompts` 降到 `4`，只跑单个 `request_rate`，例如 `0.2`：
+
+```bash
+env NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost \
+python benchmarks/diffusion/diffusion_benchmark_serving.py \
+  --base-url http://127.0.0.1:8080 \
+  --model Qwen/Qwen-Image \
+  --backend vllm-omni \
+  --dataset random \
+  --task t2i \
+  --num-prompts 4 \
+  --max-concurrency 1000 \
+  --request-rate 0.2 \
+  --warmup-requests 1 \
+  --warmup-num-inference-steps 1 \
+  --seed 0 \
+  --random-request-seed 8 \
+  --random-request-config "${QWEN_IMAGE_RANDOM4}" \
+  --disable-tqdm \
+  --run-label smoke \
+  --output-file /tmp/super_p95_plot/smoke_rate_0.2.json
+```
+
+### 15.7 Output JSON Fields
+
+当前 `--output-file` 会写出：
+
+- 聚合指标：
+  - `duration`
+  - `completed_requests`
+  - `failed_requests`
+  - `throughput_qps`
+  - `latency_mean`
+  - `latency_median`
+  - `latency_p95`
+  - `latency_p99`
+- 复现元数据：
+  - `run_label`
+  - `generated_at_utc`
+  - `base_url`
+  - `request_rate`
+  - `traffic_schedule`
+  - `num_prompts`
+  - `max_concurrency`
+  - `warmup_requests`
+  - `warmup_num_inference_steps`
+  - `seed`
+  - `random_request_seed`
+  - `random_request_config`
+  - `backend`
+  - `model`
+  - `dataset`
+  - `task`
+
+绘图时直接读取每个 JSON 的：
+
+```text
+x = request_rate
+y = latency_p95
+group = run_label
+```

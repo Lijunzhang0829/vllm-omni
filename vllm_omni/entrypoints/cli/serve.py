@@ -271,6 +271,16 @@ class OmniServeCommand(CLISubcommand):
             action="store_true",
             help="Enable VAE tiling for memory optimization (useful for mitigating OOM issues).",
         )
+        omni_config_group.add_argument(
+            "--super-p95-hardware-profile",
+            type=str,
+            default=None,
+            choices=["910B2", "910B3"],
+            help=(
+                "Hardware profile used by super_p95 service-time estimation. "
+                "Defaults to 910B2."
+            ),
+        )
 
         # diffusion model offload parameters
         omni_config_group.add_argument(

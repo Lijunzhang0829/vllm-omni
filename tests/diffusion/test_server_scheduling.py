@@ -1,10 +1,15 @@
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.diffusion.server_scheduling import PredictedLatencyPolicy, estimate_service_time_s
+from vllm_omni.diffusion.server_scheduling import (
+    PredictedLatencyPolicy,
+    estimate_service_time_s,
+    normalize_super_p95_hardware_profile,
+)
 from vllm_omni.diffusion.super_p95 import (
     EXTRA_ARG_SUPER_P95_ESTIMATED_SERVICE_S,
     EXTRA_ARG_SUPER_P95_SACRIFICIAL,
 )
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+import pytest
 
 
 def _make_request(
@@ -36,7 +41,18 @@ def _make_request(
 
 def test_estimate_service_time_uses_known_anchor():
     request = _make_request(width=1024, height=1024, num_inference_steps=25)
-    assert estimate_service_time_s(request) == 33.90
+    assert estimate_service_time_s(request) == pytest.approx(14.22)
+
+
+def test_estimate_service_time_uses_requested_hardware_profile():
+    request = _make_request(width=1536, height=1536, num_inference_steps=35)
+    assert estimate_service_time_s(request, hardware_profile="910B3") == pytest.approx(71.68)
+
+
+def test_estimate_service_time_defaults_unknown_profile_to_910b2():
+    request = _make_request(width=512, height=512, num_inference_steps=20)
+    assert normalize_super_p95_hardware_profile("unknown") == "910B2"
+    assert estimate_service_time_s(request, hardware_profile="unknown") == pytest.approx(8.60)
 
 
 def test_predicted_latency_policy_prefers_longer_request():

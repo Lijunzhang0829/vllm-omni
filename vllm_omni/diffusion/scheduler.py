@@ -13,7 +13,11 @@ from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.diffusion.server_scheduling import PredictedLatencyPolicy, ScheduledRequest
+from vllm_omni.diffusion.server_scheduling import (
+    PredictedLatencyPolicy,
+    ScheduledRequest,
+    resolve_super_p95_hardware_profile,
+)
 from vllm_omni.diffusion.super_p95 import SuperP95LoadSnapshot
 
 logger = init_logger(__name__)
@@ -31,7 +35,13 @@ class Scheduler:
         self._lock = threading.Lock()
         self._pending_cv = threading.Condition()
         self._closed = False
-        self._policy = PredictedLatencyPolicy()
+        self._policy = PredictedLatencyPolicy(
+            hardware_profile=resolve_super_p95_hardware_profile(
+                od_config.super_p95_hardware_profile,
+                warn_on_default=True,
+                context="server",
+            )
+        )
         preemption_env = os.environ.get("VLLM_OMNI_ENABLE_DIFFUSION_PREEMPTION", "1")
         self._preemption_enabled = preemption_env.strip().lower() not in {"0", "false", "off", "no"}
         self._active_scheduled: ScheduledRequest | None = None
