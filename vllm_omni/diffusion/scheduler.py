@@ -29,7 +29,7 @@ class Scheduler:
         self._pending_cv = threading.Condition()
         self._closed = False
         self._policy = PredictedLatencyPolicy()
-        self._step_budget = 1
+        self._contention_step_budget = 5
 
         # Initialize single MessageQueue for all message types (generation & RPC)
         # Assuming all readers are local for now as per current launch_engine implementation
@@ -74,9 +74,13 @@ class Scheduler:
                 if self._closed and not self._policy.has_pending():
                     return
                 scheduled = self._policy.pop_next_request()
+                has_competition = self._policy.has_pending()
 
             try:
-                output = self._execute_request(scheduled.request)
+                output = self._execute_request(
+                    scheduled.request,
+                    step_budget=self._select_step_budget(scheduled, has_competition),
+                )
                 if output.finished:
                     scheduled.request.sampling_params.extra_args.pop("_server_state", None)
                     scheduled.output = output
@@ -97,13 +101,20 @@ class Scheduler:
                 scheduled.error = exc
                 scheduled.done_event.set()
 
-    def _execute_request(self, request: OmniDiffusionRequest) -> DiffusionOutput:
+    def _select_step_budget(self, scheduled, has_competition: bool) -> int | None:
+        if not has_competition:
+            return None
+        return min(8, max(self._contention_step_budget, scheduled.total_steps // 4))
+
+    def _execute_request(self, request: OmniDiffusionRequest, step_budget: int | None) -> DiffusionOutput:
         with self._lock:
             try:
                 supports_preemption = self.od_config.model_class_name == "QwenImagePipeline"
-                request.sampling_params.extra_args["_server_preemption_enabled"] = supports_preemption
-                if supports_preemption:
-                    request.sampling_params.extra_args["_server_step_budget"] = self._step_budget
+                request.sampling_params.extra_args["_server_preemption_enabled"] = (
+                    supports_preemption and step_budget is not None
+                )
+                if supports_preemption and step_budget is not None:
+                    request.sampling_params.extra_args["_server_step_budget"] = step_budget
                 else:
                     request.sampling_params.extra_args.pop("_server_step_budget", None)
                     request.sampling_params.extra_args.pop("_server_state", None)
