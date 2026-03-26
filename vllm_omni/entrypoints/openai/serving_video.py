@@ -391,6 +391,8 @@ class OmniOpenAIServingVideo:
             sampling_params_list=sampling_params_list,
         ):
             result = output
+            if getattr(output, "finished", False):
+                return output
 
         if result is None:
             raise HTTPException(

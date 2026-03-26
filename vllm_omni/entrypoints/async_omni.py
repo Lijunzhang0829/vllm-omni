@@ -306,6 +306,12 @@ class AsyncOmni(OmniBase):
             await self._pause_cond.wait_for(lambda: not self._paused)
 
         logger.debug(f"[{self._name}] generate() called")
+        req_finalized = False
+        last_yielded_finished = False
+        metrics = None
+        final_stage_id_for_e2e = None
+        _req_start_ts = {}
+        _wall_start_ts = time.time()
         try:
             # Start output handler on the first call to generate()
             self._run_output_handler()
@@ -320,8 +326,8 @@ class AsyncOmni(OmniBase):
             # Orchestrator keeps stage objects for input derivation
             num_stages = len(self.stage_list)
             # Track per-request start time for end-to-end timing
-            _req_start_ts: dict[int, float] = {}
-            _wall_start_ts: float = time.time()
+            _req_start_ts = {}
+            _wall_start_ts = time.time()
             # _last_finish_ts: float = _wall_start_ts
 
             # Determine the final stage for E2E stats (highest stage_id with
@@ -363,6 +369,7 @@ class AsyncOmni(OmniBase):
                     metrics,
                     final_stage_id_for_e2e,
                 ):
+                    last_yielded_finished = bool(getattr(output, "finished", False))
                     yield output
             else:
                 async for output in self._process_sequential_results(
@@ -373,28 +380,35 @@ class AsyncOmni(OmniBase):
                     sampling_params_list,
                     prompt,
                 ):
+                    last_yielded_finished = bool(getattr(output, "finished", False))
                     yield output
 
             logger.debug(f"[{self._name}] Request {request_id} finalized at stage-{final_stage_id_for_e2e}")
-            try:
-                # Finalize E2E metrics if not already done
-                metrics.on_finalize_request(
-                    final_stage_id_for_e2e,
+            req_finalized = True
+        except (asyncio.CancelledError, GeneratorExit):
+            if not last_yielded_finished:
+                await self.abort(request_id)
+                logger.info("[AsyncOrchestrator] Request %s aborted.", request_id)
+            else:
+                logger.info(
+                    "[AsyncOrchestrator] Request %s generator closed after finished output; skipping abort.",
                     request_id,
-                    _req_start_ts.get(request_id, _wall_start_ts),
                 )
-
-                logger.debug(f"[{self._name}] All requests completed")
-                # Summarize and print stats
-                metrics.build_and_log_summary()
+            raise
+        finally:
+            try:
+                if metrics is not None and final_stage_id_for_e2e is not None and (req_finalized or last_yielded_finished):
+                    metrics.on_finalize_request(
+                        final_stage_id_for_e2e,
+                        request_id,
+                        _req_start_ts.get(request_id, _wall_start_ts),
+                    )
+                    logger.debug(f"[{self._name}] All requests completed")
+                    metrics.build_and_log_summary()
             except Exception as e:
                 logger.exception(f"[{self._name}] Request {request_id} Failed to finalized/build/log summary: {e}")
             finally:
                 self.request_states.pop(request_id, None)
-        except (asyncio.CancelledError, GeneratorExit):
-            await self.abort(request_id)
-            logger.info("[AsyncOrchestrator] Request %s aborted.", request_id)
-            raise
 
     async def _process_async_results(
         self,
