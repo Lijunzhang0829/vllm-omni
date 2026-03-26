@@ -276,4 +276,4 @@ def test_dispatcher_estimates_service_time_per_backend_profile():
     decision = asyncio.run(_run())
 
     assert decision.backend_index == 1
-    assert decision.estimated_service_s == pytest.approx(22.11)
+    assert decision.estimated_service_s == pytest.approx(14.22)

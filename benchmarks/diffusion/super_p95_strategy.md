@@ -40,14 +40,30 @@ server 负责本地优先级和抢占。
 
 策略依赖一个粗粒度 service-time 估计器。
 
+当前实现支持按硬件 profile 选择不同 anchor：
+
+- `910B2`
+- `910B3`
+
+如果 server / dispatcher 没有显式指定 hardware profile，会 warning 并默认回落到 `910B2`。
+
 ### 2.1 已知 profile
 
-Qwen-Image 当前使用这 4 个锚点：
+Qwen-Image 当前使用这 4 个 profile anchor。
 
-- `512x512x20x1 -> 22.35s`
-- `768x768x20x1 -> 20.62s`
-- `1024x1024x25x1 -> 33.90s`
-- `1536x1536x35x1 -> 102.66s`
+`910B2`：
+
+- `512x512x20x1 -> 8.60s`
+- `768x768x20x1 -> 8.94s`
+- `1024x1024x25x1 -> 14.22s`
+- `1536x1536x35x1 -> 43.22s`
+
+`910B3`：
+
+- `512x512x20x1 -> 8.64s`
+- `768x768x20x1 -> 8.64s`
+- `1024x1024x25x1 -> 14.22s`
+- `1536x1536x35x1 -> 49.34s`
 
 当前单卡 NPU 实测值（2026-03-26，`Qwen/Qwen-Image`，`--vae-use-slicing --vae-use-tiling`，warm server，单请求 wall-clock）：
 
@@ -70,6 +86,8 @@ Qwen-Image 当前使用这 4 个锚点：
 
 ### 2.2 同分辨率估计公式
 
+先按 hardware profile 选 anchor 表。
+
 若分辨率命中以下 4 档之一：
 
 - `512x512`
@@ -77,24 +95,29 @@ Qwen-Image 当前使用这 4 个锚点：
 - `1024x1024`
 - `1536x1536`
 
-则使用该分辨率锚点做缩放：
+则先预处理：
+
+```text
+per_pixel_step_ms
+= anchor_latency_s * 1000 / (anchor_width * anchor_height * anchor_steps)
+```
+
+然后估计：
 
 ```text
 estimated_service_s
-= anchor_latency_s
- * (num_inference_steps / anchor_steps)
- * (num_frames / anchor_frames)
+= per_pixel_step_ms * width * height * num_inference_steps * num_frames / 1000
 ```
 
 ### 2.3 未知分辨率 fallback
 
-若分辨率未知，则 fallback 到总 work 线性公式：
+若分辨率未知，则 fallback 到当前 hardware profile 下的 `1024x1024` 基准：
 
 ```text
 estimated_service_s
-= 33.90
- * (width * height * num_inference_steps * num_frames)
- / (1024 * 1024 * 25 * 1)
+= per_pixel_step_ms_1024
+ * width * height * num_inference_steps * num_frames
+ / 1000
 ```
 
 ### 2.4 剩余耗时估计
@@ -547,24 +570,31 @@ dispatcher 只维护轻量负载账本，不托管 server 真实等待队列。
 
 ```text
 known profile:
-  (512,512,20,1)   -> 22.35
-  (768,768,20,1)   -> 20.62
-  (1024,1024,25,1) -> 33.90
-  (1536,1536,35,1) -> 102.66
+  910B2:
+    (512,512,20,1)   -> 8.60
+    (768,768,20,1)   -> 8.94
+    (1024,1024,25,1) -> 14.22
+    (1536,1536,35,1) -> 43.22
+  910B3:
+    (512,512,20,1)   -> 8.64
+    (768,768,20,1)   -> 8.64
+    (1024,1024,25,1) -> 14.22
+    (1536,1536,35,1) -> 49.34
 ```
 
 ```text
 same-resolution estimate:
+per_pixel_step_ms
+= anchor_latency_s * 1000 / (anchor_width * anchor_height * anchor_steps)
+
 estimated_service_s
-= anchor_latency_s
- * (steps / anchor_steps)
- * (frames / anchor_frames)
+= per_pixel_step_ms * width * height * steps * frames / 1000
 ```
 
 ```text
 fallback:
 estimated_service_s
-= 33.90 * (width * height * steps * frames) / (1024 * 1024 * 25)
+= per_pixel_step_ms_1024 * width * height * steps * frames / 1000
 ```
 
 ### Dispatcher sacrificial 规则

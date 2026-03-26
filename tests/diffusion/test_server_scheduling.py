@@ -46,7 +46,7 @@ def test_estimate_service_time_uses_known_anchor():
 
 def test_estimate_service_time_uses_requested_hardware_profile():
     request = _make_request(width=1536, height=1536, num_inference_steps=35)
-    assert estimate_service_time_s(request, hardware_profile="910B3") == pytest.approx(71.68)
+    assert estimate_service_time_s(request, hardware_profile="910B3") == pytest.approx(49.34)
 
 
 def test_estimate_service_time_defaults_unknown_profile_to_910b2():
