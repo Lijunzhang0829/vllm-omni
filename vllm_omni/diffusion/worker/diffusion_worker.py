@@ -72,6 +72,7 @@ class DiffusionWorker:
         self.model_runner: DiffusionModelRunner | None = None
         self._sleep_saved_buffers: dict[str, torch.Tensor] = {}
         self._resident_scheduler_states: dict[str, dict[str, Any]] = {}
+        self._preempt_event = None
         self.lora_manager: DiffusionLoRAManager | None = None
         self.init_device()
         # Create model runner
@@ -180,11 +181,9 @@ class DiffusionWorker:
     def execute_model(self, req: OmniDiffusionRequest, od_config: OmniDiffusionConfig) -> DiffusionOutput:
         """Execute a forward pass by delegating to the model runner."""
         assert self.model_runner is not None, "Model runner not initialized"
-        request_key = self._get_request_key(req)
-        if (
-            req.sampling_params.extra_args.get("_server_preemption_enabled", False)
-            and request_key in self._resident_scheduler_states
-        ):
+        preemption_enabled = req.sampling_params.extra_args.get("_server_preemption_enabled", False)
+        request_key = self._get_request_key(req) if preemption_enabled else None
+        if preemption_enabled and request_key in self._resident_scheduler_states:
             req.sampling_params.extra_args["_server_state"] = self._resident_scheduler_states[request_key]
         else:
             req.sampling_params.extra_args.pop("_server_state", None)
@@ -196,18 +195,28 @@ class DiffusionWorker:
                 if req.sampling_params.lora_request is not None:
                     raise
                 logger.warning("LoRA activation skipped: %s", exc)
-        output = self.model_runner.execute_model(req)
-        if req.sampling_params.extra_args.get("_server_preemption_enabled", False):
-            if output.finished:
-                self._resident_scheduler_states.pop(request_key, None)
-            elif output.scheduler_state is not None:
-                state = output.scheduler_state
-                self._resident_scheduler_states[request_key] = state
-                output.scheduler_state = {
-                    "request_key": request_key,
-                    "completed_steps": int(state.get("completed_steps", 0)),
-                }
-        return output
+        pipeline = getattr(self.model_runner, "pipeline", None)
+        if pipeline is not None:
+            pipeline._interrupt = False
+            pipeline._interrupt_event = self._preempt_event if preemption_enabled else None
+
+        try:
+            output = self.model_runner.execute_model(req)
+            if preemption_enabled and request_key is not None:
+                if output.finished:
+                    self._resident_scheduler_states.pop(request_key, None)
+                elif output.scheduler_state is not None:
+                    state = output.scheduler_state
+                    self._resident_scheduler_states[request_key] = state
+                    output.scheduler_state = {
+                        "request_key": request_key,
+                        "completed_steps": int(state.get("completed_steps", 0)),
+                    }
+            return output
+        finally:
+            if pipeline is not None:
+                pipeline._interrupt = False
+                pipeline._interrupt_event = None
 
     def _get_request_key(self, req: OmniDiffusionRequest) -> str:
         if req.request_ids:
@@ -353,6 +362,7 @@ class WorkerProc:
         od_config: OmniDiffusionConfig,
         gpu_id: int,
         broadcast_handle,
+        preempt_event=None,
         worker_extension_cls: str | None = None,
         custom_pipeline_args: dict[str, Any] | None = None,
     ):
@@ -378,6 +388,7 @@ class WorkerProc:
 
         # Create worker using WorkerWrapperBase for extension support
         self.worker = self._create_worker(gpu_id, od_config, worker_extension_cls, custom_pipeline_args)
+        self.worker.worker._preempt_event = preempt_event
         self._running = True
 
     def _create_worker(
@@ -492,6 +503,7 @@ class WorkerProc:
         od_config: OmniDiffusionConfig,
         pipe_writer: mp.connection.Connection,
         broadcast_handle,
+        preempt_event=None,
         worker_extension_cls: str | None = None,
         custom_pipeline_args: dict[str, Any] | None = None,
     ) -> None:
@@ -503,6 +515,7 @@ class WorkerProc:
             od_config,
             gpu_id=rank,
             broadcast_handle=broadcast_handle,
+            preempt_event=preempt_event,
             worker_extension_cls=worker_extension_cls,
             custom_pipeline_args=custom_pipeline_args,
         )

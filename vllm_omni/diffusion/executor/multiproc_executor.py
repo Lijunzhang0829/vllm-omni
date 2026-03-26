@@ -50,14 +50,16 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
     def _init_executor(self) -> None:
         self._processes: list[mp.Process] = []
         self._closed = False
+        self._mp_ctx = mp.get_context("spawn")
+        preempt_event = self._mp_ctx.Event()
 
         # Initialize scheduler
         self.scheduler = Scheduler()
-        self.scheduler.initialize(self.od_config)
+        self.scheduler.initialize(self.od_config, preempt_event=preempt_event)
         broadcast_handle = self.scheduler.get_broadcast_handle()
 
         # Launch workers
-        processes, result_handle = self._launch_workers(broadcast_handle)
+        processes, result_handle = self._launch_workers(broadcast_handle, preempt_event)
 
         if result_handle is not None:
             self.scheduler.initialize_result_queue(result_handle)
@@ -69,12 +71,11 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         self.resources = BackgroundResources(scheduler=self.scheduler, processes=self._processes)
         self._finalizer = weakref.finalize(self, self.resources)
 
-    def _launch_workers(self, broadcast_handle):
+    def _launch_workers(self, broadcast_handle, preempt_event):
         od_config = self.od_config
         logger.info("Starting server...")
 
         num_gpus = od_config.num_gpus
-        mp.set_start_method("spawn", force=True)
         processes = []
 
         # Extract worker_extension_cls and custom_pipeline_args from od_config
@@ -86,15 +87,16 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         scheduler_pipe_writers = []
 
         for i in range(num_gpus):
-            reader, writer = mp.Pipe(duplex=False)
+            reader, writer = self._mp_ctx.Pipe(duplex=False)
             scheduler_pipe_writers.append(writer)
-            process = mp.Process(
+            process = self._mp_ctx.Process(
                 target=WorkerProc.worker_main,
                 args=(
                     i,  # rank
                     od_config,
                     writer,
                     broadcast_handle,
+                    preempt_event,
                     worker_extension_cls,
                     custom_pipeline_args,
                 ),

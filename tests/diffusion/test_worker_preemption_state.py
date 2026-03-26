@@ -1,3 +1,4 @@
+import threading
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -7,8 +8,10 @@ from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker
 def _make_worker():
     worker = object.__new__(DiffusionWorker)
     worker.model_runner = Mock()
+    worker.model_runner.pipeline = SimpleNamespace(_interrupt=False, _interrupt_event=None)
     worker.lora_manager = None
     worker._resident_scheduler_states = {}
+    worker._preempt_event = threading.Event()
     worker.od_config = SimpleNamespace()
     return worker
 
@@ -48,3 +51,19 @@ def test_execute_model_restores_cached_scheduler_state_from_worker():
 
     assert request.sampling_params.extra_args["_server_state"] is resident_state
     assert "req-2" not in worker._resident_scheduler_states
+
+
+def test_execute_model_attaches_shared_preempt_event_to_pipeline():
+    worker = _make_worker()
+    request = _make_request("req-3")
+
+    def _execute(req):
+        assert worker.model_runner.pipeline._interrupt_event is worker._preempt_event
+        return SimpleNamespace(finished=True, scheduler_state=None)
+
+    worker.model_runner.execute_model.side_effect = _execute
+
+    worker.execute_model(request, worker.od_config)
+
+    assert worker.model_runner.pipeline._interrupt is False
+    assert worker.model_runner.pipeline._interrupt_event is None

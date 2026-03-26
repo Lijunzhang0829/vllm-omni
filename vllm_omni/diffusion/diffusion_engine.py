@@ -337,6 +337,7 @@ class DiffusionEngine:
                 guidance_scale=0.0,
                 num_outputs_per_prompt=1,
             ),
+            request_ids=["warmup-0"],
         )
         logger.info("dummy run to warm up the model")
         request = self.pre_process_func(req) if self.pre_process_func is not None else req

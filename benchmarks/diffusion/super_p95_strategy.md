@@ -49,6 +49,19 @@ Qwen-Image 当前使用这 4 个锚点：
 - `1024x1024x25x1 -> 33.90s`
 - `1536x1536x35x1 -> 102.66s`
 
+当前单卡 NPU 实测值（2026-03-26，`Qwen/Qwen-Image`，`--vae-use-slicing --vae-use-tiling`，warm server，单请求 wall-clock）：
+
+- `512x512x20x1 -> 8.93s`
+- `768x768x20x1 -> 9.44s`
+- `1024x1024x25x1 -> 13.41s`
+- `1536x1536x35x1 -> 43.90s`
+
+说明：
+
+- 这组值是当前环境下的实测观测值，不是算法定义的一部分
+- `weight` 字段在这次测量中被忽略，没有参与请求执行
+- 对应更完整的测量记录见 `benchmarks/diffusion/qwen_image_npu_single_request_timings.md`
+
 这里四元组含义是：
 
 ```text

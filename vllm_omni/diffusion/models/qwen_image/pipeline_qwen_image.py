@@ -534,7 +534,8 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin):
 
     @property
     def interrupt(self):
-        return self._interrupt
+        interrupt_event = getattr(self, "_interrupt_event", None)
+        return self._interrupt or (interrupt_event is not None and interrupt_event.is_set())
 
     def _init_generation_state(
         self,
@@ -643,14 +644,9 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin):
             "output_type": "pil",
         }
 
-    def _run_generation_steps(
-        self,
-        state: dict[str, Any],
-        step_budget: int | None,
-    ) -> tuple[dict[str, Any], bool, int]:
+    def _run_generation_steps(self, state: dict[str, Any]) -> tuple[dict[str, Any], bool, int]:
         timesteps = state["timesteps"]
         start_index = int(state["next_step_index"])
-        end_index = len(timesteps) if step_budget is None else min(len(timesteps), start_index + max(step_budget, 1))
 
         self.scheduler.set_begin_index(start_index)
         self.transformer.do_true_cfg = state["do_true_cfg"]
@@ -660,8 +656,11 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin):
             "attention_kwargs": state["attention_kwargs"],
         }
         latents = state["latents"]
+        completed_steps = 0
 
-        for step_index in range(start_index, end_index):
+        for step_index in range(start_index, len(timesteps)):
+            if completed_steps > 0 and self.interrupt:
+                break
             t = timesteps[step_index]
             self._current_timestep = t
 
@@ -699,10 +698,17 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin):
                 None,
             )
             latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, state["do_true_cfg"])
+            completed_steps += 1
 
+            # Async preemption requests arrive out-of-band while the worker is
+            # running. Yield on the next step boundary after the signal lands.
+            if self.interrupt and step_index + 1 < len(timesteps):
+                break
+
+        end_index = start_index + completed_steps
         state["latents"] = latents
         state["next_step_index"] = end_index
-        return state, end_index >= len(timesteps), end_index - start_index
+        return state, end_index >= len(timesteps), completed_steps
 
     def _decode_generation_state(self, state: dict[str, Any], output_type: str | None) -> torch.Tensor:
         latents = state["latents"]
@@ -792,14 +798,13 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin):
         self._guidance_scale = guidance_scale
         self._attention_kwargs = attention_kwargs
         self._current_timestep = None
-        self._interrupt = False
         if self.attention_kwargs is None:
             self._attention_kwargs = {}
 
         scheduling_args = req.sampling_params.extra_args
         preemption_enabled = bool(scheduling_args.get("_server_preemption_enabled", False))
-        step_budget = scheduling_args.get("_server_step_budget")
         state = scheduling_args.get("_server_state")
+        self._interrupt = False
 
         if preemption_enabled:
             if state is None:
@@ -821,7 +826,7 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin):
                     max_sequence_length,
                 )
             state["output_type"] = output_type
-            state, finished, completed_steps = self._run_generation_steps(state, step_budget)
+            state, finished, completed_steps = self._run_generation_steps(state)
             self._current_timestep = None
             if not finished:
                 state["completed_steps"] = completed_steps

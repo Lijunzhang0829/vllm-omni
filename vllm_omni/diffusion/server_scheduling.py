@@ -96,6 +96,9 @@ class PredictedLatencyPolicy:
     def pop_next_request(self) -> ScheduledRequest:
         return heapq.heappop(self._pending)
 
+    def peek_next_request(self) -> ScheduledRequest | None:
+        return self._pending[0] if self._pending else None
+
     def requeue_request(self, scheduled: ScheduledRequest) -> None:
         scheduled.refresh_sort_key()
         heapq.heappush(self._pending, scheduled)

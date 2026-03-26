@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import os
 import threading
+from multiprocessing.synchronize import Event as MpEvent
 
 import zmq
 from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
@@ -11,13 +13,13 @@ from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.diffusion.server_scheduling import PredictedLatencyPolicy
+from vllm_omni.diffusion.server_scheduling import PredictedLatencyPolicy, ScheduledRequest
 
 logger = init_logger(__name__)
 
 
 class Scheduler:
-    def initialize(self, od_config: OmniDiffusionConfig):
+    def initialize(self, od_config: OmniDiffusionConfig, preempt_event: MpEvent | None = None):
         existing_mq = getattr(self, "mq", None)
         if existing_mq is not None and not existing_mq.closed:
             logger.warning("SyncSchedulerClient is already initialized. Re-initializing.")
@@ -29,7 +31,12 @@ class Scheduler:
         self._pending_cv = threading.Condition()
         self._closed = False
         self._policy = PredictedLatencyPolicy()
-        self._contention_step_budget = 5
+        preemption_env = os.environ.get("VLLM_OMNI_ENABLE_DIFFUSION_PREEMPTION", "1")
+        self._preemption_enabled = preemption_env.strip().lower() not in {"0", "false", "off", "no"}
+        self._active_scheduled: ScheduledRequest | None = None
+        self._active_request_preemptible = False
+        self._active_preemption_requested = False
+        self._preempt_event = preempt_event
 
         # Initialize single MessageQueue for all message types (generation & RPC)
         # Assuming all readers are local for now as per current launch_engine implementation
@@ -38,7 +45,6 @@ class Scheduler:
             n_local_reader=self.num_workers,
             local_reader_ranks=list(range(self.num_workers)),
         )
-
         self.result_mq = None
         self._scheduler_thread = threading.Thread(
             target=self._run_scheduler_loop,
@@ -58,9 +64,13 @@ class Scheduler:
 
     def add_req(self, request: OmniDiffusionRequest) -> DiffusionOutput:
         """Queue a request and wait for server-side scheduling to execute it."""
+        should_preempt = False
         with self._pending_cv:
             scheduled = self._policy.add_request(request)
+            should_preempt = self._maybe_request_active_preemption_locked()
             self._pending_cv.notify_all()
+        if should_preempt and self._preempt_event is not None:
+            self._preempt_event.set()
         scheduled.done_event.wait()
         if scheduled.error is not None:
             raise scheduled.error
@@ -74,13 +84,10 @@ class Scheduler:
                 if self._closed and not self._policy.has_pending():
                     return
                 scheduled = self._policy.pop_next_request()
-                has_competition = self._policy.has_pending()
+                self._mark_active_request_locked(scheduled)
 
             try:
-                output = self._execute_request(
-                    scheduled.request,
-                    step_budget=self._select_step_budget(scheduled, has_competition),
-                )
+                output = self._execute_request(scheduled.request)
                 if output.finished:
                     scheduled.output = output
                     self._policy.mark_finished(scheduled)
@@ -98,23 +105,15 @@ class Scheduler:
             except BaseException as exc:  # pragma: no cover - surfaced to caller
                 scheduled.error = exc
                 scheduled.done_event.set()
+            finally:
+                with self._pending_cv:
+                    self._clear_active_request_locked()
 
-    def _select_step_budget(self, scheduled, has_competition: bool) -> int | None:
-        if not has_competition:
-            return None
-        return min(8, max(self._contention_step_budget, scheduled.total_steps // 4))
-
-    def _execute_request(self, request: OmniDiffusionRequest, step_budget: int | None) -> DiffusionOutput:
+    def _execute_request(self, request: OmniDiffusionRequest) -> DiffusionOutput:
         with self._lock:
             try:
-                supports_preemption = self.od_config.model_class_name == "QwenImagePipeline"
-                request.sampling_params.extra_args["_server_preemption_enabled"] = (
-                    supports_preemption and step_budget is not None
-                )
-                if supports_preemption and step_budget is not None:
-                    request.sampling_params.extra_args["_server_step_budget"] = step_budget
-                else:
-                    request.sampling_params.extra_args.pop("_server_step_budget", None)
+                supports_preemption = self._supports_async_preemption(request)
+                request.sampling_params.extra_args["_server_preemption_enabled"] = supports_preemption
                 rpc_request = {
                     "type": "rpc",
                     "method": "generate",
@@ -135,6 +134,44 @@ class Scheduler:
             except zmq.error.Again as exc:
                 logger.error("Timeout waiting for response from scheduler.")
                 raise TimeoutError("Scheduler did not respond in time.") from exc
+
+    def _supports_async_preemption(self, request: OmniDiffusionRequest) -> bool:
+        return (
+            self._preemption_enabled
+            and self.od_config.model_class_name == "QwenImagePipeline"
+            and bool(getattr(request, "request_ids", None))
+        )
+
+    def _mark_active_request_locked(self, scheduled: ScheduledRequest) -> None:
+        request = scheduled.request
+        preemptible = self._supports_async_preemption(request)
+        if self._preempt_event is not None:
+            self._preempt_event.clear()
+        self._active_scheduled = scheduled
+        self._active_request_preemptible = preemptible
+        self._active_preemption_requested = False
+
+    def _clear_active_request_locked(self) -> None:
+        if self._preempt_event is not None:
+            self._preempt_event.clear()
+        self._active_scheduled = None
+        self._active_request_preemptible = False
+        self._active_preemption_requested = False
+
+    def _maybe_request_active_preemption_locked(self) -> bool:
+        if not (
+            self._active_request_preemptible
+            and self._active_scheduled is not None
+            and not self._active_preemption_requested
+        ):
+            return False
+
+        best_pending = self._policy.peek_next_request()
+        if best_pending is None or not (best_pending < self._active_scheduled):
+            return False
+
+        self._active_preemption_requested = True
+        return True
 
     def close(self):
         """Closes the socket and terminates the context."""
