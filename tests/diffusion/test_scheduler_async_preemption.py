@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 from vllm_omni.diffusion.scheduler import Scheduler
 from vllm_omni.diffusion.server_scheduling import PredictedLatencyPolicy
+from vllm_omni.diffusion.super_p95 import EXTRA_ARG_SUPER_P95_SACRIFICIAL
 
 
 def _make_request(request_id: str, *, width: int, height: int, steps: int):
@@ -84,3 +85,17 @@ def test_mark_and_clear_active_request_manage_preempt_event():
     sched._preempt_event.set()
     sched._clear_active_request_locked()
     assert sched._preempt_event.is_set() is False
+
+
+def test_normal_pending_preempts_active_sacrificial_request():
+    sched = _make_scheduler()
+    active_request = _make_request("active", width=1536, height=1536, steps=35)
+    active_request.sampling_params.extra_args[EXTRA_ARG_SUPER_P95_SACRIFICIAL] = True
+    active = sched._policy.add_request(active_request)
+    sched._policy.pop_next_request()
+    sched._mark_active_request_locked(active)
+    sched._policy.add_request(_make_request("new", width=512, height=512, steps=20))
+
+    should_preempt = sched._maybe_request_active_preemption_locked()
+
+    assert should_preempt is True

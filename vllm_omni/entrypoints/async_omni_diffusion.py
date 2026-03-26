@@ -20,6 +20,7 @@ from vllm.transformers_utils.config import get_hf_file_to_dict
 from vllm_omni.diffusion.data import OmniDiffusionConfig, TransformerConfig
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.super_p95 import SuperP95LoadSnapshot
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.outputs import OmniRequestOutput
@@ -202,6 +203,12 @@ class AsyncOmniDiffusion:
         """
         result = await self.generate(prompt=prompt, request_id=request_id, **kwargs)
         yield result
+
+    def get_super_p95_load_snapshot(self) -> SuperP95LoadSnapshot:
+        return self.engine.get_super_p95_load_snapshot()
+
+    def get_super_p95_response_headers(self) -> dict[str, str]:
+        return self.engine.get_super_p95_response_headers()
 
     def close(self) -> None:
         """Close the engine and release resources.

@@ -5,6 +5,7 @@ from vllm.utils.import_utils import resolve_obj_by_qualname
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.super_p95 import SuperP95LoadSnapshot
 
 
 class DiffusionExecutor(ABC):
@@ -78,6 +79,11 @@ class DiffusionExecutor(ABC):
     @abstractmethod
     def check_health(self) -> None:
         """Check if the executor and workers are healthy."""
+        pass
+
+    @abstractmethod
+    def get_super_p95_load_snapshot(self) -> SuperP95LoadSnapshot:
+        """Return the authoritative local load snapshot for super_p95."""
         pass
 
     @abstractmethod

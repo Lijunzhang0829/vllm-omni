@@ -17,6 +17,11 @@ from vllm_omni.diffusion.registry import (
     get_diffusion_pre_process_func,
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.super_p95 import (
+    SuperP95LoadSnapshot,
+    build_super_p95_response_headers,
+    snapshot_to_metrics,
+)
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -107,6 +112,7 @@ class DiffusionEngine:
             "resolution": int(request.sampling_params.resolution),
             "postprocess_time_ms": postprocess_time * 1000,
         }
+        metrics.update(snapshot_to_metrics(self.get_super_p95_load_snapshot()))
         if self.pre_process_func is not None:
             metrics["preprocessing_time_ms"] = preprocess_time * 1000
 
@@ -193,6 +199,12 @@ class DiffusionEngine:
 
     def add_req_and_wait_for_response(self, request: OmniDiffusionRequest):
         return self.executor.add_req(request)
+
+    def get_super_p95_load_snapshot(self) -> SuperP95LoadSnapshot:
+        return self.executor.get_super_p95_load_snapshot()
+
+    def get_super_p95_response_headers(self) -> dict[str, str]:
+        return build_super_p95_response_headers(self.get_super_p95_load_snapshot())
 
     def start_profile(self, trace_filename: str | None = None) -> None:
         """

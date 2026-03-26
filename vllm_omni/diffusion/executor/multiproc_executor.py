@@ -10,6 +10,7 @@ from vllm_omni.diffusion.data import SHUTDOWN_MESSAGE, DiffusionOutput
 from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.scheduler import Scheduler
+from vllm_omni.diffusion.super_p95 import SuperP95LoadSnapshot
 from vllm_omni.diffusion.worker import WorkerProc
 
 logger = init_logger(__name__)
@@ -209,6 +210,9 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         for p in self._processes:
             if not p.is_alive():
                 raise RuntimeError(f"Worker process {p.name} is dead")
+
+    def get_super_p95_load_snapshot(self) -> SuperP95LoadSnapshot:
+        return self.scheduler.get_super_p95_load_snapshot()
 
     def shutdown(self) -> None:
         self._closed = True

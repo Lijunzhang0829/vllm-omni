@@ -1,5 +1,9 @@
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.server_scheduling import PredictedLatencyPolicy, estimate_service_time_s
+from vllm_omni.diffusion.super_p95 import (
+    EXTRA_ARG_SUPER_P95_ESTIMATED_SERVICE_S,
+    EXTRA_ARG_SUPER_P95_SACRIFICIAL,
+)
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 
@@ -9,7 +13,14 @@ def _make_request(
     height: int,
     num_inference_steps: int,
     num_frames: int = 1,
+    is_sacrificial: bool = False,
+    estimated_service_s: float | None = None,
 ) -> OmniDiffusionRequest:
+    extra_args = {}
+    if is_sacrificial:
+        extra_args[EXTRA_ARG_SUPER_P95_SACRIFICIAL] = True
+    if estimated_service_s is not None:
+        extra_args[EXTRA_ARG_SUPER_P95_ESTIMATED_SERVICE_S] = estimated_service_s
     return OmniDiffusionRequest(
         prompts=["test"],
         sampling_params=OmniDiffusionSamplingParams(
@@ -17,6 +28,7 @@ def _make_request(
             height=height,
             num_inference_steps=num_inference_steps,
             num_frames=num_frames,
+            extra_args=extra_args,
         ),
         request_ids=["req"],
     )
@@ -60,3 +72,43 @@ def test_predicted_latency_policy_updates_remaining_after_quantum():
 
     assert scheduled.remaining_steps == 20
     assert scheduled.remaining_service_s == scheduled.estimated_service_s * 20 / 25
+
+
+def test_predicted_latency_policy_prioritizes_normal_before_sacrificial():
+    policy = PredictedLatencyPolicy()
+    policy.add_request(_make_request(width=512, height=512, num_inference_steps=20, is_sacrificial=True))
+    normal = _make_request(width=768, height=768, num_inference_steps=20)
+    policy.add_request(normal)
+
+    scheduled = policy.pop_next_request()
+
+    assert scheduled.request is normal
+    assert scheduled.is_sacrificial is False
+
+
+def test_predicted_latency_policy_uses_sacrificial_order_within_tail_queue():
+    policy = PredictedLatencyPolicy()
+    slower = policy.add_request(
+        _make_request(width=1536, height=1536, num_inference_steps=35, is_sacrificial=True, estimated_service_s=100.0)
+    )
+    faster = policy.add_request(
+        _make_request(width=512, height=512, num_inference_steps=20, is_sacrificial=True, estimated_service_s=10.0)
+    )
+
+    scheduled = policy.pop_next_request()
+
+    assert scheduled is faster
+    assert scheduled is not slower
+
+
+def test_predicted_latency_policy_reports_pending_load_snapshot():
+    policy = PredictedLatencyPolicy()
+    policy.add_request(_make_request(width=512, height=512, num_inference_steps=20, estimated_service_s=5.0))
+    policy.add_request(
+        _make_request(width=1536, height=1536, num_inference_steps=35, is_sacrificial=True, estimated_service_s=7.0)
+    )
+
+    snapshot = policy.get_pending_load_snapshot()
+
+    assert snapshot.normal_load_s == 5.0
+    assert snapshot.sacrificial_load_s == 7.0

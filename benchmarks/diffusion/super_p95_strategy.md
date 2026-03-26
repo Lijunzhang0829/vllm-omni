@@ -236,8 +236,8 @@ dispatcher 自己会先按估计值增量更新负载。
 
 backend 在请求返回时，会把本机当前权威负载通过 header 回传：
 
-- `X-DelayX-Normal-Load-S`
-- `X-DelayX-Sacrificial-Load-S`
+- `X-Super-P95-Normal-Load-S`
+- `X-Super-P95-Sacrificial-Load-S`
 
 dispatcher 收到响应后，用 server 的值覆盖本地账本，避免累计误差。
 
@@ -459,7 +459,7 @@ finish 时：
 
 当前 dispatcher 会通过 header 给请求打标：
 
-- `X-DelayX-Sacrificial: 1`
+- `X-Super-P95-Sacrificial: 1`
 
 server 收到后，把该请求视为 `sacrificial`。
 
@@ -467,7 +467,7 @@ server 收到后，把该请求视为 `sacrificial`。
 
 benchmark client 会通过 header 提供请求 service hint：
 
-- `X-DelayX-Estimated-Service-S`
+- `X-Super-P95-Estimated-Service-S`
 
 dispatcher 优先使用这个值，避免逐请求解析 JSON body。
 
@@ -475,8 +475,8 @@ dispatcher 优先使用这个值，避免逐请求解析 JSON body。
 
 server 返回时会带回本机负载：
 
-- `X-DelayX-Normal-Load-S`
-- `X-DelayX-Sacrificial-Load-S`
+- `X-Super-P95-Normal-Load-S`
+- `X-Super-P95-Sacrificial-Load-S`
 
 dispatcher 用于纠偏本地估计。
 

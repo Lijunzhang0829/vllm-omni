@@ -530,9 +530,17 @@ class AsyncOmni(OmniBase):
         if getattr(stage, "final_output", False):
             # Construct output to yield
             images = []
+            prompt = None
+            latents = None
+            metrics_dict: dict[str, Any] = {}
+            multimodal_output: dict[str, Any] | None = None
             if stage.final_output_type == "image":
                 if isinstance(engine_outputs, OmniRequestOutput) and engine_outputs.images:
                     images = engine_outputs.images
+                    prompt = engine_outputs.prompt
+                    latents = engine_outputs.latents
+                    metrics_dict = dict(engine_outputs.metrics)
+                    multimodal_output = engine_outputs.multimodal_output
                 elif hasattr(engine_outputs, "images") and engine_outputs.images:
                     images = engine_outputs.images
 
@@ -542,6 +550,10 @@ class AsyncOmni(OmniBase):
                     final_output_type=stage.final_output_type,
                     request_output=engine_outputs,
                     images=images,
+                    prompt=prompt,
+                    latents=latents,
+                    metrics=metrics_dict,
+                    _multimodal_output=multimodal_output or {},
                     finished=finished,
                 )
             else:

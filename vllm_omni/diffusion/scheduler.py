@@ -14,6 +14,7 @@ from vllm.logger import init_logger
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.server_scheduling import PredictedLatencyPolicy, ScheduledRequest
+from vllm_omni.diffusion.super_p95 import SuperP95LoadSnapshot
 
 logger = init_logger(__name__)
 
@@ -167,11 +168,28 @@ class Scheduler:
             return False
 
         best_pending = self._policy.peek_next_request()
-        if best_pending is None or not (best_pending < self._active_scheduled):
+        if best_pending is None or not self._policy.request_outranks(best_pending, self._active_scheduled):
             return False
 
         self._active_preemption_requested = True
         return True
+
+    def get_super_p95_load_snapshot(self) -> SuperP95LoadSnapshot:
+        with self._pending_cv:
+            snapshot = self._policy.get_pending_load_snapshot()
+            if self._active_scheduled is None:
+                return snapshot
+
+            active_remaining_s = self._active_scheduled.remaining_service_s
+            if self._active_scheduled.is_sacrificial:
+                return SuperP95LoadSnapshot(
+                    normal_load_s=snapshot.normal_load_s,
+                    sacrificial_load_s=snapshot.sacrificial_load_s + active_remaining_s,
+                )
+            return SuperP95LoadSnapshot(
+                normal_load_s=snapshot.normal_load_s + active_remaining_s,
+                sacrificial_load_s=snapshot.sacrificial_load_s,
+            )
 
     def close(self):
         """Closes the socket and terminates the context."""
