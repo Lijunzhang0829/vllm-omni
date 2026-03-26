@@ -1590,15 +1590,20 @@ def _strip_final_diffusion_output(r_output: OmniRequestOutput, final_output_type
     metadata. Keeping nested request_output/prompt/latents around can retain
     large tensors and slow down serialization on NPU paths.
     """
+    encoded_videos = _maybe_encode_final_video_payload(r_output.images, r_output.metrics)
     return OmniRequestOutput(
         request_id=r_output.request_id,
         finished=r_output.finished,
         final_output_type=final_output_type or r_output.final_output_type,
-        images=_sanitize_ipc_payload(r_output.images),
+        images=[] if encoded_videos is not None else _sanitize_ipc_payload(r_output.images),
         prompt=None,
         latents=None,
         metrics=dict(r_output.metrics or {}),
-        _multimodal_output=_sanitize_ipc_payload(r_output.multimodal_output),
+        _multimodal_output=(
+            {"video_b64": encoded_videos}
+            if encoded_videos is not None
+            else _sanitize_ipc_payload(r_output.multimodal_output)
+        ),
     )
 
 
@@ -1622,3 +1627,59 @@ def _sanitize_ipc_payload(payload: Any) -> Any:
     if isinstance(payload, dict):
         return {key: _sanitize_ipc_payload(value) for key, value in payload.items()}
     return payload
+
+
+def _maybe_encode_final_video_payload(payload: Any, metrics: dict[str, Any] | None) -> list[str] | None:
+    """Encode large final video payloads before IPC to avoid huge frame transfers."""
+    videos = _split_video_payloads(payload)
+    if videos is None:
+        return None
+
+    from vllm_omni.entrypoints.openai.video_api_utils import encode_video_base64
+
+    fps = int((metrics or {}).get("fps", 24) or 24)
+    return [encode_video_base64(video, fps=fps) for video in videos]
+
+
+def _split_video_payloads(payload: Any) -> list[Any] | None:
+    try:
+        import numpy as np
+        import torch
+        from PIL import Image
+    except Exception:
+        np = None  # type: ignore[assignment]
+        torch = None  # type: ignore[assignment]
+        Image = None  # type: ignore[assignment]
+
+    if payload is None:
+        return None
+
+    if torch is not None and isinstance(payload, torch.Tensor):
+        if payload.ndim == 5:
+            return [payload[i] for i in range(payload.shape[0])]
+        if payload.ndim == 4:
+            return [payload]
+        return None
+
+    if np is not None and isinstance(payload, np.ndarray):
+        if payload.ndim == 5:
+            return [payload[i] for i in range(payload.shape[0])]
+        if payload.ndim == 4:
+            return [payload]
+        return None
+
+    if isinstance(payload, list):
+        if not payload:
+            return None
+        first = payload[0]
+        if torch is not None and isinstance(first, torch.Tensor) and first.ndim >= 4:
+            return payload
+        if np is not None and isinstance(first, np.ndarray) and first.ndim >= 4:
+            return payload
+        if isinstance(first, list):
+            return payload
+        if Image is not None and isinstance(first, Image.Image):
+            return None
+        return None
+
+    return None

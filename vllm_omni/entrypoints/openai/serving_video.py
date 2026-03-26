@@ -99,6 +99,13 @@ class OmniOpenAIServingVideo:
             ) from exc
 
     async def _encode_video_data(self, video: Any, fps: int, request_id: str, video_index: int) -> VideoData:
+        if isinstance(video, str):
+            logger.info(
+                "Video encoding skipped for request %s item=%d; payload already base64-encoded.",
+                request_id,
+                video_index,
+            )
+            return VideoData(b64_json=video)
         start = time.perf_counter()
         logger.info(
             "Video encoding started for request %s item=%d fps=%d.",
@@ -434,14 +441,26 @@ class OmniOpenAIServingVideo:
             videos = result.images
         elif hasattr(result, "request_output"):
             request_output = result.request_output
-            if isinstance(request_output, dict) and request_output.get("images"):
+            if (
+                isinstance(request_output, dict)
+                and isinstance(request_output.get("multimodal_output"), dict)
+                and request_output["multimodal_output"].get("video_b64")
+            ):
+                videos = request_output["multimodal_output"]["video_b64"]
+            elif isinstance(request_output, dict) and request_output.get("images"):
                 videos = request_output["images"]
+            elif (
+                hasattr(request_output, "multimodal_output")
+                and request_output.multimodal_output
+                and request_output.multimodal_output.get("video_b64")
+            ):
+                videos = request_output.multimodal_output.get("video_b64")
             elif hasattr(request_output, "images") and request_output.images:
                 videos = request_output.images
             elif hasattr(request_output, "multimodal_output") and request_output.multimodal_output:
                 videos = request_output.multimodal_output.get("video")
         if videos is None and hasattr(result, "multimodal_output") and result.multimodal_output:
-            videos = result.multimodal_output.get("video")
+            videos = result.multimodal_output.get("video_b64") or result.multimodal_output.get("video")
 
         normalized = self._normalize_video_outputs(videos)
         if not normalized:

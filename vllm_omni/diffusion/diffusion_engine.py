@@ -106,6 +106,7 @@ class DiffusionEngine:
             "image_num": int(request.sampling_params.num_outputs_per_prompt),
             "resolution": int(request.sampling_params.resolution),
             "postprocess_time_ms": postprocess_time * 1000,
+            "fps": int(getattr(request.sampling_params, "fps", 24) or 24),
         }
         metrics.update(output.scheduler_metadata or {})
         if self.pre_process_func is not None:
