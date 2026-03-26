@@ -71,6 +71,7 @@ class DiffusionWorker:
         self.vllm_config: VllmConfig | None = None
         self.model_runner: DiffusionModelRunner | None = None
         self._sleep_saved_buffers: dict[str, torch.Tensor] = {}
+        self._resident_scheduler_states: dict[str, dict[str, Any]] = {}
         self.lora_manager: DiffusionLoRAManager | None = None
         self.init_device()
         # Create model runner
@@ -179,6 +180,15 @@ class DiffusionWorker:
     def execute_model(self, req: OmniDiffusionRequest, od_config: OmniDiffusionConfig) -> DiffusionOutput:
         """Execute a forward pass by delegating to the model runner."""
         assert self.model_runner is not None, "Model runner not initialized"
+        request_key = self._get_request_key(req)
+        if (
+            req.sampling_params.extra_args.get("_server_preemption_enabled", False)
+            and request_key in self._resident_scheduler_states
+        ):
+            req.sampling_params.extra_args["_server_state"] = self._resident_scheduler_states[request_key]
+        else:
+            req.sampling_params.extra_args.pop("_server_state", None)
+
         if self.lora_manager is not None:
             try:
                 self.lora_manager.set_active_adapter(req.sampling_params.lora_request, req.sampling_params.lora_scale)
@@ -186,7 +196,23 @@ class DiffusionWorker:
                 if req.sampling_params.lora_request is not None:
                     raise
                 logger.warning("LoRA activation skipped: %s", exc)
-        return self.model_runner.execute_model(req)
+        output = self.model_runner.execute_model(req)
+        if req.sampling_params.extra_args.get("_server_preemption_enabled", False):
+            if output.finished:
+                self._resident_scheduler_states.pop(request_key, None)
+            elif output.scheduler_state is not None:
+                state = output.scheduler_state
+                self._resident_scheduler_states[request_key] = state
+                output.scheduler_state = {
+                    "request_key": request_key,
+                    "completed_steps": int(state.get("completed_steps", 0)),
+                }
+        return output
+
+    def _get_request_key(self, req: OmniDiffusionRequest) -> str:
+        if req.request_ids:
+            return req.request_ids[0]
+        raise ValueError("Preemptible diffusion requests must carry a request_id.")
 
     def load_weights(self, weights) -> set[str]:
         """Load weights by delegating to the model runner."""

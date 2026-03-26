@@ -82,7 +82,6 @@ class Scheduler:
                     step_budget=self._select_step_budget(scheduled, has_competition),
                 )
                 if output.finished:
-                    scheduled.request.sampling_params.extra_args.pop("_server_state", None)
                     scheduled.output = output
                     self._policy.mark_finished(scheduled)
                     scheduled.done_event.set()
@@ -92,7 +91,6 @@ class Scheduler:
                 completed_steps = int(scheduler_state.get("completed_steps", 0))
                 if completed_steps <= 0:
                     raise RuntimeError("Preempted diffusion request did not report any completed steps.")
-                scheduled.request.sampling_params.extra_args["_server_state"] = scheduler_state
                 self._policy.update_after_quantum(scheduled, completed_steps)
                 with self._pending_cv:
                     self._policy.requeue_request(scheduled)
@@ -117,7 +115,6 @@ class Scheduler:
                     request.sampling_params.extra_args["_server_step_budget"] = step_budget
                 else:
                     request.sampling_params.extra_args.pop("_server_step_budget", None)
-                    request.sampling_params.extra_args.pop("_server_state", None)
                 rpc_request = {
                     "type": "rpc",
                     "method": "generate",
