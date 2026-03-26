@@ -607,8 +607,7 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin):
         if self.attention_kwargs is None:
             self._attention_kwargs = {}
 
-        state = req.execution_state.payload if req.execution_state is not None else None
-        if state is None:
+        if not req.preempt_enabled:
             if prompt is not None and isinstance(prompt, str):
                 batch_size = 1
             elif prompt is not None and isinstance(prompt, list):
@@ -659,7 +658,9 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin):
                     )
                 ]
             ] * batch_size
+
             timesteps, num_inference_steps = self.prepare_timesteps(num_inference_steps, sigmas, latents.shape[1])
+            self._num_timesteps = len(timesteps)
 
             if self.transformer.guidance_embeds:
                 guidance = torch.full([1], guidance_scale, dtype=torch.float32)
@@ -672,99 +673,182 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin):
                 negative_prompt_embeds_mask.sum(dim=1).tolist() if negative_prompt_embeds_mask is not None else None
             )
 
-            state = {
-                "prompt_embeds": prompt_embeds,
-                "prompt_embeds_mask": prompt_embeds_mask,
-                "negative_prompt_embeds": negative_prompt_embeds,
-                "negative_prompt_embeds_mask": negative_prompt_embeds_mask,
-                "latents": latents,
-                "img_shapes": img_shapes,
-                "txt_seq_lens": txt_seq_lens,
-                "negative_txt_seq_lens": negative_txt_seq_lens,
-                "timesteps": timesteps,
-                "do_true_cfg": do_true_cfg,
-                "guidance": guidance,
-                "true_cfg_scale": true_cfg_scale,
-                "height": height,
-                "width": width,
-                "num_inference_steps": num_inference_steps,
-                "sigmas": sigmas,
-                "image_seq_len": latents.shape[1],
-            }
-            req.execution_state = OmniDiffusionExecutionState(step_index=0, payload=state)
+            latents = self.diffuse(
+                prompt_embeds,
+                prompt_embeds_mask,
+                negative_prompt_embeds,
+                negative_prompt_embeds_mask,
+                latents,
+                img_shapes,
+                txt_seq_lens,
+                negative_txt_seq_lens,
+                timesteps,
+                do_true_cfg,
+                guidance,
+                true_cfg_scale,
+                image_latents=None,
+                cfg_normalize=True,
+                additional_transformer_kwargs={
+                    "return_dict": False,
+                    "attention_kwargs": self.attention_kwargs,
+                },
+            )
         else:
-            prompt_embeds = state["prompt_embeds"]
-            prompt_embeds_mask = state["prompt_embeds_mask"]
-            negative_prompt_embeds = state["negative_prompt_embeds"]
-            negative_prompt_embeds_mask = state["negative_prompt_embeds_mask"]
-            latents = state["latents"]
-            img_shapes = state["img_shapes"]
-            txt_seq_lens = state["txt_seq_lens"]
-            negative_txt_seq_lens = state["negative_txt_seq_lens"]
-            timesteps = state["timesteps"]
-            do_true_cfg = state["do_true_cfg"]
-            guidance = state["guidance"]
-            true_cfg_scale = state["true_cfg_scale"]
-            height = state["height"]
-            width = state["width"]
+            state = req.execution_state.payload if req.execution_state is not None else None
+            if state is None:
+                if prompt is not None and isinstance(prompt, str):
+                    batch_size = 1
+                elif prompt is not None and isinstance(prompt, list):
+                    batch_size = len(prompt)
+                else:
+                    batch_size = prompt_embeds.shape[0]
 
-        # Restore scheduler internal state per request to avoid cross-request
-        # contamination of scheduler.sigmas when requests are interleaved.
-        timesteps, _ = self.prepare_timesteps(
-            state["num_inference_steps"],
-            state["sigmas"],
-            state["image_seq_len"],
-        )
-        state["timesteps"] = timesteps
-        self._num_timesteps = len(timesteps)
-        start_index = req.execution_state.step_index if req.execution_state is not None else 0
-        chunk_size = None
-        req_id = req.request_ids[0] if req.request_ids else req.request_key
-        if start_index >= len(timesteps):
-            raise RuntimeError(
-                f"Invalid resume step for req_id={req_id}: "
-                f"start_index={start_index} >= timesteps_len={len(timesteps)}"
+                has_neg_prompt = negative_prompt is not None or (
+                    negative_prompt_embeds is not None and negative_prompt_embeds_mask is not None
+                )
+
+                do_true_cfg = true_cfg_scale > 1 and has_neg_prompt
+                self.check_cfg_parallel_validity(true_cfg_scale, has_neg_prompt)
+
+                prompt_embeds, prompt_embeds_mask = self.encode_prompt(
+                    prompt=prompt,
+                    prompt_embeds=prompt_embeds,
+                    prompt_embeds_mask=prompt_embeds_mask,
+                    num_images_per_prompt=num_images_per_prompt,
+                    max_sequence_length=max_sequence_length,
+                )
+                if do_true_cfg:
+                    negative_prompt_embeds, negative_prompt_embeds_mask = self.encode_prompt(
+                        prompt=negative_prompt,
+                        prompt_embeds=negative_prompt_embeds,
+                        prompt_embeds_mask=negative_prompt_embeds_mask,
+                        num_images_per_prompt=num_images_per_prompt,
+                        max_sequence_length=max_sequence_length,
+                    )
+
+                num_channels_latents = self.transformer.in_channels // 4
+                latents = self.prepare_latents(
+                    batch_size * num_images_per_prompt,
+                    num_channels_latents,
+                    height,
+                    width,
+                    prompt_embeds.dtype,
+                    self.device,
+                    generator,
+                    latents,
+                )
+                img_shapes = [
+                    [
+                        (
+                            1,
+                            height // self.vae_scale_factor // 2,
+                            width // self.vae_scale_factor // 2,
+                        )
+                    ]
+                ] * batch_size
+                timesteps, num_inference_steps = self.prepare_timesteps(num_inference_steps, sigmas, latents.shape[1])
+
+                if self.transformer.guidance_embeds:
+                    guidance = torch.full([1], guidance_scale, dtype=torch.float32)
+                    guidance = guidance.expand(latents.shape[0])
+                else:
+                    guidance = None
+
+                txt_seq_lens = prompt_embeds_mask.sum(dim=1).tolist() if prompt_embeds_mask is not None else None
+                negative_txt_seq_lens = (
+                    negative_prompt_embeds_mask.sum(dim=1).tolist() if negative_prompt_embeds_mask is not None else None
+                )
+
+                state = {
+                    "prompt_embeds": prompt_embeds,
+                    "prompt_embeds_mask": prompt_embeds_mask,
+                    "negative_prompt_embeds": negative_prompt_embeds,
+                    "negative_prompt_embeds_mask": negative_prompt_embeds_mask,
+                    "latents": latents,
+                    "img_shapes": img_shapes,
+                    "txt_seq_lens": txt_seq_lens,
+                    "negative_txt_seq_lens": negative_txt_seq_lens,
+                    "timesteps": timesteps,
+                    "do_true_cfg": do_true_cfg,
+                    "guidance": guidance,
+                    "true_cfg_scale": true_cfg_scale,
+                    "height": height,
+                    "width": width,
+                    "num_inference_steps": num_inference_steps,
+                    "sigmas": sigmas,
+                    "image_seq_len": latents.shape[1],
+                }
+                req.execution_state = OmniDiffusionExecutionState(step_index=0, payload=state)
+            else:
+                prompt_embeds = state["prompt_embeds"]
+                prompt_embeds_mask = state["prompt_embeds_mask"]
+                negative_prompt_embeds = state["negative_prompt_embeds"]
+                negative_prompt_embeds_mask = state["negative_prompt_embeds_mask"]
+                latents = state["latents"]
+                img_shapes = state["img_shapes"]
+                txt_seq_lens = state["txt_seq_lens"]
+                negative_txt_seq_lens = state["negative_txt_seq_lens"]
+                timesteps = state["timesteps"]
+                do_true_cfg = state["do_true_cfg"]
+                guidance = state["guidance"]
+                true_cfg_scale = state["true_cfg_scale"]
+                height = state["height"]
+                width = state["width"]
+
+            timesteps, _ = self.prepare_timesteps(
+                state["num_inference_steps"],
+                state["sigmas"],
+                state["image_seq_len"],
+            )
+            state["timesteps"] = timesteps
+            self._num_timesteps = len(timesteps)
+            start_index = req.execution_state.step_index if req.execution_state is not None else 0
+            if start_index >= len(timesteps):
+                req_id = req.request_ids[0] if req.request_ids else req.request_key
+                raise RuntimeError(
+                    f"Invalid resume step for req_id={req_id}: "
+                    f"start_index={start_index} >= timesteps_len={len(timesteps)}"
+                )
+
+            diffuse_result = self.diffuse(
+                state["prompt_embeds"],
+                state["prompt_embeds_mask"],
+                state["negative_prompt_embeds"],
+                state["negative_prompt_embeds_mask"],
+                state["latents"],
+                state["img_shapes"],
+                state["txt_seq_lens"],
+                state["negative_txt_seq_lens"],
+                timesteps,
+                state["do_true_cfg"],
+                state["guidance"],
+                state["true_cfg_scale"],
+                image_latents=None,
+                cfg_normalize=True,
+                additional_transformer_kwargs={
+                    "return_dict": False,
+                    "attention_kwargs": self.attention_kwargs,
+                },
+                start_index=start_index,
+                step_chunk_size=None,
+                should_yield=req.preempt_should_yield,
             )
 
-        diffuse_result = self.diffuse(
-            state["prompt_embeds"],
-            state["prompt_embeds_mask"],
-            state["negative_prompt_embeds"],
-            state["negative_prompt_embeds_mask"],
-            state["latents"],
-            state["img_shapes"],
-            state["txt_seq_lens"],
-            state["negative_txt_seq_lens"],
-            timesteps,
-            state["do_true_cfg"],
-            state["guidance"],
-            state["true_cfg_scale"],
-            image_latents=None,
-            cfg_normalize=True,
-            additional_transformer_kwargs={
-                "return_dict": False,
-                "attention_kwargs": self.attention_kwargs,
-            },
-            start_index=start_index,
-            step_chunk_size=chunk_size,
-            should_yield=req.preempt_should_yield if req.preempt_enabled else None,
-        )
+            if isinstance(diffuse_result, tuple):
+                latents, next_step_index, unfinished = diffuse_result
+            else:
+                latents = diffuse_result
+                next_step_index = len(timesteps)
+                unfinished = False
 
-        if isinstance(diffuse_result, tuple):
-            latents, next_step_index, unfinished = diffuse_result
-        else:
-            latents = diffuse_result
-            next_step_index = len(timesteps)
-            unfinished = False
+            state["latents"] = latents
+            if req.execution_state is None:
+                req.execution_state = OmniDiffusionExecutionState()
+            req.execution_state.payload = state
+            req.execution_state.step_index = next_step_index
 
-        state["latents"] = latents
-        if req.execution_state is None:
-            req.execution_state = OmniDiffusionExecutionState()
-        req.execution_state.payload = state
-        req.execution_state.step_index = next_step_index
-
-        if unfinished:
-            return DiffusionOutput(output=None, finished=False, request_key=req.request_key)
+            if unfinished:
+                return DiffusionOutput(output=None, finished=False, request_key=req.request_key)
 
         self._current_timestep = None
         if output_type == "latent":
