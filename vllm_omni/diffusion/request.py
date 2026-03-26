@@ -6,7 +6,7 @@ import hashlib
 import random
 import uuid
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
 
@@ -41,6 +41,7 @@ class OmniDiffusionRequest:
     execution_state: OmniDiffusionExecutionState | None = None
     preempt_step_chunk_size: int = 1
     preempt_enabled: bool = False
+    preempt_should_yield: Callable[[int], bool] | None = field(default=None, repr=False, compare=False)
     _request_key: str = field(init=False, repr=False)
 
     def __post_init__(self):

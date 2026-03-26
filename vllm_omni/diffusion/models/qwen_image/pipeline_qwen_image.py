@@ -718,7 +718,7 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin):
         state["timesteps"] = timesteps
         self._num_timesteps = len(timesteps)
         start_index = req.execution_state.step_index if req.execution_state is not None else 0
-        chunk_size = max(1, req.preempt_step_chunk_size) if req.preempt_enabled else None
+        chunk_size = None
         req_id = req.request_ids[0] if req.request_ids else req.request_key
         if start_index >= len(timesteps):
             raise RuntimeError(
@@ -747,7 +747,7 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin):
             },
             start_index=start_index,
             step_chunk_size=chunk_size,
-            should_yield=(lambda _: True) if req.preempt_enabled else None,
+            should_yield=req.preempt_should_yield if req.preempt_enabled else None,
         )
 
         if isinstance(diffuse_result, tuple):

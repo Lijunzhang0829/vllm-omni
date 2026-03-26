@@ -11,6 +11,7 @@ to DiffusionModelRunner.
 import gc
 import multiprocessing as mp
 import os
+from collections import deque
 from collections.abc import Iterable
 from contextlib import AbstractContextManager, nullcontext
 from datetime import datetime
@@ -352,6 +353,7 @@ class WorkerProc:
 
         # Initialize MessageQueue reader from handle
         self.mq = MessageQueue.create_from_handle(broadcast_handle, gpu_id)
+        self._prefetched_messages: deque[Any] = deque()
 
         self.result_mq = None
         self.result_mq_handle = None
@@ -514,7 +516,25 @@ class WorkerProc:
 
     def recv_message(self, timeout: float | None = None):
         """Receive messages from broadcast queue."""
+        if self._prefetched_messages:
+            return self._prefetched_messages.popleft()
         return self.mq.dequeue(timeout=timeout, indefinite=timeout is None)
+
+    def _prefetch_external_message(self) -> bool:
+        if self._prefetched_messages:
+            return True
+        try:
+            msg = self.mq.dequeue(timeout=0.0, indefinite=False)
+        except TimeoutError:
+            return False
+        self._prefetched_messages.append(msg)
+        return True
+
+    def _should_yield_current_chunk(self, request_key: str) -> bool:
+        current_req = self._current_req
+        if current_req is None or current_req.request_key != request_key:
+            return False
+        return self._prefetch_external_message()
 
     def _supports_step_preemption(self) -> bool:
         if getattr(self.od_config, "disable_diffusion_preemption", False):
@@ -531,6 +551,11 @@ class WorkerProc:
         req.get_or_assign_priority()
         req.preempt_enabled = self._supports_step_preemption()
         req.preempt_step_chunk_size = max(1, int(req.preempt_step_chunk_size))
+        req.preempt_should_yield = (
+            (lambda _step_index, request_key=req.request_key: self._should_yield_current_chunk(request_key))
+            if req.preempt_enabled
+            else None
+        )
         incoming_req_id = self._req_debug_id(req)
         if self._scheduling_policy.is_aborted(incoming_req_id):
             return
