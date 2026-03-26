@@ -7,6 +7,7 @@ from benchmarks.diffusion.super_p95_dispatcher import (
     ManagedBackendLauncher,
     ManagedBackendSpec,
     SuperP95Dispatcher,
+    _parse_npu_smi_bus_ids,
     build_dispatcher_from_args,
 )
 from vllm_omni.diffusion.super_p95 import (
@@ -179,6 +180,7 @@ def test_managed_backend_launcher_builds_expected_command_and_env(tmp_path, monk
         "_wait_until_healthy",
         lambda self: None,
     )
+    monkeypatch.setattr("benchmarks.diffusion.super_p95_dispatcher.shutil.which", lambda cmd: None)
 
     launcher = ManagedBackendLauncher(
         specs=[
@@ -225,6 +227,83 @@ def test_managed_backend_launcher_builds_expected_command_and_env(tmp_path, monk
     ]
     assert [call["env_device"] for call in popen_calls] == ["0", "1"]
     assert all(call["env_plugin"] == "ascend" for call in popen_calls)
+
+
+def test_parse_npu_smi_bus_ids_extracts_mapping():
+    output = """
+| 0     910B3               | OK            | 92.5        30                0    / 0             |
+| 0                         | 0000:C1:00.0  | 0           0    / 0          3429 / 65536         |
+| 1     910B3               | OK            | 87.5        31                0    / 0             |
+| 0                         | 0000:C2:00.0  | 0           0    / 0          3414 / 65536         |
+"""
+
+    assert _parse_npu_smi_bus_ids(output) == {
+        "0": "0000:c1:00.0",
+        "1": "0000:c2:00.0",
+    }
+
+
+def test_managed_backend_launcher_prefixes_numactl_when_numa_is_resolved(tmp_path, monkeypatch):
+    popen_calls = []
+
+    class FakeProcess:
+        def __init__(self):
+            self._returncode = None
+
+        def poll(self):
+            return self._returncode
+
+        def terminate(self):
+            self._returncode = 0
+
+        def wait(self, timeout=None):
+            self._returncode = 0
+            return 0
+
+        def kill(self):
+            self._returncode = -9
+
+    def fake_popen(cmd, env, stdout, stderr, text):
+        popen_calls.append(cmd)
+        return FakeProcess()
+
+    monkeypatch.setattr("benchmarks.diffusion.super_p95_dispatcher.subprocess.Popen", fake_popen)
+    monkeypatch.setattr(ManagedBackendLauncher, "_wait_until_healthy", lambda self: None)
+    monkeypatch.setattr("benchmarks.diffusion.super_p95_dispatcher.shutil.which", lambda cmd: "/usr/bin/numactl")
+    monkeypatch.setattr(ManagedBackendLauncher, "_get_device_bus_id", lambda self, device_id: "0000:c1:00.0")
+    monkeypatch.setattr("benchmarks.diffusion.super_p95_dispatcher._read_pci_numa_node", lambda bus_id: 6)
+
+    launcher = ManagedBackendLauncher(
+        specs=[ManagedBackendSpec(device_id="0", port=8091, base_url="http://127.0.0.1:8091", hardware_profile="910B3")],
+        model="Qwen/Qwen-Image",
+        backend_args=["--omni"],
+        backend_env={"VLLM_PLUGINS": "ascend"},
+        device_env_var="ASCEND_RT_VISIBLE_DEVICES",
+        health_timeout_s=10.0,
+        health_poll_interval_s=0.1,
+        log_dir=str(tmp_path),
+    )
+
+    launcher.start_all()
+    launcher.stop_all()
+
+    assert popen_calls == [
+        [
+            "numactl",
+            "--cpunodebind",
+            "6",
+            "--membind",
+            "6",
+            "vllm",
+            "serve",
+            "Qwen/Qwen-Image",
+            "--port",
+            "8091",
+            "--super-p95-hardware-profile",
+            "910B3",
+            "--omni",
+        ]
+    ]
 
 
 def test_build_dispatcher_from_args_applies_backend_hardware_profiles():

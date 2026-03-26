@@ -6,7 +6,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
+import re
 import shlex
+import shutil
 import subprocess
 import time
 from contextlib import suppress
@@ -20,6 +22,7 @@ import httpx
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
+from vllm.logger import init_logger
 
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.server_scheduling import (
@@ -33,6 +36,8 @@ from vllm_omni.diffusion.super_p95 import (
     parse_super_p95_load_headers,
 )
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+logger = init_logger(__name__)
 
 
 @dataclass
@@ -104,6 +109,8 @@ class ManagedBackendLauncher:
         self.health_poll_interval_s = health_poll_interval_s
         self.log_dir = Path(log_dir)
         self._processes: list[ManagedBackendProcess] = []
+        self._warned_messages: set[str] = set()
+        self._device_bus_ids: dict[str, str] | None = None
 
     def start_all(self) -> None:
         self.log_dir.mkdir(parents=True, exist_ok=True)
@@ -151,6 +158,16 @@ class ManagedBackendLauncher:
             spec.hardware_profile,
             *self.backend_args,
         ]
+        numa_node = self._resolve_numa_node(spec.device_id)
+        if numa_node is not None:
+            cmd = [
+                "numactl",
+                "--cpunodebind",
+                str(numa_node),
+                "--membind",
+                str(numa_node),
+                *cmd,
+            ]
         process = subprocess.Popen(
             cmd,
             env=env,
@@ -194,6 +211,86 @@ class ManagedBackendLauncher:
                 return response.status == 200
         except (urllib_error.URLError, TimeoutError, ValueError):
             return False
+
+    def _resolve_numa_node(self, device_id: str) -> int | None:
+        if shutil.which("numactl") is None:
+            self._warn_once("numactl is not installed; managed backends will start without NUMA binding.")
+            return None
+
+        bus_id = self._get_device_bus_id(device_id)
+        if bus_id is None:
+            self._warn_once(
+                f"Could not map device_id={device_id} to a PCI Bus-Id via `npu-smi info`; "
+                "managed backends will start without NUMA binding."
+            )
+            return None
+
+        numa_node = _read_pci_numa_node(bus_id)
+        if numa_node is None:
+            self._warn_once(
+                f"Could not resolve NUMA node for PCI device {bus_id}; managed backends will start without NUMA binding."
+            )
+            return None
+        return numa_node
+
+    def _get_device_bus_id(self, device_id: str) -> str | None:
+        if self._device_bus_ids is None:
+            self._device_bus_ids = _query_npu_device_bus_ids()
+        return self._device_bus_ids.get(str(device_id))
+
+    def _warn_once(self, message: str) -> None:
+        if message in self._warned_messages:
+            return
+        self._warned_messages.add(message)
+        logger.warning(message)
+
+
+def _query_npu_device_bus_ids() -> dict[str, str]:
+    try:
+        completed = subprocess.run(
+            ["npu-smi", "info"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        logger.warning("Failed to query `npu-smi info` for NUMA auto-binding: %s", exc)
+        return {}
+    return _parse_npu_smi_bus_ids(completed.stdout)
+
+
+def _parse_npu_smi_bus_ids(output: str) -> dict[str, str]:
+    mapping: dict[str, str] = {}
+    current_device_id: str | None = None
+    device_line_re = re.compile(r"^\|\s*(\d+)\s+([^\s|]+)\s+\|")
+    bus_line_re = re.compile(r"^\|\s*\d+\s*\|\s*([0-9A-Fa-f]{4}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}\.[0-9A-Fa-f])\s+\|")
+
+    for raw_line in output.splitlines():
+        line = raw_line.rstrip()
+        bus_match = bus_line_re.match(line)
+        if bus_match and current_device_id is not None:
+            mapping[current_device_id] = bus_match.group(1).lower()
+            current_device_id = None
+            continue
+
+        device_match = device_line_re.match(line)
+        if device_match and "Bus-Id" not in line and "Process id" not in line:
+            current_device_id = device_match.group(1)
+
+    return mapping
+
+
+def _read_pci_numa_node(bus_id: str) -> int | None:
+    path = Path("/sys/bus/pci/devices") / bus_id.lower() / "numa_node"
+    if not path.exists():
+        return None
+    try:
+        numa_node = int(path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+    if numa_node < 0:
+        return None
+    return numa_node
 
 
 class SuperP95Dispatcher:

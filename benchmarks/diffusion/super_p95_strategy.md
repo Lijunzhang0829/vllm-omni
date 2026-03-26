@@ -692,6 +692,7 @@ then sacrificial
 - `baseline` 和 `super_p95` 都通过同一个 dispatcher 统一对外暴露 `8080`。
 - `baseline` 关闭 sacrificial 分类，并关闭 server 异步抢占。
 - `super_p95` 开启 sacrificial 分类，并开启 server 异步抢占。
+- dispatcher managed launch 在检测到 `numactl` 和有效的 NPU NUMA node 后，会自动为每个 backend 做 `cpunodebind/membind` 绑定。
 
 ### 15.1 固定 workload
 
@@ -767,7 +768,6 @@ for rate in 0.2 0.3 0.4 0.5 0.6 0.7 0.8; do
     --seed 0 \
     --random-request-seed 8 \
     --random-request-config "${QWEN_IMAGE_RANDOM4}" \
-    --disable-tqdm \
     --run-label baseline \
     --output-file "/tmp/super_p95_plot/baseline/rate_${rate}.json"
 done
@@ -794,7 +794,6 @@ for rate in 0.2 0.3 0.4 0.5 0.6 0.7 0.8; do
     --seed 0 \
     --random-request-seed 8 \
     --random-request-config "${QWEN_IMAGE_RANDOM4}" \
-    --disable-tqdm \
     --run-label super_p95 \
     --output-file "/tmp/super_p95_plot/super_p95/rate_${rate}.json"
 done
@@ -820,7 +819,6 @@ python benchmarks/diffusion/diffusion_benchmark_serving.py \
   --seed 0 \
   --random-request-seed 8 \
   --random-request-config "${QWEN_IMAGE_RANDOM4}" \
-  --disable-tqdm \
   --run-label smoke \
   --output-file /tmp/super_p95_plot/smoke_rate_0.2.json
 ```

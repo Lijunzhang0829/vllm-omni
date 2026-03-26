@@ -1,6 +1,60 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# 8-card server launch examples for this script.
+#
+# Notes:
+# - This script only launches the client benchmark. Start the server manually first.
+# - The dispatcher now auto-binds managed backends with:
+#     numactl --cpunodebind=<numa_node> --membind=<numa_node>
+#   when `numactl` is installed and the NPU PCI device exposes a NUMA node.
+# - On the current 910B3 machine, the PCIe -> NUMA mapping is:
+#     0000:01:00.0 -> NUMA 0
+#     0000:02:00.0 -> NUMA 0
+#     0000:41:00.0 -> NUMA 2
+#     0000:42:00.0 -> NUMA 2
+#     0000:81:00.0 -> NUMA 4
+#     0000:82:00.0 -> NUMA 4
+#     0000:c1:00.0 -> NUMA 6
+#     0000:c2:00.0 -> NUMA 6
+# - /sys/bus/pci/devices paths are case-sensitive. Use lowercase hex, e.g. 0000:c1:00.0.
+#
+# Baseline, 8x 910B3:
+# env NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost \
+# python benchmarks/diffusion/super_p95_dispatcher.py \
+#   --host 127.0.0.1 \
+#   --port 8080 \
+#   --num-servers 8 \
+#   --device-ids 0,1,2,3,4,5,6,7 \
+#   --backend-hardware-profiles 910B3 \
+#   --model Qwen/Qwen-Image \
+#   --backend-start-port 8091 \
+#   --backend-args "--omni --vae-use-slicing --vae-use-tiling" \
+#   --backend-env VLLM_PLUGINS=ascend \
+#   --backend-env HF_HUB_OFFLINE=1 \
+#   --backend-env VLLM_OMNI_ENABLE_DIFFUSION_PREEMPTION=0 \
+#   --quota-every 20 \
+#   --quota-amount 0
+#
+# Super-P95, 8x 910B3:
+# env NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost \
+# python benchmarks/diffusion/super_p95_dispatcher.py \
+#   --host 127.0.0.1 \
+#   --port 8080 \
+#   --num-servers 8 \
+#   --device-ids 0,1,2,3,4,5,6,7 \
+#   --backend-hardware-profiles 910B3 \
+#   --model Qwen/Qwen-Image \
+#   --backend-start-port 8091 \
+#   --backend-args "--omni --vae-use-slicing --vae-use-tiling" \
+#   --backend-env VLLM_PLUGINS=ascend \
+#   --backend-env HF_HUB_OFFLINE=1 \
+#   --backend-env VLLM_OMNI_ENABLE_DIFFUSION_PREEMPTION=1 \
+#   --quota-every 20 \
+#   --quota-amount 1 \
+#   --threshold-ratio 0.8 \
+#   --sacrificial-load-factor 0.1
+
 usage() {
   cat <<'EOF'
 Usage:
@@ -108,7 +162,6 @@ for rate in ${REQUEST_RATES}; do
     --seed "${SEED}" \
     --random-request-seed "${RANDOM_REQUEST_SEED}" \
     --random-request-config "${QWEN_IMAGE_RANDOM4}" \
-    --disable-tqdm \
     --run-label "${RUN_LABEL}" \
     --output-file "${output_file}"
 done
