@@ -59,6 +59,21 @@ def test_arrival_does_not_preempt_when_pending_is_not_better_than_active():
     assert sched._active_preemption_requested is False
 
 
+def test_arrival_does_not_preempt_when_preemption_is_disabled():
+    sched = _make_scheduler()
+    sched._preemption_enabled = False
+    active = sched._policy.add_request(_make_request("active", width=512, height=512, steps=20))
+    sched._policy.pop_next_request()
+    sched._mark_active_request_locked(active)
+    sched._policy.add_request(_make_request("new", width=1536, height=1536, steps=35))
+
+    should_preempt = sched._maybe_request_active_preemption_locked()
+
+    assert should_preempt is False
+    assert sched._active_request_preemptible is False
+    assert sched._active_preemption_requested is False
+
+
 def test_arrival_only_requests_preemption_once_per_active_request():
     sched = _make_scheduler()
     active = sched._policy.add_request(_make_request("active", width=512, height=512, steps=20))

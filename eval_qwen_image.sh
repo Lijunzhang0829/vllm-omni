@@ -53,12 +53,16 @@ SEED="${SEED:-0}"
 RANDOM_REQUEST_SEED="${RANDOM_REQUEST_SEED:-8}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-benchmarks/diffusion/results/qwen_image_p95_sweep}"
 
-QWEN_IMAGE_RANDOM4="${QWEN_IMAGE_RANDOM4:-[
-  {\"width\":512,\"height\":512,\"num_inference_steps\":20,\"weight\":0.15},
-  {\"width\":768,\"height\":768,\"num_inference_steps\":20,\"weight\":0.25},
-  {\"width\":1024,\"height\":1024,\"num_inference_steps\":25,\"weight\":0.45},
-  {\"width\":1536,\"height\":1536,\"num_inference_steps\":35,\"weight\":0.15}
-]}"
+DEFAULT_QWEN_IMAGE_RANDOM4="$(cat <<'EOF'
+[
+  {"width":512,"height":512,"num_inference_steps":20,"weight":0.15},
+  {"width":768,"height":768,"num_inference_steps":20,"weight":0.25},
+  {"width":1024,"height":1024,"num_inference_steps":25,"weight":0.45},
+  {"width":1536,"height":1536,"num_inference_steps":35,"weight":0.15}
+]
+EOF
+)"
+QWEN_IMAGE_RANDOM4="${QWEN_IMAGE_RANDOM4:-$DEFAULT_QWEN_IMAGE_RANDOM4}"
 
 OUT_DIR="${OUTPUT_ROOT}/${RUN_LABEL}"
 mkdir -p "${OUT_DIR}"
@@ -70,6 +74,13 @@ echo "Num prompts     : ${NUM_PROMPTS}"
 echo "Max concurrency : ${MAX_CONCURRENCY}"
 echo "Request rates   : ${REQUEST_RATES}"
 echo "Output dir      : ${OUT_DIR}"
+
+python - <<'PY' <<<"${QWEN_IMAGE_RANDOM4}" >/dev/null
+import json
+import sys
+
+json.loads(sys.stdin.read())
+PY
 
 HEALTH_CODE="$(curl --noproxy '*' -s -o /tmp/eval_qwen_image_health.json -w '%{http_code}' "${BASE_URL}/health" || true)"
 if [[ "${HEALTH_CODE}" != "200" ]]; then

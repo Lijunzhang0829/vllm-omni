@@ -721,9 +721,7 @@ python benchmarks/diffusion/super_p95_dispatcher.py \
   --backend-env HF_HUB_OFFLINE=1 \
   --backend-env VLLM_OMNI_ENABLE_DIFFUSION_PREEMPTION=0 \
   --quota-every 20 \
-  --quota-amount 0 \
-  --threshold-ratio 0.8 \
-  --sacrificial-load-factor 0.1
+  --quota-amount 0
 ```
 
 ### 15.3 Super-P95 Server Command
