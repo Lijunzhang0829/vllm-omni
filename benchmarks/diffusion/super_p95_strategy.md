@@ -690,7 +690,8 @@ then sacrificial
 - 建议两组实验都使用相同 workload、相同 seed、相同 `random_request_seed`。
 - 默认 sweep 配置使用 `500` 条请求。
 - `baseline` 和 `super_p95` 都通过同一个 dispatcher 统一对外暴露 `8080`。
-- `baseline` 只是关闭 sacrificial 分类，保持双卡、统一入口和相同 backend 启动方式。
+- `baseline` 关闭 sacrificial 分类，并关闭 server 异步抢占。
+- `super_p95` 开启 sacrificial 分类，并开启 server 异步抢占。
 
 ### 15.1 固定 workload
 
@@ -718,6 +719,7 @@ python benchmarks/diffusion/super_p95_dispatcher.py \
   --backend-args "--omni --vae-use-slicing --vae-use-tiling" \
   --backend-env VLLM_PLUGINS=ascend \
   --backend-env HF_HUB_OFFLINE=1 \
+  --backend-env VLLM_OMNI_ENABLE_DIFFUSION_PREEMPTION=0 \
   --quota-every 20 \
   --quota-amount 0 \
   --threshold-ratio 0.8 \
@@ -739,6 +741,7 @@ python benchmarks/diffusion/super_p95_dispatcher.py \
   --backend-args "--omni --vae-use-slicing --vae-use-tiling" \
   --backend-env VLLM_PLUGINS=ascend \
   --backend-env HF_HUB_OFFLINE=1 \
+  --backend-env VLLM_OMNI_ENABLE_DIFFUSION_PREEMPTION=1 \
   --quota-every 20 \
   --quota-amount 1 \
   --threshold-ratio 0.8 \
