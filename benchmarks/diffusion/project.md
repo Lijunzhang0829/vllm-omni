@@ -68,6 +68,15 @@ python benchmarks/diffusion/launch_qwen_image_servers.py \
   --extra-server-args "--dtype bfloat16 --vae-use-slicing --vae-use-tiling"
 ```
 
+Note
+
+```
+The benchmark client now automatically sends a lightweight
+X-DelayX-Estimated-Service-S request header, so the dispatcher can avoid
+parsing each JSON body for service-time estimation. No extra client flags are
+needed for this.
+```
+
 Client
 
 ```
@@ -83,7 +92,7 @@ python benchmarks/diffusion/run_qwen_image_req_rate_sweep.py \
   --max-concurrency 1000 \
   --warmup-requests 1 \
   --enable-negative-prompt \
-  --request-rates 0.1,0.25,0.4,0.55,0.7,0.85,1 \
+  --request-rates 0.3,0.4,0.5,0.6,0.7,0.8,0.9 \
   --output-dir benchmarks/diffusion/results/qwen_image_delay_x \
   --random-request-config '[
     {"width":512,"height":512,"num_inference_steps":20,"weight":0.15},

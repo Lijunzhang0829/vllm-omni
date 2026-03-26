@@ -378,7 +378,6 @@ class OmniServeCommand(CLISubcommand):
             default=100.0,
             help="For backend delay_x scheduling, demote sacrificial requests by this factor while preserving order.",
         )
-
         # TTS-specific parameters
         omni_config_group.add_argument(
             "--tts-max-instructions-length",
