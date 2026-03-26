@@ -49,3 +49,14 @@ def test_predicted_latency_policy_tracks_logical_time_on_completion():
     second = policy.add_request(second_request)
 
     assert second.arrival_time_s == first.estimated_service_s
+
+
+def test_predicted_latency_policy_updates_remaining_after_quantum():
+    policy = PredictedLatencyPolicy()
+    request = _make_request(width=1024, height=1024, num_inference_steps=25)
+
+    scheduled = policy.add_request(request)
+    policy.update_after_quantum(scheduled, completed_steps=5)
+
+    assert scheduled.remaining_steps == 20
+    assert scheduled.remaining_service_s == scheduled.estimated_service_s * 20 / 25

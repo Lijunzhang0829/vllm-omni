@@ -53,6 +53,8 @@ class ScheduledRequest:
     request: OmniDiffusionRequest = field(compare=False)
     estimated_service_s: float = field(compare=False)
     remaining_service_s: float = field(compare=False)
+    total_steps: int = field(compare=False, default=1)
+    remaining_steps: int = field(compare=False, default=1)
     output: object | None = field(default=None, compare=False)
     error: BaseException | None = field(default=None, compare=False)
     done_event: threading.Event = field(default_factory=threading.Event, compare=False, repr=False)
@@ -74,12 +76,15 @@ class PredictedLatencyPolicy:
 
     def add_request(self, request: OmniDiffusionRequest) -> ScheduledRequest:
         estimated_service_s = estimate_service_time_s(request)
+        total_steps = max(int(request.sampling_params.num_inference_steps or 1), 1)
         scheduled = ScheduledRequest(
             arrival_seq=self._arrival_seq,
             arrival_time_s=self.current_time_s,
             request=request,
             estimated_service_s=estimated_service_s,
             remaining_service_s=estimated_service_s,
+            total_steps=total_steps,
+            remaining_steps=total_steps,
         )
         self._arrival_seq += 1
         heapq.heappush(self._pending, scheduled)
@@ -91,5 +96,22 @@ class PredictedLatencyPolicy:
     def pop_next_request(self) -> ScheduledRequest:
         return heapq.heappop(self._pending)
 
+    def requeue_request(self, scheduled: ScheduledRequest) -> None:
+        scheduled.refresh_sort_key()
+        heapq.heappush(self._pending, scheduled)
+
+    def update_after_quantum(self, scheduled: ScheduledRequest, completed_steps: int) -> None:
+        completed_steps = max(completed_steps, 0)
+        self.current_time_s += scheduled.estimated_service_s * completed_steps / scheduled.total_steps
+        scheduled.remaining_steps = max(scheduled.remaining_steps - completed_steps, 0)
+        if scheduled.remaining_steps > 0:
+            scheduled.remaining_service_s = (
+                scheduled.estimated_service_s * scheduled.remaining_steps / scheduled.total_steps
+            )
+        else:
+            scheduled.remaining_service_s = 0.0
+
     def mark_finished(self, scheduled: ScheduledRequest) -> None:
-        self.current_time_s += scheduled.estimated_service_s
+        self.current_time_s += scheduled.remaining_service_s
+        scheduled.remaining_steps = 0
+        scheduled.remaining_service_s = 0.0

@@ -29,6 +29,7 @@ class Scheduler:
         self._pending_cv = threading.Condition()
         self._closed = False
         self._policy = PredictedLatencyPolicy()
+        self._step_budget = 1
 
         # Initialize single MessageQueue for all message types (generation & RPC)
         # Assuming all readers are local for now as per current launch_engine implementation
@@ -76,17 +77,36 @@ class Scheduler:
 
             try:
                 output = self._execute_request(scheduled.request)
-                scheduled.output = output
+                if output.finished:
+                    scheduled.request.sampling_params.extra_args.pop("_server_state", None)
+                    scheduled.output = output
+                    self._policy.mark_finished(scheduled)
+                    scheduled.done_event.set()
+                    continue
+
+                scheduler_state = output.scheduler_state or {}
+                completed_steps = int(scheduler_state.get("completed_steps", 0))
+                if completed_steps <= 0:
+                    raise RuntimeError("Preempted diffusion request did not report any completed steps.")
+                scheduled.request.sampling_params.extra_args["_server_state"] = scheduler_state
+                self._policy.update_after_quantum(scheduled, completed_steps)
+                with self._pending_cv:
+                    self._policy.requeue_request(scheduled)
+                    self._pending_cv.notify_all()
             except BaseException as exc:  # pragma: no cover - surfaced to caller
                 scheduled.error = exc
-            finally:
-                if scheduled.error is None:
-                    self._policy.mark_finished(scheduled)
                 scheduled.done_event.set()
 
     def _execute_request(self, request: OmniDiffusionRequest) -> DiffusionOutput:
         with self._lock:
             try:
+                supports_preemption = self.od_config.model_class_name == "QwenImagePipeline"
+                request.sampling_params.extra_args["_server_preemption_enabled"] = supports_preemption
+                if supports_preemption:
+                    request.sampling_params.extra_args["_server_step_budget"] = self._step_budget
+                else:
+                    request.sampling_params.extra_args.pop("_server_step_budget", None)
+                    request.sampling_params.extra_args.pop("_server_state", None)
                 rpc_request = {
                     "type": "rpc",
                     "method": "generate",
