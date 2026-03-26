@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from __future__ import annotations
+
 import threading
 
 import zmq
@@ -9,6 +11,7 @@ from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.server_scheduling import PredictedLatencyPolicy
 
 logger = init_logger(__name__)
 
@@ -23,6 +26,9 @@ class Scheduler:
         self.num_workers = od_config.num_gpus
         self.od_config = od_config
         self._lock = threading.Lock()
+        self._pending_cv = threading.Condition()
+        self._closed = False
+        self._policy = PredictedLatencyPolicy()
 
         # Initialize single MessageQueue for all message types (generation & RPC)
         # Assuming all readers are local for now as per current launch_engine implementation
@@ -33,6 +39,12 @@ class Scheduler:
         )
 
         self.result_mq = None
+        self._scheduler_thread = threading.Thread(
+            target=self._run_scheduler_loop,
+            name="DiffusionPredictedLatencyScheduler",
+            daemon=True,
+        )
+        self._scheduler_thread.start()
 
     def initialize_result_queue(self, handle):
         # Initialize MessageQueue for receiving results
@@ -44,10 +56,37 @@ class Scheduler:
         return self.mq.export_handle()
 
     def add_req(self, request: OmniDiffusionRequest) -> DiffusionOutput:
-        """Sends a request to the scheduler and waits for the response."""
+        """Queue a request and wait for server-side scheduling to execute it."""
+        with self._pending_cv:
+            scheduled = self._policy.add_request(request)
+            self._pending_cv.notify_all()
+        scheduled.done_event.wait()
+        if scheduled.error is not None:
+            raise scheduled.error
+        assert isinstance(scheduled.output, DiffusionOutput)
+        return scheduled.output
+
+    def _run_scheduler_loop(self) -> None:
+        while True:
+            with self._pending_cv:
+                self._pending_cv.wait_for(lambda: self._closed or self._policy.has_pending())
+                if self._closed and not self._policy.has_pending():
+                    return
+                scheduled = self._policy.pop_next_request()
+
+            try:
+                output = self._execute_request(scheduled.request)
+                scheduled.output = output
+            except BaseException as exc:  # pragma: no cover - surfaced to caller
+                scheduled.error = exc
+            finally:
+                if scheduled.error is None:
+                    self._policy.mark_finished(scheduled)
+                scheduled.done_event.set()
+
+    def _execute_request(self, request: OmniDiffusionRequest) -> DiffusionOutput:
         with self._lock:
             try:
-                # Prepare RPC request for generation
                 rpc_request = {
                     "type": "rpc",
                     "method": "generate",
@@ -56,24 +95,26 @@ class Scheduler:
                     "output_rank": 0,
                     "exec_all_ranks": True,
                 }
-
-                # Broadcast RPC request to all workers
                 self.mq.enqueue(rpc_request)
-                # Wait for result from Rank 0 (or whoever sends it)
 
                 if self.result_mq is None:
                     raise RuntimeError("Result queue not initialized")
 
                 output = self.result_mq.dequeue()
-                # {"status": "error", "error": str(e)}
                 if isinstance(output, dict) and output.get("status") == "error":
                     raise RuntimeError("worker error")
                 return output
-            except zmq.error.Again:
+            except zmq.error.Again as exc:
                 logger.error("Timeout waiting for response from scheduler.")
-                raise TimeoutError("Scheduler did not respond in time.")
+                raise TimeoutError("Scheduler did not respond in time.") from exc
 
     def close(self):
         """Closes the socket and terminates the context."""
+        with self._pending_cv:
+            self._closed = True
+            self._pending_cv.notify_all()
+        scheduler_thread = getattr(self, "_scheduler_thread", None)
+        if scheduler_thread is not None:
+            scheduler_thread.join(timeout=1)
         self.mq = None
         self.result_mq = None
