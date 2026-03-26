@@ -85,6 +85,7 @@ class ManagedBackendProcess:
     spec: ManagedBackendSpec
     process: subprocess.Popen[str]
     log_file: Any
+    numa_node: int | None = None
 
 
 class ManagedBackendLauncher:
@@ -114,15 +115,23 @@ class ManagedBackendLauncher:
 
     def start_all(self) -> None:
         self.log_dir.mkdir(parents=True, exist_ok=True)
+        logger.info(
+            "Starting %d managed super_p95 backends. Logs will be written to %s",
+            len(self.specs),
+            self.log_dir,
+        )
         try:
             for spec in self.specs:
                 self._processes.append(self._start_one(spec))
             self._wait_until_healthy()
+            logger.info("All managed super_p95 backends are healthy.")
         except Exception:
             self.stop_all()
             raise
 
     def stop_all(self) -> None:
+        if self._processes:
+            logger.info("Stopping %d managed super_p95 backends.", len(self._processes))
         for managed in reversed(self._processes):
             process = managed.process
             if process.poll() is None:
@@ -168,6 +177,16 @@ class ManagedBackendLauncher:
                 str(numa_node),
                 *cmd,
             ]
+        logger.info(
+            "Launching backend port=%s device_id=%s hardware_profile=%s numa_node=%s base_url=%s log=%s cmd=%s",
+            spec.port,
+            spec.device_id,
+            spec.hardware_profile,
+            numa_node if numa_node is not None else "none",
+            spec.base_url,
+            log_path,
+            shlex.join(cmd),
+        )
         process = subprocess.Popen(
             cmd,
             env=env,
@@ -175,11 +194,20 @@ class ManagedBackendLauncher:
             stderr=subprocess.STDOUT,
             text=True,
         )
-        return ManagedBackendProcess(spec=spec, process=process, log_file=log_file)
+        return ManagedBackendProcess(spec=spec, process=process, log_file=log_file, numa_node=numa_node)
 
     def _wait_until_healthy(self) -> None:
         deadline = time.time() + self.health_timeout_s
         pending = {managed.spec.port: managed for managed in self._processes}
+        logger.info(
+            "Waiting up to %.1fs for managed backends to become healthy: %s",
+            self.health_timeout_s,
+            ", ".join(
+                f"{managed.spec.port}(device={managed.spec.device_id}, numa={managed.numa_node if managed.numa_node is not None else 'none'})"
+                for managed in pending.values()
+            ),
+        )
+        last_logged_pending_ports: tuple[int, ...] | None = None
         while pending:
             failed = [
                 managed
@@ -187,19 +215,43 @@ class ManagedBackendLauncher:
                 if managed.process.poll() is not None
             ]
             if failed:
-                ports = ", ".join(str(managed.spec.port) for managed in failed)
-                raise RuntimeError(f"super_p95 backend exited before becoming healthy: {ports}")
+                failed_details = ", ".join(
+                    f"{managed.spec.port}(device={managed.spec.device_id}, log={managed.log_file.name})"
+                    for managed in failed
+                )
+                raise RuntimeError(f"super_p95 backend exited before becoming healthy: {failed_details}")
 
             ready_ports = [
                 port for port, managed in pending.items() if self._is_healthy(managed.spec.base_url)
             ]
             for port in ready_ports:
-                pending.pop(port, None)
+                managed = pending.pop(port, None)
+                if managed is not None:
+                    logger.info(
+                        "Managed backend is healthy: port=%s device_id=%s base_url=%s log=%s",
+                        managed.spec.port,
+                        managed.spec.device_id,
+                        managed.spec.base_url,
+                        managed.log_file.name,
+                    )
 
             if not pending:
                 return
+            pending_ports = tuple(sorted(pending))
+            if pending_ports != last_logged_pending_ports:
+                logger.info(
+                    "Still waiting for managed backends: %s",
+                    ", ".join(
+                        f"{managed.spec.port}(device={managed.spec.device_id}, log={managed.log_file.name})"
+                        for managed in pending.values()
+                    ),
+                )
+                last_logged_pending_ports = pending_ports
             if time.time() >= deadline:
-                ports = ", ".join(str(port) for port in sorted(pending))
+                ports = ", ".join(
+                    f"{managed.spec.port}(device={managed.spec.device_id}, log={managed.log_file.name})"
+                    for managed in pending.values()
+                )
                 raise TimeoutError(f"Timed out waiting for super_p95 backends to become healthy: {ports}")
             time.sleep(self.health_poll_interval_s)
 

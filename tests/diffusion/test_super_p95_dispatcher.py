@@ -306,6 +306,60 @@ def test_managed_backend_launcher_prefixes_numactl_when_numa_is_resolved(tmp_pat
     ]
 
 
+def test_managed_backend_launcher_logs_launch_details(tmp_path, monkeypatch):
+    popen_calls = []
+    log_messages = []
+
+    class FakeProcess:
+        def __init__(self):
+            self._returncode = None
+
+        def poll(self):
+            return self._returncode
+
+        def terminate(self):
+            self._returncode = 0
+
+        def wait(self, timeout=None):
+            self._returncode = 0
+            return 0
+
+        def kill(self):
+            self._returncode = -9
+
+    def fake_popen(cmd, env, stdout, stderr, text):
+        popen_calls.append(cmd)
+        return FakeProcess()
+
+    monkeypatch.setattr("benchmarks.diffusion.super_p95_dispatcher.subprocess.Popen", fake_popen)
+    monkeypatch.setattr(ManagedBackendLauncher, "_wait_until_healthy", lambda self: None)
+    monkeypatch.setattr("benchmarks.diffusion.super_p95_dispatcher.shutil.which", lambda cmd: "/usr/bin/numactl")
+    monkeypatch.setattr(ManagedBackendLauncher, "_get_device_bus_id", lambda self, device_id: "0000:c1:00.0")
+    monkeypatch.setattr("benchmarks.diffusion.super_p95_dispatcher._read_pci_numa_node", lambda bus_id: 6)
+    monkeypatch.setattr(
+        "benchmarks.diffusion.super_p95_dispatcher.logger.info",
+        lambda msg, *args: log_messages.append(msg % args if args else msg),
+    )
+
+    launcher = ManagedBackendLauncher(
+        specs=[ManagedBackendSpec(device_id="0", port=8091, base_url="http://127.0.0.1:8091", hardware_profile="910B3")],
+        model="Qwen/Qwen-Image",
+        backend_args=["--omni"],
+        backend_env={"VLLM_PLUGINS": "ascend"},
+        device_env_var="ASCEND_RT_VISIBLE_DEVICES",
+        health_timeout_s=10.0,
+        health_poll_interval_s=0.1,
+        log_dir=str(tmp_path),
+    )
+
+    launcher.start_all()
+    launcher.stop_all()
+
+    assert popen_calls
+    assert any("Launching backend port=8091 device_id=0 hardware_profile=910B3 numa_node=6" in msg for msg in log_messages)
+    assert any("Starting 1 managed super_p95 backends." in msg for msg in log_messages)
+
+
 def test_build_dispatcher_from_args_applies_backend_hardware_profiles():
     args = Namespace(
         backend_urls=None,
