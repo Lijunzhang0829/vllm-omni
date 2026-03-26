@@ -17,6 +17,12 @@ QWEN_IMAGE_PROFILE_LATENCY_S: dict[tuple[int, int, int, int], float] = {
     (1024, 1024, 25, 1): 33.90,
     (1536, 1536, 35, 1): 102.66,
 }
+QWEN_IMAGE_RESOLUTION_ANCHORS: dict[tuple[int, int], tuple[int, int, float]] = {
+    (512, 512): (20, 1, 22.35),
+    (768, 768): (20, 1, 20.62),
+    (1024, 1024): (25, 1, 33.90),
+    (1536, 1536): (35, 1, 102.66),
+}
 QWEN_IMAGE_FALLBACK_REFERENCE_KEY = (1024, 1024, 25, 1)
 QWEN_IMAGE_FALLBACK_REFERENCE_LATENCY_S = QWEN_IMAGE_PROFILE_LATENCY_S[QWEN_IMAGE_FALLBACK_REFERENCE_KEY]
 
@@ -58,6 +64,12 @@ def estimate_request_service_s(input: RequestFuncInput) -> float:
     profile_key = (width, height, steps, num_frames)
     if profile_key in QWEN_IMAGE_PROFILE_LATENCY_S:
         return QWEN_IMAGE_PROFILE_LATENCY_S[profile_key]
+
+    anchor = QWEN_IMAGE_RESOLUTION_ANCHORS.get((width, height))
+    if anchor is not None:
+        anchor_steps, anchor_frames, anchor_latency_s = anchor
+        if anchor_steps > 0 and anchor_frames > 0:
+            return anchor_latency_s * (float(steps) / float(anchor_steps)) * (float(num_frames) / float(anchor_frames))
 
     total_cost = max(1, width * height * steps * num_frames)
     reference_cost = (

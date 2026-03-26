@@ -17,6 +17,12 @@ QWEN_IMAGE_PROFILE_LATENCY_S: dict[tuple[int, int, int, int], float] = {
     (1024, 1024, 25, 1): 33.90,
     (1536, 1536, 35, 1): 102.66,
 }
+QWEN_IMAGE_RESOLUTION_ANCHORS: dict[tuple[int, int], tuple[int, int, float]] = {
+    (512, 512): (20, 1, 22.35),
+    (768, 768): (20, 1, 20.62),
+    (1024, 1024): (25, 1, 33.90),
+    (1536, 1536): (35, 1, 102.66),
+}
 QWEN_IMAGE_FALLBACK_REFERENCE_KEY = (1024, 1024, 25, 1)
 QWEN_IMAGE_FALLBACK_REFERENCE_LATENCY_S = QWEN_IMAGE_PROFILE_LATENCY_S[QWEN_IMAGE_FALLBACK_REFERENCE_KEY]
 DELAY_X_DISPATCHER_SACRIFICIAL_EXTRA_ARG_KEY = "_delay_x_dispatcher_sacrificial"
@@ -62,6 +68,13 @@ def estimate_total_service_s(req: OmniDiffusionRequest) -> float:
     profile_key = (width, height, total_steps, num_frames)
     if profile_key in QWEN_IMAGE_PROFILE_LATENCY_S:
         return QWEN_IMAGE_PROFILE_LATENCY_S[profile_key]
+
+    resolution_key = (width, height)
+    anchor = QWEN_IMAGE_RESOLUTION_ANCHORS.get(resolution_key)
+    if anchor is not None:
+        anchor_steps, anchor_frames, anchor_latency_s = anchor
+        if anchor_steps > 0 and anchor_frames > 0 and total_steps > 0 and num_frames > 0:
+            return anchor_latency_s * (float(total_steps) / float(anchor_steps)) * (float(num_frames) / float(anchor_frames))
 
     total_cost = estimate_total_cost(req)
     reference_cost = (
