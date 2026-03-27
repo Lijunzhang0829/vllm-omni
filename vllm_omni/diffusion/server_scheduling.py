@@ -187,9 +187,10 @@ class ScheduledRequest:
 
     def refresh_sort_key(self) -> None:
         priority = self.remaining_service_s - self.arrival_time_s
-        # `heapq` pops the smallest key first. super_p95 uses max-delay-first
-        # within a queue, so larger priority should be scheduled earlier.
-        self.sort_key = (-priority, self.arrival_seq)
+        if self.is_sacrificial:
+            self.sort_key = (priority, self.arrival_seq)
+        else:
+            self.sort_key = (-priority, self.arrival_seq)
 
 
 class PredictedLatencyPolicy:

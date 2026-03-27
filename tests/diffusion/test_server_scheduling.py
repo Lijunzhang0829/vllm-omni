@@ -118,7 +118,7 @@ def test_predicted_latency_policy_prioritizes_normal_before_sacrificial():
     assert scheduled.is_sacrificial is False
 
 
-def test_predicted_latency_policy_uses_max_delay_first_within_tail_queue():
+def test_predicted_latency_policy_uses_min_delay_first_within_tail_queue():
     policy = PredictedLatencyPolicy()
     slower = policy.add_request(
         _make_request(width=1536, height=1536, num_inference_steps=35, is_sacrificial=True, estimated_service_s=100.0)
@@ -129,8 +129,8 @@ def test_predicted_latency_policy_uses_max_delay_first_within_tail_queue():
 
     scheduled = policy.pop_next_request()
 
-    assert scheduled is slower
-    assert scheduled is not faster
+    assert scheduled is faster
+    assert scheduled is not slower
 
 
 def test_predicted_latency_policy_reports_pending_load_snapshot():
