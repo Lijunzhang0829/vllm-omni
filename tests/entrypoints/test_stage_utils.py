@@ -111,3 +111,40 @@ def test_set_stage_devices_npu_platform(mocker: MockerFixture, monkeypatch: pyte
 
     assert os.environ["ASCEND_RT_VISIBLE_DEVICES"] == "0,1"
     assert os.environ[STAGE_PHYSICAL_DEVICES_ENV_VAR] == "4,5"
+
+
+@pytest.mark.usefixtures("clean_gpu_memory_between_tests")
+def test_set_stage_devices_npu_single_device_keeps_physical_visibility(
+    mocker: MockerFixture,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("ASCEND_RT_VISIBLE_DEVICES", "4")
+
+    class _Npu:
+        @staticmethod
+        def is_available():
+            return True
+
+        @staticmethod
+        def set_device(idx):
+            return None
+
+        @staticmethod
+        def device_count():
+            return 1
+
+    class _NpuTorch:
+        npu = _Npu
+
+    monkeypatch.setitem(sys.modules, "torch", _NpuTorch)
+
+    mock_platform = _make_mock_platform(mocker, device_type="npu", env_var="ASCEND_RT_VISIBLE_DEVICES")
+    monkeypatch.setattr(
+        "vllm_omni.platforms.current_omni_platform",
+        mock_platform,
+    )
+
+    set_stage_devices(stage_id=0, devices=0)
+
+    assert os.environ["ASCEND_RT_VISIBLE_DEVICES"] == "4"
+    assert os.environ[STAGE_PHYSICAL_DEVICES_ENV_VAR] == "4"

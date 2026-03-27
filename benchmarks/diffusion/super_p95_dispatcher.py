@@ -154,6 +154,9 @@ class ManagedBackendLauncher:
     def _start_one(self, spec: ManagedBackendSpec) -> ManagedBackendProcess:
         env = os.environ.copy()
         env[self.device_env_var] = spec.device_id
+        # Make managed backend logs visible immediately instead of waiting on
+        # stdio buffering, otherwise startup failures are hard to diagnose.
+        env.setdefault("PYTHONUNBUFFERED", "1")
         env.update(self.backend_env)
         log_path = self.log_dir / f"backend_{spec.port}.log"
         log_file = open(log_path, "a", encoding="utf-8")

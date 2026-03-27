@@ -3,7 +3,10 @@ from types import SimpleNamespace
 
 from vllm_omni.diffusion.scheduler import Scheduler
 from vllm_omni.diffusion.server_scheduling import PredictedLatencyPolicy
-from vllm_omni.diffusion.super_p95 import EXTRA_ARG_SUPER_P95_SACRIFICIAL
+from vllm_omni.diffusion.super_p95 import (
+    EXTRA_ARG_SUPER_P95_ESTIMATED_SERVICE_S,
+    EXTRA_ARG_SUPER_P95_SACRIFICIAL,
+)
 
 
 def _make_request(request_id: str, *, width: int, height: int, steps: int):
@@ -119,6 +122,10 @@ def test_normal_pending_preempts_active_sacrificial_request():
 def test_add_req_bypasses_server_scheduling_when_disabled():
     sched = object.__new__(Scheduler)
     sched._server_scheduling_enabled = False
+    sched._pending_cv = threading.Condition()
+    sched._direct_normal_load_s = 0.0
+    sched._direct_sacrificial_load_s = 0.0
+    sched.od_config = SimpleNamespace(super_p95_hardware_profile="910B3")
 
     seen = []
     expected = object()
@@ -132,3 +139,47 @@ def test_add_req_bypasses_server_scheduling_when_disabled():
     req = _make_request("direct", width=512, height=512, steps=20)
     assert sched.add_req(req) is expected
     assert seen == [req]
+
+
+def test_direct_mode_tracks_authoritative_load_while_request_is_running():
+    sched = object.__new__(Scheduler)
+    sched._server_scheduling_enabled = False
+    sched._pending_cv = threading.Condition()
+    sched._direct_normal_load_s = 0.0
+    sched._direct_sacrificial_load_s = 0.0
+    sched.od_config = SimpleNamespace(super_p95_hardware_profile="910B2")
+
+    entered = threading.Event()
+    release = threading.Event()
+    result = object()
+
+    def _fake_execute(_request):
+        entered.set()
+        release.wait(timeout=5.0)
+        return result
+
+    sched._execute_request = _fake_execute
+
+    req = _make_request("direct", width=512, height=512, steps=20)
+    req.sampling_params.extra_args[EXTRA_ARG_SUPER_P95_ESTIMATED_SERVICE_S] = 12.5
+
+    output_holder = {}
+
+    def _run():
+        output_holder["result"] = sched.add_req(req)
+
+    worker = threading.Thread(target=_run)
+    worker.start()
+    assert entered.wait(timeout=5.0) is True
+
+    snapshot = sched.get_super_p95_load_snapshot()
+    assert snapshot.normal_load_s == 12.5
+    assert snapshot.sacrificial_load_s == 0.0
+
+    release.set()
+    worker.join(timeout=5.0)
+    assert output_holder["result"] is result
+
+    final_snapshot = sched.get_super_p95_load_snapshot()
+    assert final_snapshot.normal_load_s == 0.0
+    assert final_snapshot.sacrificial_load_s == 0.0

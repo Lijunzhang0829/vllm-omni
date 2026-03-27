@@ -34,7 +34,7 @@ set -euo pipefail
 #   --backend-env HF_HUB_OFFLINE=1 \
 #   --backend-env VLLM_OMNI_ENABLE_DIFFUSION_SERVER_SCHEDULING=0 \
 #   --backend-env VLLM_OMNI_ENABLE_DIFFUSION_PREEMPTION=0 \
-#   --request-timeout-s 10000 \
+#   --request-timeout-s 1000000 \
 #   --quota-every 20 \
 #   --quota-amount 0
 #
@@ -52,7 +52,7 @@ set -euo pipefail
 #   --backend-env VLLM_PLUGINS=ascend \
 #   --backend-env HF_HUB_OFFLINE=1 \
 #   --backend-env VLLM_OMNI_ENABLE_DIFFUSION_PREEMPTION=1 \
-#   --request-timeout-s 10000 \
+#   --request-timeout-s 1000000 \
 #   --quota-every 20 \
 #   --quota-amount 1 \
 #   --threshold-ratio 0.8 \
@@ -79,6 +79,7 @@ Environment overrides:
   WARMUP_STEPS        Default: 1
   SEED                Default: 0
   RANDOM_REQUEST_SEED Default: 8
+  CLIENT_TIMEOUT_S    Default: 1000000
   OUTPUT_ROOT         Default: benchmarks/diffusion/results/qwen_image_p95_sweep
 EOF
 }
@@ -108,6 +109,7 @@ WARMUP_REQUESTS="${WARMUP_REQUESTS:-1}"
 WARMUP_STEPS="${WARMUP_STEPS:-1}"
 SEED="${SEED:-0}"
 RANDOM_REQUEST_SEED="${RANDOM_REQUEST_SEED:-8}"
+CLIENT_TIMEOUT_S="${CLIENT_TIMEOUT_S:-1000000}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-benchmarks/diffusion/results/qwen_image_p95_sweep}"
 
 DEFAULT_QWEN_IMAGE_RANDOM4="$(cat <<'EOF'
@@ -130,6 +132,7 @@ echo "Model           : ${MODEL}"
 echo "Num prompts     : ${NUM_PROMPTS}"
 echo "Max concurrency : ${MAX_CONCURRENCY}"
 echo "Request rates   : ${REQUEST_RATES}"
+echo "Client timeout  : ${CLIENT_TIMEOUT_S}"
 echo "Output dir      : ${OUT_DIR}"
 
 python - <<'PY' <<<"${QWEN_IMAGE_RANDOM4}" >/dev/null
@@ -162,6 +165,7 @@ for rate in ${REQUEST_RATES}; do
     --request-rate "${rate}" \
     --warmup-requests "${WARMUP_REQUESTS}" \
     --warmup-num-inference-steps "${WARMUP_STEPS}" \
+    --client-timeout-s "${CLIENT_TIMEOUT_S}" \
     --seed "${SEED}" \
     --random-request-seed "${RANDOM_REQUEST_SEED}" \
     --random-request-config "${QWEN_IMAGE_RANDOM4}" \

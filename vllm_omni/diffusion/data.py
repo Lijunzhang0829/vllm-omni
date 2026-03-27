@@ -484,8 +484,20 @@ class OmniDiffusionConfig:
         )
 
     def __post_init__(self):
+        master_port_override = os.environ.get("VLLM_OMNI_DIFFUSION_MASTER_PORT")
+        if master_port_override:
+            self.master_port = int(master_port_override)
+        elif self.master_port is None and self.port is not None:
+            # Managed diffusion backends often launch concurrently. Derive the
+            # worker group's master port from the unique API port so sibling
+            # backends do not randomly collide during distributed init.
+            self.master_port = 30000 + int(self.port)
+
         # TODO: remove hard code
-        initial_master_port = (self.master_port or 30005) + random.randint(0, 100)
+        if self.master_port is not None:
+            initial_master_port = self.master_port
+        else:
+            initial_master_port = 30005 + random.randint(0, 100)
         self.master_port = self.settle_port(initial_master_port, 37)
 
         # Convert parallel_config dict to DiffusionParallelConfig if needed
@@ -606,9 +618,11 @@ class DiffusionOutput:
     trajectory_timesteps: list[torch.Tensor] | None = None
     trajectory_latents: torch.Tensor | None = None
     trajectory_decoded: list[torch.Tensor] | None = None
-    scheduler_state: dict[str, Any] | None = None
-    finished: bool = True
     error: str | None = None
+    finished: bool = True
+    request_key: str | None = None
+    scheduler_metadata: dict[str, Any] = field(default_factory=dict)
+    scheduler_state: dict[str, Any] | None = None
 
     post_process_func: Callable[..., Any] | None = None
 

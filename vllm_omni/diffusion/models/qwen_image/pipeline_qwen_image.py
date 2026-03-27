@@ -629,6 +629,9 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin):
             "width": width,
             "latents": latents,
             "timesteps": timesteps,
+            "num_inference_steps": num_inference_steps,
+            "sigmas": sigmas,
+            "image_seq_len": latents.shape[1],
             "next_step_index": 0,
             "do_true_cfg": do_true_cfg,
             "guidance": guidance,
@@ -644,9 +647,24 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin):
             "output_type": "pil",
         }
 
+    def _restore_scheduler_state(self, state: dict[str, Any]) -> None:
+        timesteps, _ = self.prepare_timesteps(
+            state["num_inference_steps"],
+            state["sigmas"],
+            state["image_seq_len"],
+        )
+        state["timesteps"] = timesteps
+        self._num_timesteps = len(timesteps)
+
     def _run_generation_steps(self, state: dict[str, Any]) -> tuple[dict[str, Any], bool, int]:
+        self._restore_scheduler_state(state)
         timesteps = state["timesteps"]
         start_index = int(state["next_step_index"])
+        if start_index >= len(timesteps):
+            raise RuntimeError(
+                f"Invalid resume step for request_key={state.get('request_key')}: "
+                f"start_index={start_index} >= timesteps_len={len(timesteps)}"
+            )
 
         self.scheduler.set_begin_index(start_index)
         self.transformer.do_true_cfg = state["do_true_cfg"]

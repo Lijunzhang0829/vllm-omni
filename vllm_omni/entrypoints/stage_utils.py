@@ -94,22 +94,37 @@ def set_stage_devices(
             mapped_devices_str = ",".join(mapped_devices)
             os.environ[STAGE_PHYSICAL_DEVICES_ENV_VAR] = mapped_devices_str
             if device_type == "npu":
-                local_devices = ",".join(str(i) for i in range(len(mapped_devices)))
-                os.environ[env_var] = local_devices
-                if toks:
-                    try:
-                        selected_physical = int(mapped_devices[0])
-                        logger.debug(
-                            "[Stage-%s] Set %s to %s for NPU local ranks; physical devices=%s; logical 0 -> physical %s",
-                            stage_id,
-                            env_var,
-                            local_devices,
-                            mapped_devices_str,
-                            selected_physical,
-                        )
-                    except Exception as e:
-                        logger.debug("[Stage-%s] Failed to parse first %s device: %s", stage_id, device_type, e)
-                        selected_physical = None
+                if len(mapped_devices) <= 1:
+                    os.environ[env_var] = mapped_devices_str
+                    if toks:
+                        try:
+                            selected_physical = int(mapped_devices[0])
+                            logger.debug(
+                                "[Stage-%s] Set %s to single NPU device %s",
+                                stage_id,
+                                env_var,
+                                mapped_devices_str,
+                            )
+                        except Exception as e:
+                            logger.debug("[Stage-%s] Failed to parse first %s device: %s", stage_id, device_type, e)
+                            selected_physical = None
+                else:
+                    local_devices = ",".join(str(i) for i in range(len(mapped_devices)))
+                    os.environ[env_var] = local_devices
+                    if toks:
+                        try:
+                            selected_physical = int(mapped_devices[0])
+                            logger.debug(
+                                "[Stage-%s] Set %s to %s for NPU local ranks; physical devices=%s; logical 0 -> physical %s",
+                                stage_id,
+                                env_var,
+                                local_devices,
+                                mapped_devices_str,
+                                selected_physical,
+                            )
+                        except Exception as e:
+                            logger.debug("[Stage-%s] Failed to parse first %s device: %s", stage_id, device_type, e)
+                            selected_physical = None
             else:
                 os.environ[env_var] = mapped_devices_str
                 if toks:
@@ -140,9 +155,9 @@ def set_stage_devices(
                 selected_physical = int(logical_idx)
             os.environ[STAGE_PHYSICAL_DEVICES_ENV_VAR] = str(selected_physical)
             if device_type == "npu":
-                os.environ[env_var] = "0"
+                os.environ[env_var] = str(selected_physical)
                 logger.debug(
-                    "[Stage-%s] Logical index %d -> physical %s; set %s to local NPU device 0",
+                    "[Stage-%s] Logical index %d -> physical %s; set %s to single NPU device",
                     stage_id,
                     logical_idx,
                     selected_physical,
@@ -163,9 +178,9 @@ def set_stage_devices(
             selected_physical = int(str(devices))
             os.environ[STAGE_PHYSICAL_DEVICES_ENV_VAR] = str(selected_physical)
             if device_type == "npu":
-                os.environ[env_var] = "0"
+                os.environ[env_var] = str(selected_physical)
                 logger.debug(
-                    "[Stage-%s] Set %s to local NPU device 0 (physical %s fallback)",
+                    "[Stage-%s] Set %s to single NPU device %s (fallback)",
                     stage_id,
                     env_var,
                     selected_physical,

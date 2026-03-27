@@ -31,7 +31,11 @@ def test_execute_model_caches_partial_scheduler_state_on_worker():
     worker = _make_worker()
     request = _make_request("req-1")
     resident_state = {"latents": object(), "completed_steps": 5}
-    worker.model_runner.execute_model.return_value = SimpleNamespace(finished=False, scheduler_state=resident_state)
+    worker.model_runner.execute_model.return_value = SimpleNamespace(
+        finished=False,
+        scheduler_state=resident_state,
+        request_key=None,
+    )
 
     output = worker.execute_model(request, worker.od_config)
 
@@ -45,7 +49,11 @@ def test_execute_model_restores_cached_scheduler_state_from_worker():
     request = _make_request("req-2")
     resident_state = {"latents": object(), "completed_steps": 3}
     worker._resident_scheduler_states["req-2"] = resident_state
-    worker.model_runner.execute_model.return_value = SimpleNamespace(finished=True, scheduler_state=None)
+    worker.model_runner.execute_model.return_value = SimpleNamespace(
+        finished=True,
+        scheduler_state=None,
+        request_key=None,
+    )
 
     worker.execute_model(request, worker.od_config)
 
@@ -59,7 +67,7 @@ def test_execute_model_attaches_shared_preempt_event_to_pipeline():
 
     def _execute(req):
         assert worker.model_runner.pipeline._interrupt_event is worker._preempt_event
-        return SimpleNamespace(finished=True, scheduler_state=None)
+        return SimpleNamespace(finished=True, scheduler_state=None, request_key=None)
 
     worker.model_runner.execute_model.side_effect = _execute
 
