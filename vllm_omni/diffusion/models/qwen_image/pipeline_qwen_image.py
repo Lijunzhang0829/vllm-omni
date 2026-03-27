@@ -675,6 +675,7 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin):
         }
         latents = state["latents"]
         completed_steps = 0
+        progress = getattr(self, "_active_completed_steps", None)
 
         for step_index in range(start_index, len(timesteps)):
             if completed_steps > 0 and self.interrupt:
@@ -717,6 +718,12 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin):
             )
             latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, state["do_true_cfg"])
             completed_steps += 1
+            if progress is not None:
+                try:
+                    if completed_steps > int(progress.value):
+                        progress.value = completed_steps
+                except (AttributeError, TypeError, ValueError):
+                    pass
 
             # Async preemption requests arrive out-of-band while the worker is
             # running. Yield on the next step boundary after the signal lands.

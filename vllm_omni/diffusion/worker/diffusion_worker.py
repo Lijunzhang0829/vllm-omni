@@ -74,6 +74,7 @@ class DiffusionWorker:
         self._sleep_saved_buffers: dict[str, torch.Tensor] = {}
         self._resident_scheduler_states: dict[str, dict[str, Any]] = {}
         self._preempt_event = None
+        self._active_completed_steps = None
         self.lora_manager: DiffusionLoRAManager | None = None
         self.init_device()
         # Create model runner
@@ -200,6 +201,7 @@ class DiffusionWorker:
         if pipeline is not None:
             pipeline._interrupt = False
             pipeline._interrupt_event = self._preempt_event if preemption_enabled else None
+            pipeline._active_completed_steps = getattr(self, "_active_completed_steps", None) if preemption_enabled else None
 
         try:
             output = self.model_runner.execute_model(req)
@@ -220,6 +222,7 @@ class DiffusionWorker:
             if pipeline is not None:
                 pipeline._interrupt = False
                 pipeline._interrupt_event = None
+                pipeline._active_completed_steps = None
 
     def _get_request_key(self, req: OmniDiffusionRequest) -> str:
         if req.request_ids:
@@ -367,6 +370,7 @@ class WorkerProc:
         control_pipe: mp.connection.Connection,
         broadcast_handle,
         preempt_event=None,
+        active_completed_steps=None,
         worker_extension_cls: str | None = None,
         custom_pipeline_args: dict[str, Any] | None = None,
     ):
@@ -394,6 +398,7 @@ class WorkerProc:
         # Create worker using WorkerWrapperBase for extension support
         self.worker = self._create_worker(gpu_id, od_config, worker_extension_cls, custom_pipeline_args)
         self.worker.worker._preempt_event = preempt_event
+        self.worker.worker._active_completed_steps = active_completed_steps
         self._running = True
 
     def _create_worker(
@@ -581,6 +586,7 @@ class WorkerProc:
         pipe_writer: mp.connection.Connection,
         broadcast_handle,
         preempt_event=None,
+        active_completed_steps=None,
         worker_extension_cls: str | None = None,
         custom_pipeline_args: dict[str, Any] | None = None,
     ) -> None:
@@ -594,6 +600,7 @@ class WorkerProc:
             control_pipe=pipe_writer,
             broadcast_handle=broadcast_handle,
             preempt_event=preempt_event,
+            active_completed_steps=active_completed_steps,
             worker_extension_cls=worker_extension_cls,
             custom_pipeline_args=custom_pipeline_args,
         )

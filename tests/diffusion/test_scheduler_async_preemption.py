@@ -1,6 +1,8 @@
 import threading
 from types import SimpleNamespace
 
+import pytest
+
 from vllm_omni.diffusion.scheduler import Scheduler
 from vllm_omni.diffusion.server_scheduling import PredictedLatencyPolicy
 from vllm_omni.diffusion.super_p95 import (
@@ -33,6 +35,7 @@ def _make_scheduler(model_class_name: str = "QwenImagePipeline"):
     sched._active_request_preemptible = False
     sched._active_preemption_requested = False
     sched._preempt_event = threading.Event()
+    sched._active_completed_steps = SimpleNamespace(value=0)
     sched.od_config = SimpleNamespace(model_class_name=model_class_name)
     return sched
 
@@ -114,10 +117,74 @@ def test_mark_and_clear_active_request_manage_preempt_event():
 
     sched._mark_active_request_locked(active)
     assert sched._preempt_event.is_set() is False
+    assert sched._active_completed_steps.value == 0
 
     sched._preempt_event.set()
+    sched._active_completed_steps.value = 7
     sched._clear_active_request_locked()
     assert sched._preempt_event.is_set() is False
+    assert sched._active_completed_steps.value == 0
+
+
+def test_arrival_uses_live_completed_steps_for_active_remaining():
+    sched = _make_scheduler()
+    active = sched._policy.add_request(_make_request("active", width=1024, height=1024, steps=25))
+    sched._policy.pop_next_request()
+    sched._mark_active_request_locked(active)
+    sched._active_completed_steps.value = 24
+    sched._policy.add_request(_make_request("new", width=512, height=512, steps=20))
+
+    should_preempt = sched._maybe_request_active_preemption_locked()
+
+    assert should_preempt is True
+    assert sched._active_preemption_requested is True
+
+
+def test_load_snapshot_uses_live_completed_steps_for_active_request():
+    sched = _make_scheduler()
+    active = sched._policy.add_request(_make_request("active", width=1024, height=1024, steps=25))
+    sched._policy.pop_next_request()
+    sched._mark_active_request_locked(active)
+    sched._active_completed_steps.value = 20
+
+    snapshot = sched.get_super_p95_load_snapshot()
+
+    assert snapshot.normal_load_s == pytest.approx(active.estimated_service_s * 5 / 25)
+    assert snapshot.sacrificial_load_s == 0.0
+
+
+def test_live_remaining_uses_dispatch_start_remaining_steps_after_requeue():
+    sched = _make_scheduler()
+    active = sched._policy.add_request(_make_request("active", width=1536, height=1536, steps=35))
+    sched._policy.pop_next_request()
+
+    active.remaining_steps = 15
+    active.remaining_service_s = active.estimated_service_s * 15 / 35
+    sched._mark_active_request_locked(active)
+    sched._active_completed_steps.value = 3
+
+    snapshot = sched.get_super_p95_load_snapshot()
+
+    assert snapshot.normal_load_s == pytest.approx(active.estimated_service_s * 12 / 35)
+
+
+def test_new_arrival_uses_effective_current_time_during_active_quantum():
+    sched = _make_scheduler()
+    active = sched._policy.add_request(_make_request("active", width=1024, height=1024, steps=25))
+    sched._policy.pop_next_request()
+    sched._mark_active_request_locked(active)
+    active.arrival_time_s = 0.0
+    active.total_steps = 25
+    active.remaining_steps = 25
+    active.dispatch_start_remaining_steps = 25
+    sched._active_completed_steps.value = 10
+
+    scheduled = sched._policy.add_request(
+        _make_request("new", width=512, height=512, steps=20),
+        arrival_time_s=sched._get_effective_current_time_s_locked(),
+    )
+
+    assert scheduled.arrival_time_s == pytest.approx(active.estimated_service_s * 10 / 25)
 
 
 def test_normal_pending_preempts_active_sacrificial_request():

@@ -72,6 +72,60 @@ def test_dispatcher_routes_to_lower_weighted_load_backend():
     assert decision.backend_index == 1
 
 
+def test_normal_request_ignores_sacrificial_load_when_routing():
+    dispatcher = SuperP95Dispatcher(
+        backend_urls=["http://backend-0", "http://backend-1"],
+        backend_hardware_profiles=None,
+        quota_every=20,
+        quota_amount=1,
+        threshold_ratio=0.8,
+        sacrificial_load_factor=0.1,
+        request_timeout_s=30.0,
+    )
+    dispatcher.backends[0].normal_load_s = 5.0
+    dispatcher.backends[0].sacrificial_load_s = 1000.0
+    dispatcher.backends[1].normal_load_s = 6.0
+    dispatcher.backends[1].sacrificial_load_s = 0.0
+
+    async def _run():
+        return await dispatcher._choose_backend(
+            "/v1/chat/completions",
+            {"extra_body": {"width": 768, "height": 768, "num_inference_steps": 20}},
+        )
+
+    decision = asyncio.run(_run())
+
+    assert decision.is_sacrificial is False
+    assert decision.backend_index == 0
+
+
+def test_sacrificial_request_uses_weighted_total_load_when_routing():
+    dispatcher = SuperP95Dispatcher(
+        backend_urls=["http://backend-0", "http://backend-1"],
+        backend_hardware_profiles=None,
+        quota_every=1,
+        quota_amount=1,
+        threshold_ratio=0.0,
+        sacrificial_load_factor=0.1,
+        request_timeout_s=30.0,
+    )
+    dispatcher.backends[0].normal_load_s = 5.0
+    dispatcher.backends[0].sacrificial_load_s = 1000.0
+    dispatcher.backends[1].normal_load_s = 6.0
+    dispatcher.backends[1].sacrificial_load_s = 0.0
+
+    async def _run():
+        return await dispatcher._choose_backend(
+            "/v1/chat/completions",
+            {"extra_body": {"width": 1536, "height": 1536, "num_inference_steps": 35}},
+        )
+
+    decision = asyncio.run(_run())
+
+    assert decision.is_sacrificial is True
+    assert decision.backend_index == 1
+
+
 def test_build_forward_headers_includes_super_p95_metadata():
     headers = SuperP95Dispatcher._build_forward_headers(
         {"Authorization": "Bearer test", "Host": "ignored"},

@@ -6,6 +6,7 @@ from __future__ import annotations
 import os
 import threading
 from multiprocessing.synchronize import Event as MpEvent
+from typing import Any
 
 import zmq
 from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
@@ -28,7 +29,12 @@ logger = init_logger(__name__)
 
 
 class Scheduler:
-    def initialize(self, od_config: OmniDiffusionConfig, preempt_event: MpEvent | None = None):
+    def initialize(
+        self,
+        od_config: OmniDiffusionConfig,
+        preempt_event: MpEvent | None = None,
+        active_completed_steps: Any | None = None,
+    ):
         existing_mq = getattr(self, "mq", None)
         if existing_mq is not None and not existing_mq.closed:
             logger.warning("SyncSchedulerClient is already initialized. Re-initializing.")
@@ -54,6 +60,7 @@ class Scheduler:
         self._active_request_preemptible = False
         self._active_preemption_requested = False
         self._preempt_event = preempt_event
+        self._active_completed_steps = active_completed_steps
 
         if self._server_scheduling_enabled:
             self._policy = PredictedLatencyPolicy(
@@ -127,7 +134,10 @@ class Scheduler:
         should_preempt = False
         with self._pending_cv:
             assert self._policy is not None
-            scheduled = self._policy.add_request(request)
+            scheduled = self._policy.add_request(
+                request,
+                arrival_time_s=self._get_effective_current_time_s_locked(),
+            )
             should_preempt = self._maybe_request_active_preemption_locked()
             self._pending_cv.notify_all()
         if should_preempt and self._preempt_event is not None:
@@ -221,6 +231,8 @@ class Scheduler:
         preemptible = self._supports_async_preemption(request)
         if self._preempt_event is not None:
             self._preempt_event.clear()
+        self._set_active_completed_steps(0)
+        scheduled.dispatch_start_remaining_steps = max(int(scheduled.remaining_steps), 0)
         self._active_scheduled = scheduled
         self._active_request_preemptible = preemptible
         self._active_preemption_requested = False
@@ -228,6 +240,7 @@ class Scheduler:
     def _clear_active_request_locked(self) -> None:
         if self._preempt_event is not None:
             self._preempt_event.clear()
+        self._set_active_completed_steps(0)
         self._active_scheduled = None
         self._active_request_preemptible = False
         self._active_preemption_requested = False
@@ -243,7 +256,22 @@ class Scheduler:
             return False
 
         best_pending = self._policy.peek_next_request()
-        if best_pending is None or not self._policy.request_outranks(best_pending, self._active_scheduled):
+        if best_pending is None:
+            return False
+
+        active_remaining_s = self._get_active_remaining_service_s_locked()
+        active = self._active_scheduled
+        original_remaining_s = active.remaining_service_s
+        original_sort_key = active.sort_key
+        active.remaining_service_s = active_remaining_s
+        active.refresh_sort_key()
+        try:
+            outranks = self._policy.request_outranks(best_pending, active)
+        finally:
+            active.remaining_service_s = original_remaining_s
+            active.sort_key = original_sort_key
+
+        if not outranks:
             return False
 
         logger.info(
@@ -256,6 +284,62 @@ class Scheduler:
         self._active_preemption_requested = True
         return True
 
+    def _get_effective_current_time_s_locked(self) -> float:
+        assert self._policy is not None
+        return self._policy.current_time_s + self._get_active_elapsed_service_s_locked()
+
+    def _get_active_elapsed_service_s_locked(self) -> float:
+        active = self._active_scheduled
+        if active is None:
+            return 0.0
+
+        completed_steps = self._get_active_completed_steps()
+        if completed_steps <= 0:
+            return 0.0
+
+        total_steps = max(int(active.total_steps), 1)
+        dispatch_start_remaining_steps = max(
+            int(getattr(active, "dispatch_start_remaining_steps", active.remaining_steps)),
+            0,
+        )
+        completed_in_quantum = min(completed_steps, dispatch_start_remaining_steps)
+        return active.estimated_service_s * completed_in_quantum / total_steps
+
+    def _get_active_remaining_service_s_locked(self) -> float:
+        active = self._active_scheduled
+        if active is None:
+            return 0.0
+
+        completed_steps = self._get_active_completed_steps()
+        total_steps = max(int(active.total_steps), 1)
+        if completed_steps <= 0:
+            return active.remaining_service_s
+
+        dispatch_start_remaining_steps = max(
+            int(getattr(active, "dispatch_start_remaining_steps", active.remaining_steps)),
+            0,
+        )
+        remaining_steps = max(dispatch_start_remaining_steps - min(completed_steps, dispatch_start_remaining_steps), 0)
+        return active.estimated_service_s * remaining_steps / total_steps
+
+    def _get_active_completed_steps(self) -> int:
+        progress = getattr(self, "_active_completed_steps", None)
+        if progress is None:
+            return 0
+        try:
+            return max(int(progress.value), 0)
+        except (AttributeError, TypeError, ValueError):
+            return 0
+
+    def _set_active_completed_steps(self, completed_steps: int) -> None:
+        progress = getattr(self, "_active_completed_steps", None)
+        if progress is None:
+            return
+        try:
+            progress.value = max(int(completed_steps), 0)
+        except (AttributeError, TypeError, ValueError):
+            return
+
     def get_super_p95_load_snapshot(self) -> SuperP95LoadSnapshot:
         with self._pending_cv:
             if not self._server_scheduling_enabled or self._policy is None:
@@ -267,7 +351,7 @@ class Scheduler:
             if self._active_scheduled is None:
                 return snapshot
 
-            active_remaining_s = self._active_scheduled.remaining_service_s
+            active_remaining_s = self._get_active_remaining_service_s_locked()
             if self._active_scheduled.is_sacrificial:
                 return SuperP95LoadSnapshot(
                     normal_load_s=snapshot.normal_load_s,

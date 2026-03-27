@@ -176,6 +176,7 @@ class ScheduledRequest:
     remaining_service_s: float = field(compare=False)
     total_steps: int = field(compare=False, default=1)
     remaining_steps: int = field(compare=False, default=1)
+    dispatch_start_remaining_steps: int = field(compare=False, default=1)
     is_sacrificial: bool = field(compare=False, default=False)
     output: object | None = field(default=None, compare=False)
     error: BaseException | None = field(default=None, compare=False)
@@ -201,7 +202,12 @@ class PredictedLatencyPolicy:
         self._sacrificial_load_s = 0.0
         self._hardware_profile = normalize_super_p95_hardware_profile(hardware_profile)
 
-    def add_request(self, request: OmniDiffusionRequest) -> ScheduledRequest:
+    def add_request(
+        self,
+        request: OmniDiffusionRequest,
+        *,
+        arrival_time_s: float | None = None,
+    ) -> ScheduledRequest:
         extra_args = getattr(request.sampling_params, "extra_args", None)
         is_sacrificial, estimated_service_s = get_super_p95_request_metadata(extra_args)
         if estimated_service_s is None:
@@ -209,12 +215,13 @@ class PredictedLatencyPolicy:
         total_steps = max(int(request.sampling_params.num_inference_steps or 1), 1)
         scheduled = ScheduledRequest(
             arrival_seq=self._arrival_seq,
-            arrival_time_s=self.current_time_s,
+            arrival_time_s=self.current_time_s if arrival_time_s is None else arrival_time_s,
             request=request,
             estimated_service_s=estimated_service_s,
             remaining_service_s=estimated_service_s,
             total_steps=total_steps,
             remaining_steps=total_steps,
+            dispatch_start_remaining_steps=total_steps,
             is_sacrificial=is_sacrificial,
         )
         self._arrival_seq += 1

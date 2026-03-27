@@ -64,14 +64,23 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         self._pipe_reader_stop = False
         self._pipe_reader_thread: threading.Thread | None = None
         preempt_event = self._mp_ctx.Event()
+        active_completed_steps = self._mp_ctx.Value("i", 0, lock=False)
 
         # Initialize scheduler
         self.scheduler = Scheduler()
-        self.scheduler.initialize(self.od_config, preempt_event=preempt_event)
+        self.scheduler.initialize(
+            self.od_config,
+            preempt_event=preempt_event,
+            active_completed_steps=active_completed_steps,
+        )
         broadcast_handle = self.scheduler.get_broadcast_handle()
 
         # Launch workers
-        processes, result_handle, scheduler_pipe_readers = self._launch_workers(broadcast_handle, preempt_event)
+        processes, result_handle, scheduler_pipe_readers = self._launch_workers(
+            broadcast_handle,
+            preempt_event,
+            active_completed_steps,
+        )
 
         if result_handle is not None:
             self.scheduler.initialize_result_queue(result_handle)
@@ -94,7 +103,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         )
         self._finalizer = weakref.finalize(self, self.resources)
 
-    def _launch_workers(self, broadcast_handle, preempt_event):
+    def _launch_workers(self, broadcast_handle, preempt_event, active_completed_steps):
         od_config = self.od_config
         logger.info("Starting server...")
 
@@ -120,6 +129,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                     writer,
                     broadcast_handle,
                     preempt_event,
+                    active_completed_steps,
                     worker_extension_cls,
                     custom_pipeline_args,
                 ),

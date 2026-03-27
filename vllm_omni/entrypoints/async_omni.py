@@ -179,9 +179,11 @@ class AsyncOmni(OmniBase):
                     "max_batch_size": 1,
                 },
                 "engine_args": {
+                    "port": kwargs.get("port"),
                     "parallel_config": parallel_config,
                     "vae_use_slicing": kwargs.get("vae_use_slicing", False),
                     "vae_use_tiling": kwargs.get("vae_use_tiling", False),
+                    "super_p95_hardware_profile": kwargs.get("super_p95_hardware_profile"),
                     "cache_backend": cache_backend,
                     "cache_config": cache_config,
                     "enable_cache_dit_summary": kwargs.get("enable_cache_dit_summary", False),
