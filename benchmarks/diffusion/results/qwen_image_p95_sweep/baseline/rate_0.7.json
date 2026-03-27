@@ -1,0 +1,61 @@
+{
+  "duration": 1148.8192261457443,
+  "completed_requests": 500,
+  "failed_requests": 0,
+  "throughput_qps": 0.43522948486637514,
+  "latency_mean": 195.49599790129065,
+  "latency_median": 189.5820648111403,
+  "latency_p99": 439.67761610616,
+  "latency_p95": 391.2474322721362,
+  "latency_p50": 189.5820648111403,
+  "peak_memory_mb_max": 0,
+  "peak_memory_mb_mean": 0,
+  "peak_memory_mb_median": 0,
+  "generated_at_utc": "2026-03-27T12:49:19.189294+00:00",
+  "run_label": "baseline",
+  "base_url": "http://127.0.0.1:8080",
+  "backend": "vllm-omni",
+  "model": "Qwen/Qwen-Image",
+  "dataset": "random",
+  "task": "t2i",
+  "request_rate": 0.7,
+  "traffic_schedule": "fixed_interval",
+  "num_prompts": 500,
+  "max_concurrency": 1000,
+  "client_timeout_s": 1000000.0,
+  "warmup_requests": 1,
+  "warmup_num_inference_steps": 1,
+  "seed": 0,
+  "random_request_seed": 8,
+  "width": null,
+  "height": null,
+  "num_frames": null,
+  "num_inference_steps": 50,
+  "fps": null,
+  "random_request_config": [
+    {
+      "width": 512,
+      "height": 512,
+      "num_inference_steps": 20,
+      "weight": 0.15
+    },
+    {
+      "width": 768,
+      "height": 768,
+      "num_inference_steps": 20,
+      "weight": 0.25
+    },
+    {
+      "width": 1024,
+      "height": 1024,
+      "num_inference_steps": 25,
+      "weight": 0.45
+    },
+    {
+      "width": 1536,
+      "height": 1536,
+      "num_inference_steps": 35,
+      "weight": 0.15
+    }
+  ]
+}
