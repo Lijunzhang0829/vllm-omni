@@ -65,14 +65,6 @@ class BackendState:
             self.name,
         )
 
-    def normal_score_tuple(self) -> tuple[float, int, float, str]:
-        return (
-            self.normal_load_s,
-            self.inflight_normal_requests,
-            self.latency_ema_s,
-            self.name,
-        )
-
 
 @dataclass(frozen=True)
 class DispatchDecision:
@@ -524,16 +516,10 @@ class SuperP95Dispatcher:
             if is_sacrificial:
                 self.credits -= 1
 
-            if is_sacrificial:
-                backend_index = min(
-                    range(len(self.backends)),
-                    key=lambda idx: self.backends[idx].score_tuple(self.sacrificial_load_factor),
-                )
-            else:
-                backend_index = min(
-                    range(len(self.backends)),
-                    key=lambda idx: self.backends[idx].normal_score_tuple(),
-                )
+            backend_index = min(
+                range(len(self.backends)),
+                key=lambda idx: self.backends[idx].score_tuple(self.sacrificial_load_factor),
+            )
             backend = self.backends[backend_index]
             selected_estimated_service_s = estimated_service_s_by_backend[backend_index]
             if is_sacrificial:

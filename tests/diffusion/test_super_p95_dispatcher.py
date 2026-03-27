@@ -72,7 +72,7 @@ def test_dispatcher_routes_to_lower_weighted_load_backend():
     assert decision.backend_index == 1
 
 
-def test_normal_request_ignores_sacrificial_load_when_routing():
+def test_normal_request_uses_weighted_total_load_when_routing():
     dispatcher = SuperP95Dispatcher(
         backend_urls=["http://backend-0", "http://backend-1"],
         backend_hardware_profiles=None,
@@ -96,7 +96,7 @@ def test_normal_request_ignores_sacrificial_load_when_routing():
     decision = asyncio.run(_run())
 
     assert decision.is_sacrificial is False
-    assert decision.backend_index == 0
+    assert decision.backend_index == 1
 
 
 def test_sacrificial_request_uses_weighted_total_load_when_routing():
