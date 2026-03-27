@@ -33,6 +33,31 @@ vllm serve Wan-AI/Wan2.2-T2V-A14B-Diffusers --omni \
     --port 8091
 ```
 
+### 3.1.1 NPU 2-card Serving Command (910B2)
+
+Current NPU validation was done on two `910B2` cards with:
+
+- `--usp 2`
+- `--enable-layerwise-offload`
+- `--boundary-ratio 0.875`
+
+```bash
+export ASCEND_RT_VISIBLE_DEVICES=1,5
+export VLLM_PLUGINS=ascend
+export HF_HUB_OFFLINE=1
+vllm serve Wan-AI/Wan2.2-T2V-A14B-Diffusers --omni \
+    --port 8091 \
+    --usp 2 \
+    --enable-layerwise-offload \
+    --boundary-ratio 0.875
+```
+
+Notes:
+
+* This model starts much more slowly than Qwen-Image. Wait for `/health` to return `200`.
+* In this environment, the visible physical NPU ids are `1,5`, while the stage runtime uses local logical ids `0,1`.
+* For online T2V requests, use `flow_shift=12.0` for `480p` and `flow_shift=5.0` for `720p`.
+
 ## 3.2 Key Parameters
 
 | Parameter             | Description              |
@@ -127,9 +152,32 @@ python benchmarks/diffusion/diffusion_benchmark_serving.py \
     --max-concurrency 1 \
     --enable-negative-prompt \
     --random-request-config '[
-        {"width":854,"height":480,"num_inference_steps":18,"num_frames": 33,"fps":16",weight":1}
+        {"width":854,"height":480,"num_inference_steps":3,"num_frames":80,"fps":16,"boundary_ratio":0.875,"flow_shift":12.0,"weight":1}
     ]'
 ```
+
+---
+
+## 5.3 Minimal Client Validation Command
+
+The current `/v1/videos` serving path is synchronous: a single `POST /v1/videos` returns `200` with the generated video in `data[0].b64_json`.
+
+```bash
+env NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost \
+curl --noproxy "*" -sS -X POST http://127.0.0.1:8091/v1/videos \
+  -F "prompt=A calm river flowing through a forest in spring" \
+  -F "width=854" \
+  -F "height=480" \
+  -F "num_frames=80" \
+  -F "fps=16" \
+  -F "num_inference_steps=3" \
+  -F "boundary_ratio=0.875" \
+  -F "flow_shift=12.0" \
+  -F "seed=0" \
+  -o /tmp/wan22_req_480_3_80.json
+```
+
+The benchmark client also supports these request-level fields through `--random-request-config`.
 
 ---
 
@@ -154,6 +202,26 @@ The following metrics are collected during benchmarking:
 | Dataset B | 1 | 2 | 2 | 1 | On | 4          | 117.44          | 117.44          |
 | Dataset C | 1 | 2 | 2 | 1 | On | 1          | 79.2175        | 124.2565 |
 | Dataset C | 1 | 2 | 2 | 1 | On | 4          | 74.4977        | 117.710 |
+---
+
+## 7.1 Current NPU 910B2 Single-Request Timings
+
+Measured on the 2-card NPU serving command above, with:
+
+* model: `Wan-AI/Wan2.2-T2V-A14B-Diffusers`
+* hardware: `910B2`
+* serving: `--usp 2 --enable-layerwise-offload`
+* client: `backend=v1/videos`, `num-prompts=1`, `max-concurrency=1`, `warmup-requests=0`
+
+| Width | Height | Steps | Frames | FPS | flow_shift | Latency (s) |
+|-------|--------|-------|--------|-----|------------|-------------|
+| 854 | 480 | 3 | 80 | 16 | 12.0 | 61.94 |
+| 854 | 480 | 4 | 120 | 24 | 12.0 | 118.07 |
+| 1280 | 720 | 6 | 80 | 16 | 5.0 | 305.52 |
+
+These are the current `910B2` service-time anchors for Wan2.2.
+`910B3` remains unset for now and should be filled with measured data later.
+
 ---
 
 # 8. Reproducibility Checklist

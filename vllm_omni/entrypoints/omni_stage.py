@@ -42,6 +42,7 @@ from vllm_omni.entrypoints.async_omni_llm import AsyncOmniLLM
 from vllm_omni.entrypoints.omni_diffusion import OmniDiffusion
 from vllm_omni.entrypoints.omni_llm import OmniLLM
 from vllm_omni.entrypoints.stage_utils import (
+    STAGE_PHYSICAL_DEVICES_ENV_VAR,
     SHUTDOWN_TASK,
     OmniStageTaskType,
     _resolve_model_tokenizer_paths,
@@ -118,7 +119,7 @@ def _sequential_init_lock(engine_args: dict[str, Any], stage_init_timeout: int =
 
     # Get physical device IDs from device control env var
     device_control_env = current_omni_platform.device_control_env_var
-    visible_devices_str = os.environ.get(device_control_env)
+    visible_devices_str = os.environ.get(STAGE_PHYSICAL_DEVICES_ENV_VAR) or os.environ.get(device_control_env)
     physical_devices = []
 
     if visible_devices_str:

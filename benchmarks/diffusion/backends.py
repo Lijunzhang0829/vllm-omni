@@ -255,6 +255,17 @@ async def async_request_v1_videos(
         async with session.post(input.api_url, data=form) as response:
             if response.status == 200:
                 resp_json = await response.json()
+                output.response_body = resp_json
+                if "peak_memory_mb" in resp_json:
+                    output.peak_memory_mb = resp_json["peak_memory_mb"]
+                if isinstance(resp_json.get("data"), list):
+                    output.success = True
+                    output.latency = time.perf_counter() - output.start_time
+                    if output.success and input.slo_ms is not None:
+                        output.slo_achieved = (output.latency * 1000.0) <= float(input.slo_ms)
+                    if pbar:
+                        pbar.update(1)
+                    return output
                 job_id = resp_json.get("id")
                 job_status = resp_json.get("status")
                 if not job_id or not job_status:
@@ -268,7 +279,7 @@ async def async_request_v1_videos(
 
         # invoke a poll request (GET /v1/videos/{video_id})
         poll_interval = 2.0  # Unit(s)
-        timeout_seconds = 600.0
+        timeout_seconds = 10000.0
         deadline = time.perf_counter() + timeout_seconds
         job_url = f"{input.api_url}/{job_id}"
 

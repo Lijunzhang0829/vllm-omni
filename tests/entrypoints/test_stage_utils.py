@@ -4,7 +4,7 @@ import sys
 import pytest
 from pytest_mock import MockerFixture
 
-from vllm_omni.entrypoints.stage_utils import set_stage_devices
+from vllm_omni.entrypoints.stage_utils import STAGE_PHYSICAL_DEVICES_ENV_VAR, set_stage_devices
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -109,4 +109,5 @@ def test_set_stage_devices_npu_platform(mocker: MockerFixture, monkeypatch: pyte
 
     set_stage_devices(stage_id=0, devices="0,1")
 
-    assert os.environ["ASCEND_RT_VISIBLE_DEVICES"] == "4,5"
+    assert os.environ["ASCEND_RT_VISIBLE_DEVICES"] == "0,1"
+    assert os.environ[STAGE_PHYSICAL_DEVICES_ENV_VAR] == "4,5"

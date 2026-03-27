@@ -595,7 +595,9 @@ class RandomDataset(BaseDataset):
         }
         if self._sampled_requests:
             profile = self._sampled_requests[idx]
-            params.update(profile)
+            known_param_keys = {"width", "height", "num_frames", "num_inference_steps", "fps"}
+            params.update({k: v for k, v in profile.items() if k in known_param_keys})
+            extra_body.update({k: v for k, v in profile.items() if k not in known_param_keys})
         return RequestFuncInput(
             prompt=f"Random prompt {idx} for benchmarking diffusion models",
             api_url=self.api_url,
@@ -804,6 +806,7 @@ def build_metrics_metadata(args: argparse.Namespace) -> dict[str, Any]:
         "traffic_schedule": "fixed_interval" if args.request_rate != float("inf") else "all_at_once",
         "num_prompts": args.num_prompts,
         "max_concurrency": args.max_concurrency,
+        "client_timeout_s": args.client_timeout_s,
         "warmup_requests": args.warmup_requests,
         "warmup_num_inference_steps": args.warmup_num_inference_steps,
         "seed": args.seed,
@@ -898,7 +901,7 @@ async def benchmark(args):
     # Run benchmark
     pbar = tqdm(total=len(requests_list), disable=args.disable_tqdm)
 
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=args.client_timeout_s)) as session:
         warmup_pairs: list[tuple[RequestFuncInput, RequestFuncOutput]] = []
         if args.warmup_requests and requests_list:
             print(
@@ -1080,6 +1083,12 @@ if __name__ == "__main__":
     )
     parser.add_argument("--fps", type=int, default=None, help="FPS (for video).")
     parser.add_argument("--output-file", type=str, default=None, help="Output JSON file for metrics.")
+    parser.add_argument(
+        "--client-timeout-s",
+        type=float,
+        default=10000.0,
+        help="Total client-side HTTP timeout in seconds for each benchmark request.",
+    )
     parser.add_argument(
         "--run-label",
         type=str,
