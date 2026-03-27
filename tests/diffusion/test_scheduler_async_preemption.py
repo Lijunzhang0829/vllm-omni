@@ -23,8 +23,9 @@ def _make_request(request_id: str, *, width: int, height: int, steps: int):
     )
 
 
-def _make_scheduler():
+def _make_scheduler(model_class_name: str = "QwenImagePipeline"):
     sched = object.__new__(Scheduler)
+    sched._server_scheduling_enabled = True
     sched._pending_cv = threading.Condition()
     sched._policy = PredictedLatencyPolicy()
     sched._preemption_enabled = True
@@ -32,7 +33,7 @@ def _make_scheduler():
     sched._active_request_preemptible = False
     sched._active_preemption_requested = False
     sched._preempt_event = threading.Event()
-    sched.od_config = SimpleNamespace(model_class_name="QwenImagePipeline")
+    sched.od_config = SimpleNamespace(model_class_name=model_class_name)
     return sched
 
 
@@ -89,6 +90,20 @@ def test_arrival_only_requests_preemption_once_per_active_request():
 
     assert first is True
     assert second is False
+
+
+def test_wan22_pipeline_is_treated_as_async_preemptible():
+    sched = _make_scheduler(model_class_name="Wan22Pipeline")
+    req = _make_request("wan", width=854, height=480, steps=3)
+
+    assert sched._supports_async_preemption(req) is True
+
+
+def test_wan_pipeline_is_treated_as_async_preemptible():
+    sched = _make_scheduler(model_class_name="WanPipeline")
+    req = _make_request("wan", width=854, height=480, steps=3)
+
+    assert sched._supports_async_preemption(req) is True
 
 
 def test_mark_and_clear_active_request_manage_preempt_event():
@@ -183,3 +198,17 @@ def test_direct_mode_tracks_authoritative_load_while_request_is_running():
     final_snapshot = sched.get_super_p95_load_snapshot()
     assert final_snapshot.normal_load_s == 0.0
     assert final_snapshot.sacrificial_load_s == 0.0
+
+
+def test_get_super_p95_load_snapshot_includes_active_remaining_work():
+    sched = _make_scheduler()
+    pending = sched._policy.add_request(_make_request("pending", width=512, height=512, steps=20))
+    active = sched._policy.add_request(_make_request("active", width=1536, height=1536, steps=35))
+    popped = sched._policy.pop_next_request()
+    assert popped is active
+    sched._mark_active_request_locked(active)
+
+    snapshot = sched.get_super_p95_load_snapshot()
+
+    assert snapshot.normal_load_s == active.remaining_service_s + pending.remaining_service_s
+    assert snapshot.sacrificial_load_s == 0.0

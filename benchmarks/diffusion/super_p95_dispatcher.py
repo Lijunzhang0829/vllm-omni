@@ -22,6 +22,7 @@ import httpx
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
+from starlette.datastructures import FormData, UploadFile
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -421,6 +422,51 @@ class SuperP95Dispatcher:
             media_type=response.headers.get("content-type"),
         )
 
+    async def dispatch_form(self, path: str, form: FormData, incoming_headers: dict[str, str]) -> Response:
+        body = _form_to_estimation_dict(form)
+        decision = await self._choose_backend(path, body)
+        backend = self.backends[decision.backend_index]
+        headers = self._build_forward_headers(incoming_headers, decision)
+        headers.pop("content-type", None)
+
+        data: dict[str, str] = {}
+        files: dict[str, tuple[str, bytes, str]] = {}
+        for key, value in form.multi_items():
+            if isinstance(value, UploadFile):
+                payload = await value.read()
+                files[key] = (
+                    value.filename or "upload.bin",
+                    payload,
+                    value.content_type or "application/octet-stream",
+                )
+            else:
+                data[key] = str(value)
+
+        start_time = time.perf_counter()
+        try:
+            response = await asyncio.to_thread(
+                _post_form_sync,
+                base_url=backend.base_url,
+                path=path,
+                data=data,
+                files=files or None,
+                headers=headers,
+                timeout_s=self.request_timeout_s,
+            )
+        except Exception:
+            elapsed_s = time.perf_counter() - start_time
+            await self._mark_failed_response(decision, elapsed_s)
+            raise
+
+        elapsed_s = time.perf_counter() - start_time
+        await self._apply_response_feedback(decision, response.headers, elapsed_s)
+        return Response(
+            content=response.content,
+            status_code=response.status_code,
+            headers=self._filter_response_headers(response.headers),
+            media_type=response.headers.get("content-type"),
+        )
+
     async def proxy_models(self) -> Response:
         backend = self.backends[0]
         assert self._client is not None
@@ -576,6 +622,16 @@ class SuperP95Dispatcher:
                 hardware_profile=hardware_profile,
             )
 
+        if path == "/v1/videos":
+            width, height = _parse_size(body.get("size"))
+            return _estimate_service_s_from_values(
+                width=body.get("width", width),
+                height=body.get("height", height),
+                num_inference_steps=body.get("num_inference_steps"),
+                num_frames=body.get("num_frames"),
+                hardware_profile=hardware_profile,
+            )
+
         raise HTTPException(status_code=400, detail=f"Unsupported super_p95 path: {path}")
 
 
@@ -607,6 +663,33 @@ def _estimate_service_s_from_values(
     return estimate_service_time_s(request, hardware_profile=hardware_profile)
 
 
+def _form_to_estimation_dict(form: FormData) -> dict[str, Any]:
+    body: dict[str, Any] = {}
+    for key, value in form.multi_items():
+        if isinstance(value, UploadFile):
+            continue
+        body[key] = value
+    return body
+
+
+def _post_form_sync(
+    *,
+    base_url: str,
+    path: str,
+    data: dict[str, str],
+    files: dict[str, tuple[str, bytes, str]] | None,
+    headers: dict[str, str],
+    timeout_s: float,
+) -> httpx.Response:
+    with httpx.Client(timeout=timeout_s, trust_env=False) as client:
+        return client.post(
+            f"{base_url}{path}",
+            data=data,
+            files=files,
+            headers=headers,
+        )
+
+
 def build_app(dispatcher: SuperP95Dispatcher) -> FastAPI:
     app = FastAPI(title="super_p95 dispatcher")
 
@@ -635,6 +718,11 @@ def build_app(dispatcher: SuperP95Dispatcher) -> FastAPI:
     async def image_generations(request: Request) -> Response:
         body = await request.json()
         return await dispatcher.dispatch_json("/v1/images/generations", body, dict(request.headers))
+
+    @app.post("/v1/videos")
+    async def videos(request: Request) -> Response:
+        form = await request.form()
+        return await dispatcher.dispatch_form("/v1/videos", form, dict(request.headers))
 
     return app
 

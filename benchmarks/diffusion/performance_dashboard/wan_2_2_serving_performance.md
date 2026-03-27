@@ -33,21 +33,21 @@ vllm serve Wan-AI/Wan2.2-T2V-A14B-Diffusers --omni \
     --port 8091
 ```
 
-### 3.1.1 NPU 2-card Serving Command (910B2)
+### 3.1.1 NPU 4-card Serving Command (910B2)
 
-Current NPU validation was done on two `910B2` cards with:
+Current NPU validation was done on four `910B2` cards with:
 
-- `--usp 2`
+- `--usp 4`
 - `--enable-layerwise-offload`
 - `--boundary-ratio 0.875`
 
 ```bash
-export ASCEND_RT_VISIBLE_DEVICES=1,5
+export ASCEND_RT_VISIBLE_DEVICES=1,2,3,5
 export VLLM_PLUGINS=ascend
 export HF_HUB_OFFLINE=1
 vllm serve Wan-AI/Wan2.2-T2V-A14B-Diffusers --omni \
     --port 8091 \
-    --usp 2 \
+    --usp 4 \
     --enable-layerwise-offload \
     --boundary-ratio 0.875
 ```
@@ -55,8 +55,56 @@ vllm serve Wan-AI/Wan2.2-T2V-A14B-Diffusers --omni \
 Notes:
 
 * This model starts much more slowly than Qwen-Image. Wait for `/health` to return `200`.
-* In this environment, the visible physical NPU ids are `1,5`, while the stage runtime uses local logical ids `0,1`.
+* In this environment, the visible physical NPU ids are `1,2,3,5`, while the stage runtime uses local logical ids `0,1,2,3`.
 * For online T2V requests, use `flow_shift=12.0` for `480p` and `flow_shift=5.0` for `720p`.
+
+### 3.1.2 Current 4-card Validation Modes
+
+Current `Wan2.2` validation uses a single 4-card server instance. The root script
+[`eval_wan22.sh`](/root/vllm-omni/eval_wan22.sh) only launches the client benchmark. Start the
+matching server manually first.
+
+Baseline:
+
+```bash
+export ASCEND_RT_VISIBLE_DEVICES=1,2,3,5
+export VLLM_PLUGINS=ascend
+export HF_HUB_OFFLINE=1
+export NO_PROXY=127.0.0.1,localhost
+export no_proxy=127.0.0.1,localhost
+export VLLM_OMNI_ENABLE_DIFFUSION_SERVER_SCHEDULING=0
+export VLLM_OMNI_ENABLE_DIFFUSION_PREEMPTION=0
+vllm serve Wan-AI/Wan2.2-T2V-A14B-Diffusers --omni \
+    --port 8091 \
+    --usp 4 \
+    --enable-layerwise-offload \
+    --boundary-ratio 0.875 \
+    --super-p95-hardware-profile 910B2
+```
+
+Async-preemption / local `super_p95` validation:
+
+```bash
+export ASCEND_RT_VISIBLE_DEVICES=1,2,3,5
+export VLLM_PLUGINS=ascend
+export HF_HUB_OFFLINE=1
+export NO_PROXY=127.0.0.1,localhost
+export no_proxy=127.0.0.1,localhost
+export VLLM_OMNI_ENABLE_DIFFUSION_SERVER_SCHEDULING=1
+export VLLM_OMNI_ENABLE_DIFFUSION_PREEMPTION=1
+vllm serve Wan-AI/Wan2.2-T2V-A14B-Diffusers --omni \
+    --port 8091 \
+    --usp 4 \
+    --enable-layerwise-offload \
+    --boundary-ratio 0.875 \
+    --super-p95-hardware-profile 910B2 \
+    --vae-use-slicing
+```
+
+Notes:
+
+* `--vae-use-slicing` is currently required for the async-preemption path; without it, the `1280x720, 6 steps, 80 frames` request can still OOM in `vae.decode(...)`.
+* `vae tiling` remains enabled by the current Wan registry path and should stay enabled.
 
 ## 3.2 Key Parameters
 
@@ -206,21 +254,48 @@ The following metrics are collected during benchmarking:
 
 ## 7.1 Current NPU 910B2 Single-Request Timings
 
-Measured on the 2-card NPU serving command above, with:
+Measured on the 4-card NPU serving command above, with:
 
 * model: `Wan-AI/Wan2.2-T2V-A14B-Diffusers`
 * hardware: `910B2`
-* serving: `--usp 2 --enable-layerwise-offload`
+* serving: `--usp 4 --enable-layerwise-offload`
 * client: `backend=v1/videos`, `num-prompts=1`, `max-concurrency=1`, `warmup-requests=0`
 
 | Width | Height | Steps | Frames | FPS | flow_shift | Latency (s) |
 |-------|--------|-------|--------|-----|------------|-------------|
-| 854 | 480 | 3 | 80 | 16 | 12.0 | 61.94 |
-| 854 | 480 | 4 | 120 | 24 | 12.0 | 118.07 |
-| 1280 | 720 | 6 | 80 | 16 | 5.0 | 305.52 |
+| 854 | 480 | 3 | 80 | 16 | 12.0 | 43.61 |
+| 854 | 480 | 4 | 120 | 24 | 12.0 | 90.17 |
+| 1280 | 720 | 6 | 80 | 16 | 5.0 | 164.38 |
 
 These are the current `910B2` service-time anchors for Wan2.2.
 `910B3` remains unset for now and should be filled with measured data later.
+
+For `super_p95` estimation, the current implementation uses:
+
+* exact-match anchors for the three profiles above on `910B2`
+* a `1280x720, 6 steps, 80 frames` normalized fallback for other Wan2.2 request shapes
+* `910B3 -> 910B2` fallback, with a warning, until dedicated `910B3` measurements are available
+
+## 7.2 Current 4-card 910B2 Async-Preemption Timings
+
+Measured with:
+
+* `VLLM_OMNI_ENABLE_DIFFUSION_SERVER_SCHEDULING=1`
+* `VLLM_OMNI_ENABLE_DIFFUSION_PREEMPTION=1`
+* `--vae-use-slicing`
+
+| Width | Height | Steps | Frames | FPS | flow_shift | Latency (s) |
+|-------|--------|-------|--------|-----|------------|-------------|
+| 854 | 480 | 3 | 80 | 16 | 12.0 | 44.97 |
+| 854 | 480 | 4 | 120 | 24 | 12.0 | 92.94 |
+| 1280 | 720 | 6 | 80 | 16 | 5.0 | 170.51 |
+
+Relative to the current baseline anchors, the async-preemption path with `--vae-use-slicing`
+adds roughly:
+
+* `+3.12%` on `854x480, 3 steps, 80 frames`
+* `+3.07%` on `854x480, 4 steps, 120 frames`
+* `+3.73%` on `1280x720, 6 steps, 80 frames`
 
 ---
 

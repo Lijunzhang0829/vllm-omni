@@ -1,12 +1,15 @@
 import asyncio
+import io
 from argparse import Namespace
 
 import pytest
+from starlette.datastructures import UploadFile
 
 from benchmarks.diffusion.super_p95_dispatcher import (
     ManagedBackendLauncher,
     ManagedBackendSpec,
     SuperP95Dispatcher,
+    _form_to_estimation_dict,
     _parse_npu_smi_bus_ids,
     build_dispatcher_from_args,
 )
@@ -410,3 +413,48 @@ def test_dispatcher_estimates_service_time_per_backend_profile():
 
     assert decision.backend_index == 1
     assert decision.estimated_service_s == pytest.approx(14.22)
+
+
+def test_dispatcher_estimates_wan22_videos_request():
+    dispatcher = SuperP95Dispatcher(
+        backend_urls=["http://backend-0"],
+        backend_hardware_profiles=["910B2"],
+        quota_every=20,
+        quota_amount=1,
+        threshold_ratio=0.8,
+        sacrificial_load_factor=0.1,
+        request_timeout_s=30.0,
+    )
+
+    estimate = dispatcher._estimate_service_s(
+        "/v1/videos",
+        {
+            "width": "854",
+            "height": "480",
+            "num_inference_steps": "3",
+            "num_frames": "80",
+            "fps": "16",
+        },
+        "910B2",
+    )
+
+    assert estimate == pytest.approx(45.05)
+
+
+def test_form_to_estimation_dict_ignores_uploads():
+    form = type(
+        "FakeForm",
+        (),
+        {
+            "multi_items": lambda self: [
+                ("prompt", "test"),
+                ("width", "854"),
+                ("height", "480"),
+                ("input_reference", UploadFile(file=io.BytesIO(b"png"), filename="x.png")),
+            ]
+        },
+    )()
+
+    body = _form_to_estimation_dict(form)
+
+    assert body == {"prompt": "test", "width": "854", "height": "480"}

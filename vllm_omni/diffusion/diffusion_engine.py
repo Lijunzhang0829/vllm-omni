@@ -24,6 +24,7 @@ from vllm_omni.diffusion.super_p95 import (
 )
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
@@ -81,6 +82,8 @@ class DiffusionEngine:
 
         output = self.add_req_and_wait_for_response(request)
         if output.error:
+            if current_omni_platform.is_available():
+                current_omni_platform.empty_cache()
             raise Exception(f"{output.error}")
         logger.info("Generation completed successfully.")
 
@@ -98,7 +101,12 @@ class DiffusionEngine:
             ]
 
         postprocess_start_time = time.time()
-        outputs = self.post_process_func(output.output) if self.post_process_func is not None else output.output
+        raw_output = output.output
+        outputs = self.post_process_func(raw_output) if self.post_process_func is not None else raw_output
+        output.output = None
+        del raw_output
+        if current_omni_platform.is_available():
+            current_omni_platform.empty_cache()
         postprocess_time = time.time() - postprocess_start_time
         logger.info(f"Post-processing completed in {postprocess_time:.4f} seconds")
 

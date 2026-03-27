@@ -20,7 +20,7 @@ DEFAULT_SUPER_P95_HARDWARE_PROFILE = "910B2"
 _KNOWN_SUPER_P95_HARDWARE_PROFILES = {"910B2", "910B3"}
 
 # Qwen-Image service-time anchors for the supported NPU hardware profiles.
-_HARDWARE_ANCHORS_S: dict[str, dict[tuple[int, int], tuple[int, float]]] = {
+_QWEN_IMAGE_HARDWARE_ANCHORS_S: dict[str, dict[tuple[int, int], tuple[int, float]]] = {
     "910B2": {
         (512, 512): (20, 8.60),
         (768, 768): (20, 8.94),
@@ -35,14 +35,39 @@ _HARDWARE_ANCHORS_S: dict[str, dict[tuple[int, int], tuple[int, float]]] = {
     },
 }
 
-_FALLBACK_BASE_RESOLUTION = (1024, 1024)
-_FALLBACK_BASE_STEPS = 25
-_PER_PIXEL_STEP_MS: dict[str, dict[tuple[int, int], float]] = {
+# Wan2.2 service-time anchors currently measured on 4-card 910B2 serving
+# (`--usp 4 --enable-layerwise-offload`). 910B3 remains unset for now.
+_WAN2_2_HARDWARE_ANCHORS_S: dict[str, dict[tuple[int, int, int, int], float]] = {
+    "910B2": {
+        (854, 480, 3, 80): 45.05,
+        (854, 480, 4, 120): 83.03,
+        (1280, 720, 6, 80): 165.10,
+    }
+}
+
+_QWEN_IMAGE_FALLBACK_BASE_RESOLUTION = (1024, 1024)
+_QWEN_IMAGE_FALLBACK_BASE_STEPS = 25
+_QWEN_IMAGE_PER_PIXEL_STEP_MS: dict[str, dict[tuple[int, int], float]] = {
     hardware_profile: {
         resolution: (anchor_latency_s * 1000.0) / (resolution[0] * resolution[1] * anchor_steps)
         for resolution, (anchor_steps, anchor_latency_s) in anchors.items()
     }
-    for hardware_profile, anchors in _HARDWARE_ANCHORS_S.items()
+    for hardware_profile, anchors in _QWEN_IMAGE_HARDWARE_ANCHORS_S.items()
+}
+_WAN2_2_FALLBACK_BASE_KEY = (1280, 720, 6, 80)
+_WAN2_2_PER_PIXEL_FRAME_STEP_MS: dict[str, float] = {
+    hardware_profile: (
+        anchors[_WAN2_2_FALLBACK_BASE_KEY]
+        * 1000.0
+        / (
+            _WAN2_2_FALLBACK_BASE_KEY[0]
+            * _WAN2_2_FALLBACK_BASE_KEY[1]
+            * _WAN2_2_FALLBACK_BASE_KEY[2]
+            * _WAN2_2_FALLBACK_BASE_KEY[3]
+        )
+    )
+    for hardware_profile, anchors in _WAN2_2_HARDWARE_ANCHORS_S.items()
+    if _WAN2_2_FALLBACK_BASE_KEY in anchors
 }
 _WARNED_SUPER_P95_HARDWARE_MESSAGES: set[str] = set()
 
@@ -91,16 +116,54 @@ def estimate_service_time_s(
     hardware_profile: str | None = None,
 ) -> float:
     params = request.sampling_params
-    width = int(params.width or params.resolution or _FALLBACK_BASE_RESOLUTION[0])
-    height = int(params.height or params.resolution or _FALLBACK_BASE_RESOLUTION[1])
-    steps = max(int(params.num_inference_steps or _FALLBACK_BASE_STEPS), 1)
     frames = max(int(params.num_frames or 1), 1)
+    if frames > 1:
+        return _estimate_wan2_2_service_time_s(request, hardware_profile=hardware_profile)
+    return _estimate_qwen_image_service_time_s(request, hardware_profile=hardware_profile)
+
+
+def _estimate_qwen_image_service_time_s(
+    request: OmniDiffusionRequest,
+    hardware_profile: str | None = None,
+) -> float:
+    params = request.sampling_params
+    width = int(params.width or params.resolution or _QWEN_IMAGE_FALLBACK_BASE_RESOLUTION[0])
+    height = int(params.height or params.resolution or _QWEN_IMAGE_FALLBACK_BASE_RESOLUTION[1])
+    steps = max(int(params.num_inference_steps or _QWEN_IMAGE_FALLBACK_BASE_STEPS), 1)
 
     profile = normalize_super_p95_hardware_profile(hardware_profile)
-    per_pixel_step_ms = _PER_PIXEL_STEP_MS[profile].get((width, height))
+    per_pixel_step_ms = _QWEN_IMAGE_PER_PIXEL_STEP_MS[profile].get((width, height))
     if per_pixel_step_ms is None:
-        per_pixel_step_ms = _PER_PIXEL_STEP_MS[profile][_FALLBACK_BASE_RESOLUTION]
-    return per_pixel_step_ms * width * height * steps * frames / 1000.0
+        per_pixel_step_ms = _QWEN_IMAGE_PER_PIXEL_STEP_MS[profile][_QWEN_IMAGE_FALLBACK_BASE_RESOLUTION]
+    return per_pixel_step_ms * width * height * steps / 1000.0
+
+
+def _estimate_wan2_2_service_time_s(
+    request: OmniDiffusionRequest,
+    hardware_profile: str | None = None,
+) -> float:
+    params = request.sampling_params
+    width = int(params.width or 854)
+    height = int(params.height or 480)
+    steps = max(int(params.num_inference_steps or 1), 1)
+    frames = max(int(params.num_frames or 1), 1)
+
+    requested_profile = normalize_super_p95_hardware_profile(hardware_profile)
+    profile = requested_profile
+    if profile not in _WAN2_2_HARDWARE_ANCHORS_S:
+        profile = DEFAULT_SUPER_P95_HARDWARE_PROFILE
+        if requested_profile != profile:
+            _warn_super_p95_hardware_once(
+                f"Wan2.2 super_p95 anchors are not available for {requested_profile}; defaulting to {profile}."
+            )
+
+    anchors = _WAN2_2_HARDWARE_ANCHORS_S[profile]
+    exact_match = anchors.get((width, height, steps, frames))
+    if exact_match is not None:
+        return exact_match
+
+    per_pixel_frame_step_ms = _WAN2_2_PER_PIXEL_FRAME_STEP_MS[profile]
+    return per_pixel_frame_step_ms * width * height * steps * frames / 1000.0
 
 
 @dataclass(order=True)
@@ -123,11 +186,9 @@ class ScheduledRequest:
 
     def refresh_sort_key(self) -> None:
         priority = self.remaining_service_s - self.arrival_time_s
-        if self.is_sacrificial:
-            self.sort_key = (priority, self.arrival_seq)
-        else:
-            # heapq is min-heap, so negate the priority score to emulate argmax.
-            self.sort_key = (-priority, self.arrival_seq)
+        # `heapq` pops the smallest key first. super_p95 uses max-delay-first
+        # within a queue, so larger priority should be scheduled earlier.
+        self.sort_key = (-priority, self.arrival_seq)
 
 
 class PredictedLatencyPolicy:

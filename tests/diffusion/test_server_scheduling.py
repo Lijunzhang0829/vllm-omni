@@ -55,7 +55,23 @@ def test_estimate_service_time_defaults_unknown_profile_to_910b2():
     assert estimate_service_time_s(request, hardware_profile="unknown") == pytest.approx(8.60)
 
 
-def test_predicted_latency_policy_prefers_longer_request():
+def test_estimate_service_time_uses_known_wan22_anchor():
+    request = _make_request(width=854, height=480, num_inference_steps=3, num_frames=80)
+    assert estimate_service_time_s(request, hardware_profile="910B2") == pytest.approx(45.05)
+
+
+def test_estimate_service_time_falls_back_for_unknown_wan22_profile():
+    request = _make_request(width=1280, height=720, num_inference_steps=6, num_frames=80)
+    assert estimate_service_time_s(request, hardware_profile="910B3") == pytest.approx(165.10)
+
+
+def test_estimate_service_time_uses_wan22_video_fallback_formula():
+    request = _make_request(width=854, height=480, num_inference_steps=6, num_frames=80)
+    expected = 165.10 * 854 * 480 * 6 * 80 / (1280 * 720 * 6 * 80)
+    assert estimate_service_time_s(request, hardware_profile="910B2") == pytest.approx(expected)
+
+
+def test_predicted_latency_policy_prefers_longer_request_within_normal_queue():
     policy = PredictedLatencyPolicy()
     short_request = _make_request(width=512, height=512, num_inference_steps=20)
     long_request = _make_request(width=1536, height=1536, num_inference_steps=35)
@@ -102,7 +118,7 @@ def test_predicted_latency_policy_prioritizes_normal_before_sacrificial():
     assert scheduled.is_sacrificial is False
 
 
-def test_predicted_latency_policy_uses_sacrificial_order_within_tail_queue():
+def test_predicted_latency_policy_uses_max_delay_first_within_tail_queue():
     policy = PredictedLatencyPolicy()
     slower = policy.add_request(
         _make_request(width=1536, height=1536, num_inference_steps=35, is_sacrificial=True, estimated_service_s=100.0)
@@ -113,8 +129,8 @@ def test_predicted_latency_policy_uses_sacrificial_order_within_tail_queue():
 
     scheduled = policy.pop_next_request()
 
-    assert scheduled is faster
-    assert scheduled is not slower
+    assert scheduled is slower
+    assert scheduled is not faster
 
 
 def test_predicted_latency_policy_reports_pending_load_snapshot():

@@ -201,7 +201,11 @@ class Scheduler:
     def _supports_async_preemption(self, request: OmniDiffusionRequest) -> bool:
         return (
             self._preemption_enabled
-            and self.od_config.model_class_name == "QwenImagePipeline"
+            and self.od_config.model_class_name in {
+                "QwenImagePipeline",
+                "Wan22Pipeline",
+                "WanPipeline",
+            }
             and bool(getattr(request, "request_ids", None))
         )
 
@@ -242,6 +246,13 @@ class Scheduler:
         if best_pending is None or not self._policy.request_outranks(best_pending, self._active_scheduled):
             return False
 
+        logger.info(
+            "Requesting async preemption: active=%s active_remaining=%.3fs pending=%s pending_remaining=%.3fs",
+            self._active_scheduled.request.request_ids[0] if self._active_scheduled.request.request_ids else "<unknown>",
+            self._active_scheduled.remaining_service_s,
+            best_pending.request.request_ids[0] if best_pending.request.request_ids else "<unknown>",
+            best_pending.remaining_service_s,
+        )
         self._active_preemption_requested = True
         return True
 
