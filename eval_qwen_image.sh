@@ -32,6 +32,7 @@ set -euo pipefail
 #   --backend-args "--omni --vae-use-slicing --vae-use-tiling" \
 #   --backend-env VLLM_PLUGINS=ascend \
 #   --backend-env HF_HUB_OFFLINE=1 \
+#   --backend-env VLLM_OMNI_ENABLE_DIFFUSION_SERVER_SCHEDULING=0 \
 #   --backend-env VLLM_OMNI_ENABLE_DIFFUSION_PREEMPTION=0 \
 #   --request-timeout-s 10000 \
 #   --quota-every 20 \

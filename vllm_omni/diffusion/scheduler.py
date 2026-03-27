@@ -33,21 +33,31 @@ class Scheduler:
         self.num_workers = od_config.num_gpus
         self.od_config = od_config
         self._lock = threading.Lock()
+        scheduling_env = os.environ.get("VLLM_OMNI_ENABLE_DIFFUSION_SERVER_SCHEDULING", "1")
+        self._server_scheduling_enabled = scheduling_env.strip().lower() not in {"0", "false", "off", "no"}
         self._pending_cv = threading.Condition()
         self._closed = False
-        self._policy = PredictedLatencyPolicy(
-            hardware_profile=resolve_super_p95_hardware_profile(
-                od_config.super_p95_hardware_profile,
-                warn_on_default=True,
-                context="server",
-            )
-        )
+        self._policy = None
         preemption_env = os.environ.get("VLLM_OMNI_ENABLE_DIFFUSION_PREEMPTION", "1")
         self._preemption_enabled = preemption_env.strip().lower() not in {"0", "false", "off", "no"}
         self._active_scheduled: ScheduledRequest | None = None
         self._active_request_preemptible = False
         self._active_preemption_requested = False
         self._preempt_event = preempt_event
+
+        if self._server_scheduling_enabled:
+            self._policy = PredictedLatencyPolicy(
+                hardware_profile=resolve_super_p95_hardware_profile(
+                    od_config.super_p95_hardware_profile,
+                    warn_on_default=True,
+                    context="server",
+                )
+            )
+            logger.info("Diffusion server-side scheduling is enabled.")
+        else:
+            logger.warning(
+                "Diffusion server-side scheduling is disabled; requests will execute in direct arrival order."
+            )
 
         # Initialize single MessageQueue for all message types (generation & RPC)
         # Assuming all readers are local for now as per current launch_engine implementation
@@ -57,12 +67,14 @@ class Scheduler:
             local_reader_ranks=list(range(self.num_workers)),
         )
         self.result_mq = None
-        self._scheduler_thread = threading.Thread(
-            target=self._run_scheduler_loop,
-            name="DiffusionPredictedLatencyScheduler",
-            daemon=True,
-        )
-        self._scheduler_thread.start()
+        self._scheduler_thread = None
+        if self._server_scheduling_enabled:
+            self._scheduler_thread = threading.Thread(
+                target=self._run_scheduler_loop,
+                name="DiffusionPredictedLatencyScheduler",
+                daemon=True,
+            )
+            self._scheduler_thread.start()
 
     def initialize_result_queue(self, handle):
         # Initialize MessageQueue for receiving results
@@ -75,8 +87,12 @@ class Scheduler:
 
     def add_req(self, request: OmniDiffusionRequest) -> DiffusionOutput:
         """Queue a request and wait for server-side scheduling to execute it."""
+        if not self._server_scheduling_enabled:
+            return self._execute_request(request)
+
         should_preempt = False
         with self._pending_cv:
+            assert self._policy is not None
             scheduled = self._policy.add_request(request)
             should_preempt = self._maybe_request_active_preemption_locked()
             self._pending_cv.notify_all()
@@ -91,6 +107,7 @@ class Scheduler:
     def _run_scheduler_loop(self) -> None:
         while True:
             with self._pending_cv:
+                assert self._policy is not None
                 self._pending_cv.wait_for(lambda: self._closed or self._policy.has_pending())
                 if self._closed and not self._policy.has_pending():
                     return
@@ -170,6 +187,8 @@ class Scheduler:
         self._active_preemption_requested = False
 
     def _maybe_request_active_preemption_locked(self) -> bool:
+        if self._policy is None:
+            return False
         if not (
             self._active_request_preemptible
             and self._active_scheduled is not None
@@ -185,6 +204,8 @@ class Scheduler:
         return True
 
     def get_super_p95_load_snapshot(self) -> SuperP95LoadSnapshot:
+        if not self._server_scheduling_enabled or self._policy is None:
+            return SuperP95LoadSnapshot(normal_load_s=0.0, sacrificial_load_s=0.0)
         with self._pending_cv:
             snapshot = self._policy.get_pending_load_snapshot()
             if self._active_scheduled is None:

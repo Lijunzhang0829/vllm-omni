@@ -114,3 +114,21 @@ def test_normal_pending_preempts_active_sacrificial_request():
     should_preempt = sched._maybe_request_active_preemption_locked()
 
     assert should_preempt is True
+
+
+def test_add_req_bypasses_server_scheduling_when_disabled():
+    sched = object.__new__(Scheduler)
+    sched._server_scheduling_enabled = False
+
+    seen = []
+    expected = object()
+
+    def _fake_execute(request):
+        seen.append(request)
+        return expected
+
+    sched._execute_request = _fake_execute
+
+    req = _make_request("direct", width=512, height=512, steps=20)
+    assert sched.add_req(req) is expected
+    assert seen == [req]
