@@ -721,6 +721,7 @@ python benchmarks/diffusion/super_p95_dispatcher.py \
   --backend-env VLLM_PLUGINS=ascend \
   --backend-env HF_HUB_OFFLINE=1 \
   --backend-env VLLM_OMNI_ENABLE_DIFFUSION_PREEMPTION=0 \
+  --request-timeout-s 10000 \
   --quota-every 20 \
   --quota-amount 0
 ```
@@ -741,6 +742,7 @@ python benchmarks/diffusion/super_p95_dispatcher.py \
   --backend-env VLLM_PLUGINS=ascend \
   --backend-env HF_HUB_OFFLINE=1 \
   --backend-env VLLM_OMNI_ENABLE_DIFFUSION_PREEMPTION=1 \
+  --request-timeout-s 10000 \
   --quota-every 20 \
   --quota-amount 1 \
   --threshold-ratio 0.8 \

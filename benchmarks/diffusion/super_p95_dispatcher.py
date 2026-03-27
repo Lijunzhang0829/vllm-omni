@@ -698,7 +698,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--quota-amount", type=int, default=1)
     parser.add_argument("--threshold-ratio", type=float, default=0.8)
     parser.add_argument("--sacrificial-load-factor", type=float, default=0.1)
-    parser.add_argument("--request-timeout-s", type=float, default=600.0)
+    parser.add_argument("--request-timeout-s", type=float, default=10000.0)
     return parser.parse_args()
 
 
