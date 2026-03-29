@@ -35,14 +35,20 @@ _QWEN_IMAGE_HARDWARE_ANCHORS_S: dict[str, dict[tuple[int, int], tuple[int, float
     },
 }
 
-# Wan2.2 service-time anchors currently measured on 4-card 910B2 serving
-# (`--usp 4 --enable-layerwise-offload`). 910B3 remains unset for now.
+# Wan2.2 service-time anchors for the supported NPU hardware profiles.
+# Current local validation uses the 8-card (`--usp 8`) serving setup for both
+# 910B2 and 910B3 profiles so the dispatcher/server estimates stay aligned.
 _WAN2_2_HARDWARE_ANCHORS_S: dict[str, dict[tuple[int, int, int, int], float]] = {
     "910B2": {
-        (854, 480, 3, 80): 45.05,
-        (854, 480, 4, 120): 83.03,
-        (1280, 720, 6, 80): 165.10,
-    }
+        (854, 480, 3, 80): 38.07,
+        (854, 480, 4, 120): 71.34,
+        (1280, 720, 6, 80): 119.71,
+    },
+    "910B3": {
+        (854, 480, 3, 80): 38.07,
+        (854, 480, 4, 120): 71.34,
+        (1280, 720, 6, 80): 119.71,
+    },
 }
 
 _QWEN_IMAGE_FALLBACK_BASE_RESOLUTION = (1024, 1024)

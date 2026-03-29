@@ -1,46 +1,60 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# 4-card Wan2.2 server launch examples for this script.
+# Wan2.2 server launch examples for this script.
 #
 # Notes:
 # - This script only launches the client benchmark. Start the server manually first.
-# - Current local validation uses one 4-card server instance, not a dispatcher.
-# - Current 910B2 visible physical NPU ids on this machine are: 1,2,3,5
+# - Both baseline and super_p95 should go through the dispatcher endpoint even when
+#   there is only one managed backend, so the serving topology stays identical.
 # - For Wan2.2 T2V:
 #     flow_shift=12.0 for 480p
 #     flow_shift=5.0  for 720p
 #
-# Baseline:
-# export ASCEND_RT_VISIBLE_DEVICES=1,2,3,5
-# export VLLM_PLUGINS=ascend
-# export HF_HUB_OFFLINE=1
-# export NO_PROXY=127.0.0.1,localhost
-# export no_proxy=127.0.0.1,localhost
+# Baseline via dispatcher with a single managed backend:
 # export VLLM_OMNI_ENABLE_DIFFUSION_SERVER_SCHEDULING=0
 # export VLLM_OMNI_ENABLE_DIFFUSION_PREEMPTION=0
-# vllm serve Wan-AI/Wan2.2-T2V-A14B-Diffusers --omni \
-#   --port 8091 \
-#   --usp 4 \
-#   --enable-layerwise-offload \
-#   --boundary-ratio 0.875 \
-#   --super-p95-hardware-profile 910B2
+# python benchmarks/diffusion/super_p95_dispatcher.py \
+#   --host 0.0.0.0 \
+#   --port 8080 \
+#   --model Wan-AI/Wan2.2-T2V-A14B-Diffusers \
+#   --managed-backends 1 \
+#   --backend-start-port 8091 \
+#   --device-env-var ASCEND_RT_VISIBLE_DEVICES \
+#   --backend-hardware-profiles 910B3 \
+#   --backend-log-dir /tmp/super_p95_backends_wan22_baseline \
+#   --request-timeout-s 1000000 \
+#   --backend-arg=--omni \
+#   --backend-arg=--usp \
+#   --backend-arg=8 \
+#   --backend-arg=--enable-layerwise-offload \
+#   --backend-arg=--boundary-ratio \
+#   --backend-arg=0.875 \
+#   --backend-arg=--vae-use-slicing \
+#   --backend-arg=--vae-use-tiling
 #
-# Async preemption / local super_p95 validation:
-# export ASCEND_RT_VISIBLE_DEVICES=1,2,3,5
-# export VLLM_PLUGINS=ascend
-# export HF_HUB_OFFLINE=1
-# export NO_PROXY=127.0.0.1,localhost
-# export no_proxy=127.0.0.1,localhost
+# super_p95 via dispatcher with a single managed backend:
 # export VLLM_OMNI_ENABLE_DIFFUSION_SERVER_SCHEDULING=1
 # export VLLM_OMNI_ENABLE_DIFFUSION_PREEMPTION=1
-# vllm serve Wan-AI/Wan2.2-T2V-A14B-Diffusers --omni \
-#   --port 8091 \
-#   --usp 4 \
-#   --enable-layerwise-offload \
-#   --boundary-ratio 0.875 \
-#   --super-p95-hardware-profile 910B2 \
-#   --vae-use-slicing
+# python benchmarks/diffusion/super_p95_dispatcher.py \
+#   --host 0.0.0.0 \
+#   --port 8080 \
+#   --model Wan-AI/Wan2.2-T2V-A14B-Diffusers \
+#   --managed-backends 1 \
+#   --backend-start-port 8091 \
+#   --device-env-var ASCEND_RT_VISIBLE_DEVICES \
+#   --backend-hardware-profiles 910B3 \
+#   --backend-log-dir /tmp/super_p95_backends_wan22 \
+#   --request-timeout-s 1000000 \
+#   --sacrificial-load-factor 0.1 \
+#   --backend-arg=--omni \
+#   --backend-arg=--usp \
+#   --backend-arg=8 \
+#   --backend-arg=--enable-layerwise-offload \
+#   --backend-arg=--boundary-ratio \
+#   --backend-arg=0.875 \
+#   --backend-arg=--vae-use-slicing \
+#   --backend-arg=--vae-use-tiling
 
 usage() {
   cat <<'EOF'
@@ -54,7 +68,7 @@ Description:
   server manually first, then run this script.
 
 Environment overrides:
-  BASE_URL            Default: http://127.0.0.1:8091
+  BASE_URL            Default: http://127.0.0.1:8080
   MODEL               Default: Wan-AI/Wan2.2-T2V-A14B-Diffusers
   NUM_PROMPTS         Default: 500
   MAX_CONCURRENCY     Default: 1000
@@ -83,7 +97,7 @@ case "${RUN_LABEL}" in
     ;;
 esac
 
-BASE_URL="${BASE_URL:-http://127.0.0.1:8091}"
+BASE_URL="${BASE_URL:-http://127.0.0.1:8080}"
 MODEL="${MODEL:-Wan-AI/Wan2.2-T2V-A14B-Diffusers}"
 NUM_PROMPTS="${NUM_PROMPTS:-500}"
 MAX_CONCURRENCY="${MAX_CONCURRENCY:-1000}"

@@ -73,3 +73,15 @@ def test_interrupt_property_checks_shared_event():
     assert pipe.interrupt is False
     event.set()
     assert pipe.interrupt is True
+
+
+def test_async_preemption_updates_live_completed_steps_progress():
+    pipe = _make_pipeline()
+    pipe._active_completed_steps = SimpleNamespace(value=0)
+    pipe._interrupt = True
+
+    _state, finished, completed_steps = pipe._run_generation_steps(_make_state())
+
+    assert finished is False
+    assert completed_steps == 1
+    assert pipe._active_completed_steps.value == 1

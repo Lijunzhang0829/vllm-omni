@@ -57,18 +57,24 @@ def test_estimate_service_time_defaults_unknown_profile_to_910b2():
 
 def test_estimate_service_time_uses_known_wan22_anchor():
     request = _make_request(width=854, height=480, num_inference_steps=3, num_frames=80)
-    assert estimate_service_time_s(request, hardware_profile="910B2") == pytest.approx(45.05)
+    assert estimate_service_time_s(request, hardware_profile="910B2") == pytest.approx(38.07)
 
 
 def test_estimate_service_time_falls_back_for_unknown_wan22_profile():
     request = _make_request(width=1280, height=720, num_inference_steps=6, num_frames=80)
-    assert estimate_service_time_s(request, hardware_profile="910B3") == pytest.approx(165.10)
+    assert estimate_service_time_s(request, hardware_profile="910B3") == pytest.approx(119.71)
+    assert estimate_service_time_s(request, hardware_profile="unknown") == pytest.approx(119.71)
 
 
 def test_estimate_service_time_uses_wan22_video_fallback_formula():
     request = _make_request(width=854, height=480, num_inference_steps=6, num_frames=80)
-    expected = 165.10 * 854 * 480 * 6 * 80 / (1280 * 720 * 6 * 80)
+    expected = 119.71 * 854 * 480 * 6 * 80 / (1280 * 720 * 6 * 80)
     assert estimate_service_time_s(request, hardware_profile="910B2") == pytest.approx(expected)
+
+
+def test_estimate_service_time_uses_known_wan22_anchor_on_910b3():
+    request = _make_request(width=854, height=480, num_inference_steps=4, num_frames=120)
+    assert estimate_service_time_s(request, hardware_profile="910B3") == pytest.approx(71.34)
 
 
 def test_predicted_latency_policy_prefers_longer_request_within_normal_queue():
