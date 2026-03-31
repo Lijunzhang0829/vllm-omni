@@ -85,6 +85,11 @@ from vllm.utils.collection_utils import as_list
 from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
 from vllm_omni.entrypoints.openai.protocol import OmniChatCompletionStreamResponse
 from vllm_omni.entrypoints.openai.protocol.audio import AudioResponse, CreateAudio
+from vllm_omni.diffusion.super_p95 import (
+    apply_super_p95_request_headers,
+    build_super_p95_response_headers,
+    parse_super_p95_load_metrics,
+)
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.lora.utils import stable_lora_int_id
 from vllm_omni.outputs import OmniRequestOutput
@@ -133,7 +138,29 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         instance._diffusion_mode = True
         instance._diffusion_engine = diffusion_engine
         instance._diffusion_model_name = model_name
+        instance._last_response_headers = {}
         return instance
+
+    def get_response_headers(self) -> dict[str, str]:
+        if not self._diffusion_mode:
+            return {}
+        return dict(getattr(self, "_last_response_headers", {}))
+
+    @staticmethod
+    def _capture_super_p95_headers_from_result(result: OmniRequestOutput) -> dict[str, str]:
+        candidate_metrics = [
+            getattr(result, "metrics", None),
+            getattr(getattr(result, "request_output", None), "metrics", None),
+            getattr(getattr(getattr(result, "request_output", None), "request_output", None), "metrics", None),
+        ]
+        snapshot = None
+        for metrics in candidate_metrics:
+            snapshot = parse_super_p95_load_metrics(metrics)
+            if snapshot is not None:
+                break
+        if snapshot is None:
+            return {}
+        return build_super_p95_response_headers(snapshot)
 
     async def create_chat_completion(
         self,
@@ -1919,6 +1946,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             ChatCompletionResponse with generated images or ErrorResponse
         """
         try:
+            self._last_response_headers = {}
             request_id = f"chatcmpl-{uuid.uuid4().hex[:16]}"
             created_time = int(time.time())
 
@@ -1997,6 +2025,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 num_outputs_per_prompt=num_outputs_per_prompt,
                 seed=seed,
             )
+            apply_super_p95_request_headers(gen_params, raw_request.headers if raw_request is not None else None)
 
             if guidance_scale is not None:
                 gen_params.guidance_scale = guidance_scale
@@ -2074,6 +2103,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     result = output
                 if result is None:
                     return self._create_error_response("No output generated from AsyncOmni")
+                self._last_response_headers = self._capture_super_p95_headers_from_result(result)
             else:
                 # AsyncOmniDiffusion: direct call
                 diffusion_engine = cast(AsyncOmniDiffusion, self._diffusion_engine)
@@ -2082,6 +2112,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     sampling_params=gen_params,
                     request_id=request_id,
                 )
+                self._last_response_headers = self._capture_super_p95_headers_from_result(result)
             # Extract images from result
             # Handle nested OmniRequestOutput structure where images might be in request_output
             images = getattr(result.request_output, "images", [])

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import importlib
+import os
 
 import torch.nn as nn
 from vllm.logger import init_logger
@@ -130,6 +131,11 @@ _VAE_PATCH_PARALLEL_ALLOWLIST = {
     "NextStep11Pipeline",
 }
 
+_DEFAULT_VAE_TILING_ALLOWLIST = {
+    # Wan2.2 T2V is prone to VAE decode OOM without spatial tiling.
+    "Wan22Pipeline",
+}
+
 _NO_CACHE_ACCELERATION = {
     # Pipelines that do not support cache acceleration (cache_dit / tea_cache).
     "NextStep11Pipeline",
@@ -178,11 +184,7 @@ def initialize_model(
             )
             od_config.vae_use_tiling = True
 
-        # Configure VAE memory optimization settings from config
-        if hasattr(model.vae, "use_slicing"):
-            model.vae.use_slicing = od_config.vae_use_slicing
-        if hasattr(model.vae, "use_tiling"):
-            model.vae.use_tiling = od_config.vae_use_tiling
+        _configure_vae_memory_optimizations(model, od_config)
 
         if (
             vae_pp_size > 1
@@ -207,6 +209,45 @@ def initialize_model(
         return model
     else:
         raise ValueError(f"Model class {od_config.model_class_name} not found in diffusion model registry.")
+
+
+def _configure_vae_memory_optimizations(model: nn.Module, od_config: OmniDiffusionConfig) -> None:
+    auto_tiling_disabled = os.getenv("VLLM_OMNI_DISABLE_AUTO_VAE_TILING", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if (
+        od_config.model_class_name in _DEFAULT_VAE_TILING_ALLOWLIST
+        and not od_config.vae_use_tiling
+        and not auto_tiling_disabled
+    ):
+        logger.warning(
+            "Automatically enabling vae_use_tiling for %s to reduce Wan2.2 VAE decode OOM risk.",
+            od_config.model_class_name,
+        )
+        od_config.vae_use_tiling = True
+
+    vae = getattr(model, "vae", None)
+    if vae is None:
+        return
+
+    if od_config.vae_use_slicing:
+        if hasattr(vae, "enable_slicing"):
+            vae.enable_slicing()
+        elif hasattr(vae, "use_slicing"):
+            vae.use_slicing = True
+    elif hasattr(vae, "use_slicing"):
+        vae.use_slicing = False
+
+    if od_config.vae_use_tiling:
+        if hasattr(vae, "enable_tiling"):
+            vae.enable_tiling()
+        elif hasattr(vae, "use_tiling"):
+            vae.use_tiling = True
+    elif hasattr(vae, "use_tiling"):
+        vae.use_tiling = False
 
 
 def _apply_sequence_parallel_if_enabled(model, od_config: OmniDiffusionConfig) -> None:

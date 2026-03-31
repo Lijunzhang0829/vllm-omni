@@ -100,6 +100,7 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.serving_video import OmniOpenAIServingVideo
+from vllm_omni.diffusion.super_p95 import apply_super_p95_request_headers
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams, OmniTextPrompt
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.lora.utils import stable_lora_int_id
@@ -785,6 +786,10 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         logger.exception("Chat completion failed: %s", e)
         raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=str(e)) from e
 
+    response_headers = dict(metrics_header(metrics_header_format) or {})
+    if handler is not None and hasattr(handler, "get_response_headers"):
+        response_headers.update(handler.get_response_headers())
+
     if isinstance(generator, ErrorResponse):
         return JSONResponse(
             content=generator.model_dump(),
@@ -806,7 +811,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
                 response_dict = generator.model_dump(mode="json", serialize_as_any=True, warnings="none")
                 return JSONResponse(
                     content=response_dict,
-                    headers=metrics_header(metrics_header_format),
+                    headers=response_headers,
                 )
             except Exception:
                 # Fallback: convert to JSON string and parse back to avoid any serialization issues
@@ -815,7 +820,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
                     response_dict = json_lib.loads(response_json)
                     return JSONResponse(
                         content=response_dict,
-                        headers=metrics_header(metrics_header_format),
+                        headers=response_headers,
                     )
                 except Exception:
                     # Last resort: regular dump with warnings suppressed
@@ -823,10 +828,10 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
                         warnings_module.filterwarnings("ignore", category=UserWarning)
                         return JSONResponse(
                             content=generator.model_dump(mode="json", warnings="none"),
-                            headers=metrics_header(metrics_header_format),
+                            headers=response_headers,
                         )
 
-    return StreamingResponse(content=generator, media_type="text/event-stream")
+    return StreamingResponse(content=generator, media_type="text/event-stream", headers=response_headers)
 
 
 _remove_route_from_router(router, "/v1/audio/speech", {"POST"})
@@ -1004,6 +1009,7 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
         if request.negative_prompt is not None:
             prompt["negative_prompt"] = request.negative_prompt
         gen_params = OmniDiffusionSamplingParams(num_outputs_per_prompt=request.n)
+        apply_super_p95_request_headers(gen_params, raw_request.headers)
 
         # Parse per-request LoRA (compatible with chat's extra_body.lora shape).
         lora_request, lora_scale = _parse_lora_request(request.lora)
@@ -1148,6 +1154,7 @@ async def edit_images(
 
         # 3 Build sample params
         gen_params = OmniDiffusionSamplingParams()
+        apply_super_p95_request_headers(gen_params, raw_request.headers)
         # 3.0 Init with system default values
         app_state_args = getattr(raw_request.app.state, "args", None)
         default_sample_param = getattr(app_state_args, "default_sampling_params", None)

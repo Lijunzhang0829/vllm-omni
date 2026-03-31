@@ -10,6 +10,7 @@ to DiffusionModelRunner.
 
 import gc
 import multiprocessing as mp
+import multiprocessing.connection
 import os
 from collections.abc import Iterable
 from contextlib import AbstractContextManager, nullcontext
@@ -71,6 +72,9 @@ class DiffusionWorker:
         self.vllm_config: VllmConfig | None = None
         self.model_runner: DiffusionModelRunner | None = None
         self._sleep_saved_buffers: dict[str, torch.Tensor] = {}
+        self._resident_scheduler_states: dict[str, dict[str, Any]] = {}
+        self._preempt_event = None
+        self._active_completed_steps = None
         self.lora_manager: DiffusionLoRAManager | None = None
         self.init_device()
         # Create model runner
@@ -179,6 +183,13 @@ class DiffusionWorker:
     def execute_model(self, req: OmniDiffusionRequest, od_config: OmniDiffusionConfig) -> DiffusionOutput:
         """Execute a forward pass by delegating to the model runner."""
         assert self.model_runner is not None, "Model runner not initialized"
+        preemption_enabled = req.sampling_params.extra_args.get("_server_preemption_enabled", False)
+        request_key = self._get_request_key(req) if getattr(req, "request_ids", None) else None
+        if preemption_enabled and request_key in self._resident_scheduler_states:
+            req.sampling_params.extra_args["_server_state"] = self._resident_scheduler_states[request_key]
+        else:
+            req.sampling_params.extra_args.pop("_server_state", None)
+
         if self.lora_manager is not None:
             try:
                 self.lora_manager.set_active_adapter(req.sampling_params.lora_request, req.sampling_params.lora_scale)
@@ -186,7 +197,37 @@ class DiffusionWorker:
                 if req.sampling_params.lora_request is not None:
                     raise
                 logger.warning("LoRA activation skipped: %s", exc)
-        return self.model_runner.execute_model(req)
+        pipeline = getattr(self.model_runner, "pipeline", None)
+        if pipeline is not None:
+            pipeline._interrupt = False
+            pipeline._interrupt_event = self._preempt_event if preemption_enabled else None
+            pipeline._active_completed_steps = getattr(self, "_active_completed_steps", None) if preemption_enabled else None
+
+        try:
+            output = self.model_runner.execute_model(req)
+            if request_key is not None and output.request_key is None:
+                output.request_key = request_key
+            if preemption_enabled and request_key is not None:
+                if output.finished:
+                    self._resident_scheduler_states.pop(request_key, None)
+                elif output.scheduler_state is not None:
+                    state = output.scheduler_state
+                    self._resident_scheduler_states[request_key] = state
+                    output.scheduler_state = {
+                        "request_key": request_key,
+                        "completed_steps": int(state.get("completed_steps", 0)),
+                    }
+            return output
+        finally:
+            if pipeline is not None:
+                pipeline._interrupt = False
+                pipeline._interrupt_event = None
+                pipeline._active_completed_steps = None
+
+    def _get_request_key(self, req: OmniDiffusionRequest) -> str:
+        if req.request_ids:
+            return req.request_ids[0]
+        raise ValueError("Preemptible diffusion requests must carry a request_id.")
 
     def load_weights(self, weights) -> set[str]:
         """Load weights by delegating to the model runner."""
@@ -326,12 +367,16 @@ class WorkerProc:
         self,
         od_config: OmniDiffusionConfig,
         gpu_id: int,
+        control_pipe: mp.connection.Connection,
         broadcast_handle,
+        preempt_event=None,
+        active_completed_steps=None,
         worker_extension_cls: str | None = None,
         custom_pipeline_args: dict[str, Any] | None = None,
     ):
         self.od_config = od_config
         self.gpu_id = gpu_id
+        self.control_pipe = control_pipe
 
         # Inter-process Communication
         self.context = zmq.Context(io_threads=2)
@@ -352,6 +397,8 @@ class WorkerProc:
 
         # Create worker using WorkerWrapperBase for extension support
         self.worker = self._create_worker(gpu_id, od_config, worker_extension_cls, custom_pipeline_args)
+        self.worker.worker._preempt_event = preempt_event
+        self.worker.worker._active_completed_steps = active_completed_steps
         self._running = True
 
     def _create_worker(
@@ -370,10 +417,81 @@ class WorkerProc:
         )
         return wrapper
 
-    def return_result(self, output: DiffusionOutput):
+    def return_result(self, output: Any):
         """Reply to client, only on rank 0."""
+        request_key = None
+        result_type = type(output).__name__
+        if isinstance(output, dict):
+            request_key = output.get("request_key")
+            result_type = output.get("type", result_type)
+        elif isinstance(output, DiffusionOutput):
+            request_key = output.request_key
+
+        if self._should_route_result_via_control_pipe(output):
+            prepared = self._prepare_result_for_scheduler(output)
+            logger.info(
+                "Worker %s sending result via control pipe: type=%s request_key=%s",
+                self.gpu_id,
+                result_type,
+                request_key,
+            )
+            self.control_pipe.send(
+                {
+                    "status": "generation_result",
+                    "rank": self.gpu_id,
+                    "payload": prepared,
+                }
+            )
+            return
+
         if self.result_mq is not None:
-            self.result_mq.enqueue(output)
+            self.result_mq.enqueue(self._prepare_result_for_scheduler(output))
+
+    @staticmethod
+    def _tensor_tree_to_cpu(value: Any) -> Any:
+        if isinstance(value, torch.Tensor):
+            return value.detach().cpu()
+        if isinstance(value, list):
+            return [WorkerProc._tensor_tree_to_cpu(v) for v in value]
+        if isinstance(value, tuple):
+            return tuple(WorkerProc._tensor_tree_to_cpu(v) for v in value)
+        if isinstance(value, dict):
+            return {k: WorkerProc._tensor_tree_to_cpu(v) for k, v in value.items()}
+        return value
+
+    @classmethod
+    def _prepare_diffusion_output_for_scheduler(cls, output: DiffusionOutput) -> DiffusionOutput:
+        return DiffusionOutput(
+            output=cls._tensor_tree_to_cpu(output.output),
+            trajectory_timesteps=cls._tensor_tree_to_cpu(output.trajectory_timesteps),
+            trajectory_latents=cls._tensor_tree_to_cpu(output.trajectory_latents),
+            trajectory_decoded=cls._tensor_tree_to_cpu(output.trajectory_decoded),
+            error=output.error,
+            finished=output.finished,
+            request_key=output.request_key,
+            scheduler_metadata=dict(output.scheduler_metadata),
+            scheduler_state=output.scheduler_state,
+            post_process_func=output.post_process_func,
+        )
+
+    @classmethod
+    def _prepare_result_for_scheduler(cls, output: Any) -> Any:
+        if isinstance(output, DiffusionOutput):
+            return cls._prepare_diffusion_output_for_scheduler(output)
+        if isinstance(output, dict) and isinstance(output.get("output"), DiffusionOutput):
+            prepared = dict(output)
+            prepared["output"] = cls._prepare_diffusion_output_for_scheduler(output["output"])
+            return prepared
+        return output
+
+    @staticmethod
+    def _is_generation_result(output: Any) -> bool:
+        if isinstance(output, dict):
+            return output.get("type") == "generation_result"
+        return isinstance(output, DiffusionOutput) and output.request_key is not None
+
+    def _should_route_result_via_control_pipe(self, output: Any) -> bool:
+        return self.gpu_id == 0 and self._is_generation_result(output)
 
     def recv_message(self):
         """Receive messages from broadcast queue."""
@@ -445,7 +563,8 @@ class WorkerProc:
                         f"Error executing forward in event loop: {e}",
                         exc_info=True,
                     )
-                    output = DiffusionOutput(error=str(e))
+                    request_key = msg.request_ids[0] if getattr(msg, "request_ids", None) else None
+                    output = DiffusionOutput(error=str(e), request_key=request_key)
 
                 try:
                     self.return_result(output)
@@ -466,6 +585,8 @@ class WorkerProc:
         od_config: OmniDiffusionConfig,
         pipe_writer: mp.connection.Connection,
         broadcast_handle,
+        preempt_event=None,
+        active_completed_steps=None,
         worker_extension_cls: str | None = None,
         custom_pipeline_args: dict[str, Any] | None = None,
     ) -> None:
@@ -476,7 +597,10 @@ class WorkerProc:
         worker_proc = WorkerProc(
             od_config,
             gpu_id=rank,
+            control_pipe=pipe_writer,
             broadcast_handle=broadcast_handle,
+            preempt_event=preempt_event,
+            active_completed_steps=active_completed_steps,
             worker_extension_cls=worker_extension_cls,
             custom_pipeline_args=custom_pipeline_args,
         )

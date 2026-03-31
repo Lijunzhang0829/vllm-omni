@@ -17,8 +17,14 @@ from vllm_omni.diffusion.registry import (
     get_diffusion_pre_process_func,
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.super_p95 import (
+    SuperP95LoadSnapshot,
+    build_super_p95_response_headers,
+    snapshot_to_metrics,
+)
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
@@ -76,6 +82,8 @@ class DiffusionEngine:
 
         output = self.add_req_and_wait_for_response(request)
         if output.error:
+            if current_omni_platform.is_available():
+                current_omni_platform.empty_cache()
             raise Exception(f"{output.error}")
         logger.info("Generation completed successfully.")
 
@@ -93,7 +101,12 @@ class DiffusionEngine:
             ]
 
         postprocess_start_time = time.time()
-        outputs = self.post_process_func(output.output) if self.post_process_func is not None else output.output
+        raw_output = output.output
+        outputs = self.post_process_func(raw_output) if self.post_process_func is not None else raw_output
+        output.output = None
+        del raw_output
+        if current_omni_platform.is_available():
+            current_omni_platform.empty_cache()
         postprocess_time = time.time() - postprocess_start_time
         logger.info(f"Post-processing completed in {postprocess_time:.4f} seconds")
 
@@ -107,6 +120,7 @@ class DiffusionEngine:
             "resolution": int(request.sampling_params.resolution),
             "postprocess_time_ms": postprocess_time * 1000,
         }
+        metrics.update(snapshot_to_metrics(self.get_super_p95_load_snapshot()))
         if self.pre_process_func is not None:
             metrics["preprocessing_time_ms"] = preprocess_time * 1000
 
@@ -193,6 +207,12 @@ class DiffusionEngine:
 
     def add_req_and_wait_for_response(self, request: OmniDiffusionRequest):
         return self.executor.add_req(request)
+
+    def get_super_p95_load_snapshot(self) -> SuperP95LoadSnapshot:
+        return self.executor.get_super_p95_load_snapshot()
+
+    def get_super_p95_response_headers(self) -> dict[str, str]:
+        return build_super_p95_response_headers(self.get_super_p95_load_snapshot())
 
     def start_profile(self, trace_filename: str | None = None) -> None:
         """
@@ -337,6 +357,7 @@ class DiffusionEngine:
                 guidance_scale=0.0,
                 num_outputs_per_prompt=1,
             ),
+            request_ids=["warmup-0"],
         )
         logger.info("dummy run to warm up the model")
         request = self.pre_process_func(req) if self.pre_process_func is not None else req

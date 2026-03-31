@@ -1,4 +1,5 @@
 import multiprocessing as mp
+import threading
 import time
 import weakref
 from dataclasses import dataclass
@@ -10,6 +11,7 @@ from vllm_omni.diffusion.data import SHUTDOWN_MESSAGE, DiffusionOutput
 from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.scheduler import Scheduler
+from vllm_omni.diffusion.super_p95 import SuperP95LoadSnapshot
 from vllm_omni.diffusion.worker import WorkerProc
 
 logger = init_logger(__name__)
@@ -23,6 +25,7 @@ class BackgroundResources:
 
     scheduler: Scheduler | None = None
     processes: list[mp.Process] | None = None
+    scheduler_pipes: list[mp.connection.Connection] | None = None
 
     def __call__(self):
         """Clean up background resources."""
@@ -42,6 +45,12 @@ class BackgroundResources:
                     logger.warning("Terminating diffusion worker %s after timeout", proc.name)
                     proc.terminate()
                     proc.join(30)
+        if self.scheduler_pipes:
+            for pipe in self.scheduler_pipes:
+                try:
+                    pipe.close()
+                except Exception:
+                    pass
 
 
 class MultiprocDiffusionExecutor(DiffusionExecutor):
@@ -50,14 +59,28 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
     def _init_executor(self) -> None:
         self._processes: list[mp.Process] = []
         self._closed = False
+        self._mp_ctx = mp.get_context("spawn")
+        self._scheduler_pipe_readers: list[mp.connection.Connection] = []
+        self._pipe_reader_stop = False
+        self._pipe_reader_thread: threading.Thread | None = None
+        preempt_event = self._mp_ctx.Event()
+        active_completed_steps = self._mp_ctx.Value("i", 0, lock=False)
 
         # Initialize scheduler
         self.scheduler = Scheduler()
-        self.scheduler.initialize(self.od_config)
+        self.scheduler.initialize(
+            self.od_config,
+            preempt_event=preempt_event,
+            active_completed_steps=active_completed_steps,
+        )
         broadcast_handle = self.scheduler.get_broadcast_handle()
 
         # Launch workers
-        processes, result_handle = self._launch_workers(broadcast_handle)
+        processes, result_handle, scheduler_pipe_readers = self._launch_workers(
+            broadcast_handle,
+            preempt_event,
+            active_completed_steps,
+        )
 
         if result_handle is not None:
             self.scheduler.initialize_result_queue(result_handle)
@@ -65,16 +88,26 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             logger.error("Failed to get result queue handle from workers")
 
         self._processes = processes
+        self._scheduler_pipe_readers = scheduler_pipe_readers
+        self._pipe_reader_thread = threading.Thread(
+            target=self._worker_pipe_loop,
+            name="diffusion-worker-pipe-reader",
+            daemon=True,
+        )
+        self._pipe_reader_thread.start()
 
-        self.resources = BackgroundResources(scheduler=self.scheduler, processes=self._processes)
+        self.resources = BackgroundResources(
+            scheduler=self.scheduler,
+            processes=self._processes,
+            scheduler_pipes=self._scheduler_pipe_readers,
+        )
         self._finalizer = weakref.finalize(self, self.resources)
 
-    def _launch_workers(self, broadcast_handle):
+    def _launch_workers(self, broadcast_handle, preempt_event, active_completed_steps):
         od_config = self.od_config
         logger.info("Starting server...")
 
         num_gpus = od_config.num_gpus
-        mp.set_start_method("spawn", force=True)
         processes = []
 
         # Extract worker_extension_cls and custom_pipeline_args from od_config
@@ -86,15 +119,17 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         scheduler_pipe_writers = []
 
         for i in range(num_gpus):
-            reader, writer = mp.Pipe(duplex=False)
+            reader, writer = self._mp_ctx.Pipe(duplex=False)
             scheduler_pipe_writers.append(writer)
-            process = mp.Process(
+            process = self._mp_ctx.Process(
                 target=WorkerProc.worker_main,
                 args=(
                     i,  # rank
                     od_config,
                     writer,
                     broadcast_handle,
+                    preempt_event,
+                    active_completed_steps,
                     worker_extension_cls,
                     custom_pipeline_args,
                 ),
@@ -127,11 +162,46 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 result_handle = data.get("result_handle")
 
             scheduler_infos.append(data)
-            reader.close()
 
         logger.debug("All workers are ready")
 
-        return processes, result_handle
+        return processes, result_handle, scheduler_pipe_readers
+
+    def _worker_pipe_loop(self) -> None:
+        while not self._pipe_reader_stop:
+            if not self._scheduler_pipe_readers:
+                time.sleep(0.1)
+                continue
+            ready_readers = mp.connection.wait(self._scheduler_pipe_readers, timeout=0.1)
+            for reader in ready_readers:
+                try:
+                    message = reader.recv()
+                except EOFError:
+                    continue
+                except Exception as exc:
+                    logger.warning("Failed to read worker control message: %s", exc)
+                    self.scheduler.set_reader_error(RuntimeError(f"Worker control pipe failed: {exc}"))
+                    continue
+
+                if not isinstance(message, dict):
+                    logger.warning("Ignoring unexpected worker control message type %s", type(message))
+                    continue
+
+                status = message.get("status")
+                if status != "generation_result":
+                    logger.warning("Ignoring unexpected worker control message: %s", message)
+                    continue
+
+                rank = message.get("rank")
+                payload = message.get("payload")
+                if isinstance(payload, DiffusionOutput) and isinstance(payload.request_key, str):
+                    self.scheduler.publish_result(
+                        payload.request_key,
+                        payload,
+                        source=f"worker-rank-{rank}",
+                    )
+                    continue
+                logger.warning("Ignoring malformed worker generation_result message: %s", message)
 
     def add_req(self, request: OmniDiffusionRequest) -> DiffusionOutput:
         return self.scheduler.add_req(request)
@@ -208,6 +278,12 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             if not p.is_alive():
                 raise RuntimeError(f"Worker process {p.name} is dead")
 
+    def get_super_p95_load_snapshot(self) -> SuperP95LoadSnapshot:
+        return self.scheduler.get_super_p95_load_snapshot()
+
     def shutdown(self) -> None:
         self._closed = True
+        self._pipe_reader_stop = True
+        if self._pipe_reader_thread is not None:
+            self._pipe_reader_thread.join(timeout=1.0)
         self._finalizer()

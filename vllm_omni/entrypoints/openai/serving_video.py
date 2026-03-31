@@ -24,6 +24,7 @@ from vllm_omni.entrypoints.openai.video_api_utils import decode_input_reference,
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams, OmniTextPrompt
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.lora.utils import stable_lora_int_id
+from vllm_omni.diffusion.super_p95 import apply_super_p95_request_headers
 
 logger = init_logger(__name__)
 
@@ -93,6 +94,7 @@ class OmniOpenAIServingVideo:
             prompt["multi_modal_data"] = {"image": input_image}
 
         gen_params = OmniDiffusionSamplingParams(num_outputs_per_prompt=request.n)
+        apply_super_p95_request_headers(gen_params, raw_request.headers if raw_request is not None else None)
 
         width, height, num_frames, fps = self._resolve_video_params(request)
         if width is not None and height is not None:

@@ -41,6 +41,40 @@ def test_default_stage_config_includes_cache_backend(monkeypatch):
     assert ulysses_degree == 2
 
 
+def test_default_stage_config_preserves_super_p95_hardware_profile(monkeypatch):
+    monkeypatch.setattr(utils_module, "load_stage_configs_from_model", lambda model, base_engine_args=None: [])
+    monkeypatch.setattr(utils_module, "resolve_model_config_path", lambda model: None)
+    monkeypatch.setattr(AsyncOmni, "_start_stages", lambda self, model: None)
+    monkeypatch.setattr(AsyncOmni, "_wait_for_stages_ready", lambda self, timeout=0: None)
+
+    omni = AsyncOmni(
+        model=MODEL,
+        super_p95_hardware_profile="910B3",
+        vae_use_slicing=True,
+        vae_use_tiling=True,
+    )
+
+    engine_args = omni.stage_configs[0].engine_args
+    assert engine_args.get("super_p95_hardware_profile") == "910B3"
+
+
+def test_default_stage_config_preserves_api_port(monkeypatch):
+    monkeypatch.setattr(utils_module, "load_stage_configs_from_model", lambda model, base_engine_args=None: [])
+    monkeypatch.setattr(utils_module, "resolve_model_config_path", lambda model: None)
+    monkeypatch.setattr(AsyncOmni, "_start_stages", lambda self, model: None)
+    monkeypatch.setattr(AsyncOmni, "_wait_for_stages_ready", lambda self, timeout=0: None)
+
+    omni = AsyncOmni(
+        model=MODEL,
+        port=8093,
+        super_p95_hardware_profile="910B3",
+    )
+
+    engine_args = omni.stage_configs[0].engine_args
+    assert engine_args.get("port") == 8093
+    assert engine_args.get("super_p95_hardware_profile") == "910B3"
+
+
 def test_default_cache_config_used_when_missing(monkeypatch):
     """Ensure default cache_config is applied when cache_backend is set."""
     monkeypatch.setattr(utils_module, "load_stage_configs_from_model", lambda model, base_engine_args=None: [])

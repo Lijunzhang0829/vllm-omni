@@ -61,7 +61,11 @@ def get_wan22_ti2v_post_process_func(
     ):
         if output_type == "latent":
             return video
-        return video_processor.postprocess_video(video, output_type=output_type)
+        cpu_video = video.detach().float().cpu()
+        del video
+        if current_omni_platform.is_available():
+            current_omni_platform.empty_cache()
+        return video_processor.postprocess_video(cpu_video, output_type=output_type)
 
     return post_process_func
 
