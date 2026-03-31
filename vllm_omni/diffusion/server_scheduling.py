@@ -240,8 +240,10 @@ class PredictedLatencyPolicy:
 
     def pop_next_request(self) -> ScheduledRequest:
         if self._normal_pending:
-            return self._pop_heap(self._normal_pending, is_sacrificial=False)
-        return self._pop_heap(self._sacrificial_pending, is_sacrificial=True)
+            scheduled = self._pop_heap(self._normal_pending, is_sacrificial=False)
+        else:
+            scheduled = self._pop_heap(self._sacrificial_pending, is_sacrificial=True)
+        return scheduled
 
     def peek_next_request(self) -> ScheduledRequest | None:
         if self._normal_pending:
@@ -279,8 +281,10 @@ class PredictedLatencyPolicy:
     @staticmethod
     def request_outranks(candidate: ScheduledRequest, incumbent: ScheduledRequest) -> bool:
         if candidate.is_sacrificial != incumbent.is_sacrificial:
-            return not candidate.is_sacrificial and incumbent.is_sacrificial
-        return candidate.sort_key < incumbent.sort_key
+            outranks = not candidate.is_sacrificial and incumbent.is_sacrificial
+        else:
+            outranks = candidate.sort_key < incumbent.sort_key
+        return outranks
 
     def _push_pending(self, scheduled: ScheduledRequest) -> None:
         heap = self._sacrificial_pending if scheduled.is_sacrificial else self._normal_pending

@@ -6,7 +6,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import time
 from collections.abc import Iterable
 from typing import Any, cast
 
@@ -29,49 +28,6 @@ from vllm_omni.inputs.data import OmniTextPrompt
 from vllm_omni.platforms import current_omni_platform
 
 logger = logging.getLogger(__name__)
-
-
-def _env_flag_enabled(name: str) -> bool:
-    return os.environ.get(name, "0").strip().lower() not in {"0", "false", "off", "no", ""}
-
-
-def _phase_trace_enabled() -> bool:
-    return _env_flag_enabled("VLLM_OMNI_DEBUG_WAN_PHASE_TRACE")
-
-
-def _log_phase(
-    request_key: str,
-    phase: str,
-    event: str,
-    *,
-    start_t: float | None = None,
-    extra: str = "",
-) -> None:
-    if not _phase_trace_enabled():
-        return
-    now = time.perf_counter()
-    suffix = f" {extra}" if extra else ""
-    if start_t is None:
-        logger.info(
-            "Wan22 phase trace: request=%s phase=%s event=%s wall_t=%.6f%s",
-            request_key,
-            phase,
-            event,
-            now,
-            suffix,
-        )
-        return
-    logger.info(
-        "Wan22 phase trace: request=%s phase=%s event=%s wall_t=%.6f elapsed_s=%.6f%s",
-        request_key,
-        phase,
-        event,
-        now,
-        now - start_t,
-        suffix,
-    )
-
-
 def retrieve_latents(
     encoder_output: torch.Tensor,
     generator: torch.Generator | None = None,
@@ -458,8 +414,6 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin):
             dtype = self.text_encoder.dtype
 
         if prompt_embeds is None:
-            encode_start = time.perf_counter()
-            _log_phase(request_key, "encode", "start")
             prompt_embeds, negative_prompt_embeds = self.encode_prompt(
                 prompt=prompt,
                 negative_prompt=negative_prompt,
@@ -469,7 +423,6 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin):
                 device=device,
                 dtype=dtype,
             )
-            _log_phase(request_key, "encode", "finish", start_t=encode_start)
         else:
             prompt_embeds = prompt_embeds.to(device=device, dtype=dtype)
             if negative_prompt_embeds is not None:
@@ -528,9 +481,6 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin):
         latents = state["latents"]
         completed_steps = 0
         progress = getattr(self, "_active_completed_steps", None)
-        _log_phase(request_key, "denoise_loop", "start", extra=f"start_index={start_index}")
-        denoise_start = time.perf_counter()
-        _log_phase(request_key, "denoise", "start", extra=f"start_index={start_index}")
         expand_timesteps = bool(getattr(self, "expand_timesteps", False))
         for step_index in range(start_index, len(timesteps)):
             if completed_steps > 0 and self.interrupt:
@@ -629,19 +579,6 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin):
         state["latents"] = latents
         state["next_step_index"] = end_index
         state["scheduler_state"] = self._snapshot_scheduler_state()
-        _log_phase(
-            request_key,
-            "denoise",
-            "finish",
-            start_t=denoise_start,
-            extra=f"completed_steps={completed_steps} end_index={end_index}",
-        )
-        _log_phase(
-            request_key,
-            "denoise_loop",
-            "finish",
-            extra=f"completed_steps={completed_steps} end_index={end_index}",
-        )
         return state, end_index >= len(timesteps), completed_steps
 
     def _decode_generation_state(
@@ -650,13 +587,8 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin):
         output_type: str | None,
         request_key: str | None = None,
     ) -> torch.Tensor:
-        if request_key is not None:
-            decode_start = time.perf_counter()
-            _log_phase(request_key, "decode", "start")
         latents = state["latents"]
         if output_type == "latent":
-            if request_key is not None:
-                _log_phase(request_key, "decode", "finish", start_t=decode_start)
             return latents
 
         latents = latents.to(self.vae.dtype)
@@ -670,8 +602,6 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin):
         )
         latents = latents / latents_std + latents_mean
         output = self.vae.decode(latents, return_dict=False)[0]
-        if request_key is not None:
-            _log_phase(request_key, "decode", "finish", start_t=decode_start)
         return output
 
     def _prepare_output_for_transfer(
@@ -680,19 +610,12 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin):
         output_type: str | None,
         request_key: str | None = None,
     ) -> torch.Tensor:
-        if request_key is not None:
-            transfer_start = time.perf_counter()
-            _log_phase(request_key, "transfer", "start")
         if output_type == "latent":
-            if request_key is not None:
-                _log_phase(request_key, "transfer", "finish", start_t=transfer_start)
             return output
         cpu_output = output.detach().float().cpu()
         del output
         if current_omni_platform.is_available():
             current_omni_platform.empty_cache()
-        if request_key is not None:
-            _log_phase(request_key, "transfer", "finish", start_t=transfer_start)
         return cpu_output
 
     def _forward_baseline_compatible(
@@ -713,8 +636,6 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin):
         attention_kwargs: dict | None,
     ) -> DiffusionOutput:
         request_key = req.request_key
-        pipeline_start = time.perf_counter()
-        _log_phase(request_key, "pipeline", "start")
         boundary_ratio = self.boundary_ratio if self.boundary_ratio is not None else req.sampling_params.boundary_ratio
         if boundary_ratio is None:
             boundary_ratio = 0.875
@@ -751,8 +672,6 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin):
                 generator = torch.Generator(device=device).manual_seed(req.sampling_params.seed)
 
             if prompt_embeds is None:
-                encode_start = time.perf_counter()
-                _log_phase(request_key, "encode", "start")
                 prompt_embeds, negative_prompt_embeds = self.encode_prompt(
                     prompt=prompt,
                     negative_prompt=negative_prompt,
@@ -762,7 +681,6 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin):
                     device=device,
                     dtype=dtype,
                 )
-                _log_phase(request_key, "encode", "finish", start_t=encode_start)
             else:
                 prompt_embeds = prompt_embeds.to(device=device, dtype=dtype)
                 if negative_prompt_embeds is not None:
@@ -897,10 +815,6 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin):
         if start_index >= len(timesteps):
             raise RuntimeError(f"Invalid resume step: start_index={start_index} >= timesteps_len={len(timesteps)}")
         end_index = len(timesteps)
-        _log_phase(request_key, "denoise_loop", "start", extra=f"start_index={start_index}")
-        denoise_start = time.perf_counter()
-        _log_phase(request_key, "denoise", "start", extra=f"start_index={start_index}")
-
         for idx in range(start_index, end_index):
             t = timesteps[idx]
             self._current_timestep = t
@@ -966,19 +880,6 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin):
             )
             latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
 
-        _log_phase(
-            request_key,
-            "denoise",
-            "finish",
-            start_t=denoise_start,
-            extra=f"completed_steps={end_index - start_index} end_index={end_index}",
-        )
-        _log_phase(
-            request_key,
-            "denoise_loop",
-            "finish",
-            extra=f"completed_steps={end_index - start_index} end_index={end_index}",
-        )
         state["latents"] = latents
         state["scheduler_state"] = self._snapshot_scheduler_state()
         if req.execution_state is None:
@@ -999,8 +900,6 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin):
         if output_type == "latent":
             output = latents
         else:
-            decode_start = time.perf_counter()
-            _log_phase(request_key, "decode", "start")
             latents = latents.to(self.vae.dtype)
             latents_mean = (
                 torch.tensor(self.vae.config.latents_mean)
@@ -1012,10 +911,8 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin):
             )
             latents = latents / latents_std + latents_mean
             output = self.vae.decode(latents, return_dict=False)[0]
-            _log_phase(request_key, "decode", "finish", start_t=decode_start)
 
         output = self._prepare_output_for_transfer(output, output_type, request_key=request_key)
-        _log_phase(request_key, "pipeline", "finish", start_t=pipeline_start)
         req.execution_state = None
         return DiffusionOutput(output=output, finished=True)
 
@@ -1036,9 +933,6 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin):
         attention_kwargs: dict | None = None,
         **kwargs,
     ) -> DiffusionOutput:
-        request_key = req.request_key
-        pipeline_start = time.perf_counter()
-        _log_phase(request_key, "pipeline", "start")
         # Get parameters from request or arguments
         if len(req.prompts) > 1:
             raise ValueError(
@@ -1154,7 +1048,6 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin):
         request_key = state.get("request_key", req.request_key)
         output = self._decode_generation_state(state, output_type, request_key=request_key)
         output = self._prepare_output_for_transfer(output, output_type, request_key=request_key)
-        _log_phase(request_key, "pipeline", "finish", start_t=pipeline_start)
         return DiffusionOutput(output=output, finished=True)
 
     def predict_noise(self, current_model: nn.Module | None = None, **kwargs: Any) -> torch.Tensor:

@@ -170,6 +170,7 @@ def test_build_dispatcher_from_args_managed_launch_defaults():
     assert [spec.hardware_profile for spec in dispatcher._backend_launcher.specs] == ["910B2", "910B2"]
     assert dispatcher._backend_launcher.backend_args == ["--omni", "--vae-use-slicing", "--vae-use-tiling"]
     assert dispatcher._backend_launcher.backend_env["VLLM_PLUGINS"] == "ascend"
+    assert dispatcher._backend_launcher.numa_membind is True
 
 
 def test_build_dispatcher_from_args_rejects_manual_and_managed_mix():
@@ -248,6 +249,7 @@ def test_managed_backend_launcher_builds_expected_command_and_env(tmp_path, monk
         backend_args=["--omni", "--vae-use-slicing", "--vae-use-tiling"],
         backend_env={"VLLM_PLUGINS": "ascend"},
         device_env_var="ASCEND_RT_VISIBLE_DEVICES",
+        numa_membind=False,
         health_timeout_s=10.0,
         health_poll_interval_s=0.1,
         log_dir=str(tmp_path),
@@ -336,6 +338,7 @@ def test_managed_backend_launcher_prefixes_numactl_when_numa_is_resolved(tmp_pat
         backend_args=["--omni"],
         backend_env={"VLLM_PLUGINS": "ascend"},
         device_env_var="ASCEND_RT_VISIBLE_DEVICES",
+        numa_membind=False,
         health_timeout_s=10.0,
         health_poll_interval_s=0.1,
         log_dir=str(tmp_path),
@@ -348,8 +351,6 @@ def test_managed_backend_launcher_prefixes_numactl_when_numa_is_resolved(tmp_pat
         [
             "numactl",
             "--cpunodebind",
-            "6",
-            "--membind",
             "6",
             "vllm",
             "serve",
@@ -404,6 +405,7 @@ def test_managed_backend_launcher_logs_launch_details(tmp_path, monkeypatch):
         backend_args=["--omni"],
         backend_env={"VLLM_PLUGINS": "ascend"},
         device_env_var="ASCEND_RT_VISIBLE_DEVICES",
+        numa_membind=False,
         health_timeout_s=10.0,
         health_poll_interval_s=0.1,
         log_dir=str(tmp_path),
@@ -413,8 +415,72 @@ def test_managed_backend_launcher_logs_launch_details(tmp_path, monkeypatch):
     launcher.stop_all()
 
     assert popen_calls
-    assert any("Launching backend port=8091 device_id=0 hardware_profile=910B3 numa_node=6" in msg for msg in log_messages)
+    assert any("Launching backend port=8091 device_id=0 hardware_profile=910B3 numa_node=6 membind=False" in msg for msg in log_messages)
     assert any("Starting 1 managed super_p95 backends." in msg for msg in log_messages)
+
+
+def test_managed_backend_launcher_can_opt_in_numa_membind(tmp_path, monkeypatch):
+    popen_calls = []
+
+    class FakeProcess:
+        def __init__(self):
+            self._returncode = None
+
+        def poll(self):
+            return self._returncode
+
+        def terminate(self):
+            self._returncode = 0
+
+        def wait(self, timeout=None):
+            self._returncode = 0
+            return 0
+
+        def kill(self):
+            self._returncode = -9
+
+    def fake_popen(cmd, env, stdout, stderr, text):
+        popen_calls.append(cmd)
+        return FakeProcess()
+
+    monkeypatch.setattr("benchmarks.diffusion.super_p95_dispatcher.subprocess.Popen", fake_popen)
+    monkeypatch.setattr(ManagedBackendLauncher, "_wait_until_healthy", lambda self: None)
+    monkeypatch.setattr("benchmarks.diffusion.super_p95_dispatcher.shutil.which", lambda cmd: "/usr/bin/numactl")
+    monkeypatch.setattr(ManagedBackendLauncher, "_get_device_bus_id", lambda self, device_id: "0000:c1:00.0")
+    monkeypatch.setattr("benchmarks.diffusion.super_p95_dispatcher._read_pci_numa_node", lambda bus_id: 6)
+
+    launcher = ManagedBackendLauncher(
+        specs=[ManagedBackendSpec(device_id="0", port=8091, base_url="http://127.0.0.1:8091", hardware_profile="910B3")],
+        model="Qwen/Qwen-Image",
+        backend_args=["--omni"],
+        backend_env={},
+        device_env_var="ASCEND_RT_VISIBLE_DEVICES",
+        numa_membind=True,
+        health_timeout_s=10.0,
+        health_poll_interval_s=0.1,
+        log_dir=str(tmp_path),
+    )
+
+    launcher.start_all()
+    launcher.stop_all()
+
+    assert popen_calls == [
+        [
+            "numactl",
+            "--cpunodebind",
+            "6",
+            "--membind",
+            "6",
+            "vllm",
+            "serve",
+            "Qwen/Qwen-Image",
+            "--port",
+            "8091",
+            "--super-p95-hardware-profile",
+            "910B3",
+            "--omni",
+        ]
+    ]
 
 
 def test_build_dispatcher_from_args_applies_backend_hardware_profiles():
@@ -442,6 +508,36 @@ def test_build_dispatcher_from_args_applies_backend_hardware_profiles():
     dispatcher = build_dispatcher_from_args(args)
 
     assert [backend.hardware_profile for backend in dispatcher.backends] == ["910B2", "910B3"]
+
+
+def test_build_dispatcher_from_args_disables_membind_for_multi_device_usp():
+    args = Namespace(
+        backend_urls=None,
+        num_servers=1,
+        device_ids="0",
+        model="Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+        backend_host="127.0.0.1",
+        backend_start_port=8091,
+        backend_hardware_profiles="910B3",
+        backend_args="--omni --usp 8 --enable-layerwise-offload --vae-use-slicing --vae-use-tiling",
+        backend_env=[],
+        device_env_var="ASCEND_RT_VISIBLE_DEVICES",
+        numa_membind=False,
+        no_numa_membind=False,
+        backend_health_timeout_s=900.0,
+        backend_health_poll_interval_s=5.0,
+        backend_log_dir="/tmp/super_p95_test_logs",
+        quota_every=20,
+        quota_amount=1,
+        threshold_ratio=0.8,
+        sacrificial_load_factor=0.1,
+        request_timeout_s=600.0,
+    )
+
+    dispatcher = build_dispatcher_from_args(args)
+
+    assert dispatcher._backend_launcher is not None
+    assert dispatcher._backend_launcher.numa_membind is False
 
 
 def test_dispatcher_estimates_service_time_per_backend_profile():
@@ -492,7 +588,7 @@ def test_dispatcher_estimates_wan22_videos_request():
         "910B2",
     )
 
-    assert estimate == pytest.approx(45.05)
+    assert estimate == pytest.approx(38.07)
 
 
 def test_form_to_estimation_dict_ignores_uploads():

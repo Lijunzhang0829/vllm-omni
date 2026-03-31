@@ -98,6 +98,7 @@ class ManagedBackendLauncher:
         backend_args: list[str],
         backend_env: dict[str, str],
         device_env_var: str,
+        numa_membind: bool,
         health_timeout_s: float,
         health_poll_interval_s: float,
         log_dir: str,
@@ -107,6 +108,7 @@ class ManagedBackendLauncher:
         self.backend_args = backend_args
         self.backend_env = backend_env
         self.device_env_var = device_env_var
+        self.numa_membind = numa_membind
         self.health_timeout_s = health_timeout_s
         self.health_poll_interval_s = health_poll_interval_s
         self.log_dir = Path(log_dir)
@@ -177,16 +179,17 @@ class ManagedBackendLauncher:
                 "numactl",
                 "--cpunodebind",
                 str(numa_node),
-                "--membind",
-                str(numa_node),
                 *cmd,
             ]
+            if self.numa_membind:
+                cmd[3:3] = ["--membind", str(numa_node)]
         logger.info(
-            "Launching backend port=%s device_id=%s hardware_profile=%s numa_node=%s base_url=%s log=%s cmd=%s",
+            "Launching backend port=%s device_id=%s hardware_profile=%s numa_node=%s membind=%s base_url=%s log=%s cmd=%s",
             spec.port,
             spec.device_id,
             spec.hardware_profile,
             numa_node if numa_node is not None else "none",
+            self.numa_membind,
             spec.base_url,
             log_path,
             shlex.join(cmd),
@@ -754,7 +757,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--backend-args",
-        default="--omni",
+        action="append",
+        default=["--omni"],
         help="Extra CLI args appended to each managed `vllm serve` command.",
     )
     parser.add_argument(
@@ -767,6 +771,20 @@ def parse_args() -> argparse.Namespace:
         "--device-env-var",
         default="ASCEND_RT_VISIBLE_DEVICES",
         help="Environment variable used to pin a managed backend to a single device.",
+    )
+    parser.add_argument(
+        "--numa-membind",
+        action="store_true",
+        help="Bind managed backend host memory to the device NUMA node.",
+    )
+    parser.add_argument(
+        "--no-numa-membind",
+        action="store_true",
+        help=(
+            "Disable NUMA memory binding for managed backends. By default, single-device backends "
+            "keep the historical membind behavior, while multi-device USP backends disable membind "
+            "to avoid NUMA-node-local OOM during startup."
+        ),
     )
     parser.add_argument(
         "--backend-health-timeout-s",
@@ -804,6 +822,25 @@ def _parse_backend_env(values: list[str]) -> dict[str, str]:
             raise ValueError(f"Invalid --backend-env value {item!r}; key cannot be empty")
         env[key] = value
     return env
+
+
+def _resolve_numa_membind(
+    model: str | None,
+    backend_args: list[str],
+    explicit: bool | None,
+) -> bool:
+    if explicit is not None:
+        return explicit
+
+    # Preserve the original behavior for single-device backends such as
+    # Qwen-Image. Disable memory binding by default for multi-device USP
+    # backends because large diffusion startups can OOM one NUMA node even
+    # when system-wide memory is sufficient.
+    for idx, token in enumerate(backend_args):
+        if token == "--usp" and idx + 1 < len(backend_args):
+            with suppress(ValueError):
+                return int(backend_args[idx + 1]) <= 1
+    return True
 
 
 def _parse_device_ids(device_ids: str | None, num_servers: int) -> list[str]:
@@ -879,12 +916,24 @@ def build_dispatcher_from_args(args: argparse.Namespace) -> SuperP95Dispatcher:
         hardware_profiles = _parse_backend_hardware_profiles(backend_hardware_profiles_arg, args.num_servers)
         specs = _build_managed_specs(args.backend_host, args.backend_start_port, device_ids, hardware_profiles)
         backend_urls = [spec.base_url for spec in specs]
+        raw_backend_args = args.backend_args
+        if isinstance(raw_backend_args, str):
+            raw_backend_args = [raw_backend_args]
+        backend_args: list[str] = []
+        for raw in raw_backend_args:
+            backend_args.extend(shlex.split(raw))
+        explicit_numa_membind = None
+        if getattr(args, "numa_membind", False):
+            explicit_numa_membind = True
+        elif getattr(args, "no_numa_membind", False):
+            explicit_numa_membind = False
         backend_launcher = ManagedBackendLauncher(
             specs=specs,
             model=args.model,
-            backend_args=shlex.split(args.backend_args),
+            backend_args=backend_args,
             backend_env=_parse_backend_env(args.backend_env),
             device_env_var=args.device_env_var,
+            numa_membind=_resolve_numa_membind(args.model, backend_args, explicit_numa_membind),
             health_timeout_s=args.backend_health_timeout_s,
             health_poll_interval_s=args.backend_health_poll_interval_s,
             log_dir=args.backend_log_dir,
