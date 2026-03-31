@@ -1,178 +1,180 @@
 # Super P95 Strategy
 
-本文档描述当前 Qwen-Image 在线调度策略的设计目标、公式、数据结构和实现语义。
+本文档描述当前 diffusion `super_p95` 系统的真实实现，而不是早期设想版。
 
-旧名字：
-- `delay_x`
-
-新名字：
-- `super_p95`
+适用范围：
+- `Qwen-Image`
+- `Wan2.2`
 
 目标：
-- 直接优化 `P95 E2E latency`
-- 允许一小部分“重请求”被延后执行
-- 正常请求优先保证尾延迟
+- 优化 `P95 E2E latency`
+- 允许一小部分重请求被“牺牲”
+- 在高压区优先保护大多数请求的尾延迟
 
 
-## 1. 总体思路
+## 1. 系统结构
 
-`super_p95` 是一个两层策略：
+当前实现是两层：
 
-1. `dispatcher` 层：
-- 对新到达请求做静态分类
-- 决定它是不是 `sacrificial`（放弃保护的请求）
-- 决定它派发到哪张卡
+1. `dispatcher`
+- 负责估计新请求 service time
+- 负责把新请求标成 `sacrificial` 或 normal
+- 负责选择 backend
+- 维护轻量负载账本，并用 backend 回传 header 纠偏
 
-2. `server` 层：
-- 对本机已有请求做本地调度
-- 正常请求按“预计延迟最大优先”
-- `sacrificial` 请求整体尾排
+2. `server`
+- 负责本机 waiting queue 的排序
+- 负责 arrival / finish 时的重排
+- 在支持异步抢占的模型上，负责 arrival-time preemption
 
 一句话：
 
 ```text
-dispatcher 负责分类和分卡；
-server 负责本地优先级和抢占。
+dispatcher 做分类和分卡；
+server 做本地优先级和抢占。
 ```
 
 
-## 2. 请求耗时估计
+## 2. 当前实现状态
+
+当前实现已经和早期文档有几处重要偏移，下面这些以代码为准：
+
+- dispatcher 启动参数是 `--num-servers`
+  - 不是旧文档里的 `--managed-backends`
+- dispatcher 对所有请求都按
+  - `normal_load_s + α * sacrificial_load_s`
+  做主分卡
+  - 不是“normal 请求只看 normal load，sacrificial 才看加权 load”
+- server 里：
+  - normal 组内是“更大的 predicted latency 先跑”
+  - sacrificial 组内是“更小的 tail key 先跑”
+- `Wan2.2` 的 `910B2` / `910B3` anchor 现在都使用同一组 8 卡 `usp=8` 实测值
+- `Wan2.2` preemption-capable path 里，non-expand timestep 构造已经修成 baseline 同款
+  - 这是近期性能修复的关键变更
+
+
+## 3. 请求耗时估计
 
 策略依赖一个粗粒度 service-time 估计器。
 
-当前实现支持按硬件 profile 选择不同 anchor：
-
+当前支持的 hardware profile：
 - `910B2`
 - `910B3`
 
-如果 server / dispatcher 没有显式指定 hardware profile，会 warning 并默认回落到 `910B2`。
+如果 dispatcher / server 没有显式指定 profile：
+- 会 warning
+- 并默认回落到 `910B2`
 
-### 2.1 已知 profile
 
-Qwen-Image 当前使用这 4 个 profile anchor。
+### 3.1 Qwen-Image anchor
+
+四元组含义：
+
+```text
+(width, height, num_inference_steps, num_frames)
+```
 
 `910B2`：
-
 - `512x512x20x1 -> 8.60s`
 - `768x768x20x1 -> 8.94s`
 - `1024x1024x25x1 -> 14.22s`
 - `1536x1536x35x1 -> 43.22s`
 
 `910B3`：
-
 - `512x512x20x1 -> 8.64s`
 - `768x768x20x1 -> 8.64s`
 - `1024x1024x25x1 -> 14.22s`
 - `1536x1536x35x1 -> 49.34s`
 
-当前单卡 NPU 实测值（2026-03-26，`Qwen/Qwen-Image`，`--vae-use-slicing --vae-use-tiling`，warm server，单请求 wall-clock）：
-
-- `512x512x20x1 -> 8.93s`
-- `768x768x20x1 -> 9.44s`
-- `1024x1024x25x1 -> 13.41s`
-- `1536x1536x35x1 -> 43.90s`
-
-说明：
-
-- 这组值是当前环境下的实测观测值，不是算法定义的一部分
-- `weight` 字段在这次测量中被忽略，没有参与请求执行
-- 对应更完整的测量记录见 `benchmarks/diffusion/qwen_image_npu_single_request_timings.md`
-
-这里四元组含义是：
-
-```text
-(width, height, num_inference_steps, num_frames)
-```
-
-### 2.2 同分辨率估计公式
-
-先按 hardware profile 选 anchor 表。
-
-若分辨率命中以下 4 档之一：
-
-- `512x512`
-- `768x768`
-- `1024x1024`
-- `1536x1536`
-
-则先预处理：
+估计公式：
 
 ```text
 per_pixel_step_ms
 = anchor_latency_s * 1000 / (anchor_width * anchor_height * anchor_steps)
-```
 
-然后估计：
-
-```text
 estimated_service_s
 = per_pixel_step_ms * width * height * num_inference_steps * num_frames / 1000
 ```
 
-### 2.3 未知分辨率 fallback
+未知分辨率 fallback 到当前 profile 下的 `1024x1024x25` anchor。
 
-若分辨率未知，则 fallback 到当前 hardware profile 下的 `1024x1024` 基准：
+
+### 3.2 Wan2.2 anchor
+
+当前 `Wan2.2` 使用的视频 anchor 是：
+
+`910B2`：
+- `854x480x3x80 -> 38.07s`
+- `854x480x4x120 -> 71.34s`
+- `1280x720x6x80 -> 119.71s`
+
+`910B3`：
+- `854x480x3x80 -> 38.07s`
+- `854x480x4x120 -> 71.34s`
+- `1280x720x6x80 -> 119.71s`
+
+说明：
+- 这不是说两种硬件天然相同
+- 而是当前本地 `super_p95` 估时为了和最近的 8 卡 `usp=8` serving 实测对齐，临时共用同一组 anchor
+
+精确命中时直接用 exact match。
+
+未知组合时 fallback：
 
 ```text
+per_pixel_frame_step_ms
+= anchor_latency_s * 1000 / (width * height * steps * frames)
+
 estimated_service_s
-= per_pixel_step_ms_1024
- * width * height * num_inference_steps * num_frames
- / 1000
+= per_pixel_frame_step_ms * width * height * steps * frames / 1000
 ```
 
-### 2.4 剩余耗时估计
+当前 fallback 基准是：
 
-定义：
+```text
+(1280, 720, 6, 80)
+```
+
+
+### 3.3 剩余耗时估计
+
+server 侧 remaining service 仍按工作量比例缩放：
 
 ```text
 total_cost     = width * height * total_steps * num_frames
 remaining_cost = width * height * remaining_steps * num_frames
-```
 
-则：
-
-```text
 remaining_service_s
-= total_service_s * (remaining_cost / total_cost)
+= total_service_s * remaining_cost / total_cost
 ```
 
 
-## 3. Dispatcher 层：Super P95 分类
+## 4. Dispatcher：sacrificial 分类
 
-### 3.1 状态
-
-dispatcher 维护以下轻量全局状态：
-
+dispatcher 维护：
 - `arrival_counter`
 - `credits`
 - `global_max_service_s`
 
-含义：
 
-- `arrival_counter`：到达请求计数
-- `credits`：当前剩余的 sacrificial 名额
-- `global_max_service_s`：历史上出现过的最大请求预计耗时
-
-### 3.2 credits 更新
-
-每收到 `quota_every` 个请求，增加 `quota_amount` 个名额：
+### 4.1 credits 规则
 
 ```text
 if arrival_counter % quota_every == 0:
     credits += quota_amount
 ```
 
-### 3.3 global max 更新
 
-新请求到达时更新：
+### 4.2 global max 更新
 
 ```text
 global_max_service_s = max(global_max_service_s, estimated_service_s)
 ```
 
-### 3.4 sacrificial 判定
 
-新请求 arrival 时直接决定它自己是不是 `sacrificial`：
+### 4.3 sacrificial 判定
+
+新请求 arrival 时，dispatcher 直接决定该请求自己是不是 `sacrificial`：
 
 ```text
 mark_sacrificial =
@@ -181,17 +183,13 @@ mark_sacrificial =
     and (estimated_service_s >= threshold_ratio * global_max_service_s)
 ```
 
-若命中，则：
+若命中：
 
 ```text
 credits -= 1
 ```
 
-然后给该请求打 `sacrificial` 标记。
-
-### 3.5 当前默认参数
-
-典型参数是：
+当前常用参数：
 
 ```text
 quota_every = 20
@@ -199,116 +197,83 @@ quota_amount = 1
 threshold_ratio = 0.8
 ```
 
-解释：
 
-- 每 20 个请求放出 1 个名额
-- 只有“接近历史最大档”的请求才会吃到名额
+## 5. Dispatcher：分卡规则
 
-
-## 4. Dispatcher 层：分卡规则
-
-dispatcher 为每张卡维护两类负载：
-
+每个 backend 维护：
 - `normal_load_s`
 - `sacrificial_load_s`
+- `inflight_normal_requests`
+- `inflight_sacrificial_requests`
+- `latency_ema_s`
 
-并维护一个 sacrificial 轻量负载系数：
-
-```text
-sacrificial_load_factor = α
-```
-
-当前推荐经验值：
-
-```text
-α = 0.1
-```
-
-### 4.1 主分数
-
-当前主分卡分数是：
+主分数是：
 
 ```text
 weighted_total_load_s
 = normal_load_s + α * sacrificial_load_s
 ```
 
-dispatcher 选：
+当前经验值：
 
 ```text
-argmin(weighted_total_load_s)
+α = 0.1
 ```
 
-### 4.2 当前实现中的 tie-break
-
-当前代码里 tie-break 还会附带：
-
-- `inflight_normal_requests + α * inflight_sacrificial_requests`
-- `latency_ema_s`
-- `backend_name`
-
-但主导项仍然是：
+dispatcher 选择：
 
 ```text
-normal_load_s + α * sacrificial_load_s
+argmin(score_tuple)
 ```
 
-### 4.3 负载纠偏
+当前 `score_tuple(alpha)` 实现是：
 
-dispatcher 自己会先按估计值增量更新负载。
+```text
+(
+  normal_load_s + α * sacrificial_load_s,
+  inflight_normal_requests + α * inflight_sacrificial_requests,
+  latency_ema_s,
+  normal_load_s,
+  backend_name,
+)
+```
 
-backend 在请求返回时，会把本机当前权威负载通过 header 回传：
+注意：
+- 这里所有请求都走同一套主分数
+- normal 请求并不会绕开 `α * sacrificial_load_s`
 
+
+### 5.1 响应反馈
+
+server 在响应头回传：
 - `X-Super-P95-Normal-Load-S`
 - `X-Super-P95-Sacrificial-Load-S`
 
-dispatcher 收到响应后，用 server 的值覆盖本地账本，避免累计误差。
+dispatcher 收到后：
+- 用 server 的权威值覆盖本地账本
+- 如果 header 缺失，就退回到“减掉本次 estimated load”的 fallback 逻辑
 
 
-## 5. Server 层：本地调度目标
+## 6. Server：本地调度目标
 
-server 负责本地排序和抢占。
-
-核心目标：
-
-- 正常请求：优先保证 `P95`
-- `sacrificial` 请求：整体延后
-
-### 5.1 本地逻辑时间
-
-server 不用墙钟时间做调度，而是维护一个逻辑时间：
+server 维护逻辑时间：
 
 ```text
 current_time_s
 ```
 
-它通过已完成的 work 推进：
+它不是墙钟时间，而是“已完成 service work”驱动的逻辑时间。
 
-```text
-elapsed_service_s
-= total_service_s * (work_done / total_cost)
-
-current_time_s += elapsed_service_s
-```
-
-这里：
-
-- `work_done = before_remaining_cost - after_remaining_cost`
-
-### 5.2 arrival time
-
-每个请求第一次进入 policy 时，记录：
+请求第一次进入 policy 时，记录：
 
 ```text
 arrival_time_s = current_time_s
 ```
 
-注意这里是逻辑时间，不是墙钟时间。
 
+### 6.1 正常请求优先级
 
-## 6. Server 层：正常请求优先级公式
-
-正常请求的核心分数是：
+normal 请求的核心分数：
 
 ```text
 predicted_latency_s
@@ -328,276 +293,281 @@ predicted_latency_s
 waited_service_s = current_time_s - arrival_time_s
 ```
 
-server 总是优先执行 `predicted_latency_s` 最大的正常请求。
-
-即：
+server 选择：
 
 ```text
 argmax(predicted_latency_s)
 ```
 
-
-## 7. Server 层：sacrificial 请求规则
-
-`sacrificial` 请求不参与正常请求竞争。
-
-规则是：
-
-1. 正常请求整体优先于 `sacrificial`
-2. `sacrificial` 只有在 normal 队列为空时才会被取出
-3. `sacrificial` 内部仍保留自己的顺序
-
-### 7.1 当前组内规则
-
-当前实现里，`sacrificial` 组内优先级由 `tail_penalty` 控制。
-
-定义：
-
-```text
-tail_penalty = β
-```
-
-典型值：
-
-```text
-β = 100
-```
-
-当前 priority tuple 近似可写为：
-
-正常请求：
-
-```text
-(0, -predicted_latency_s, arrival_seq, request_key)
-```
-
-`sacrificial` 请求：
-
-```text
-(1, predicted_latency_s / β, arrival_seq, request_key)
-```
-
-也就是：
-
-- 第一位 `0/1` 保证 normal 永远先于 sacrificial
-- 第二位只用于组内排序
-
-
-## 8. 数据结构
-
-当前 server 本地使用两个 heap：
-
-- `normal_heap`
-- `sacrificial_heap`
-
-### 8.1 为什么能用 heap
-
-因为当前 waiting 请求的排序键不依赖前缀和，不需要：
-
-```text
-prefix_wait_before_me
-```
-
-waiting 请求内部比较时，`current_time_s` 是公共项，所以只需比较：
-
-```text
-remaining_service_s - arrival_time_s
-```
-
-### 8.2 heap key
-
-对 waiting 请求，当前 key 近似为：
-
-正常 heap：
+在 heap 里等价成：
 
 ```text
 key_normal = -(remaining_service_s - arrival_time_s)
 ```
 
-`sacrificial` heap：
+
+### 6.2 sacrificial 规则
+
+规则是：
+
+1. normal 永远先于 sacrificial
+2. 只有 normal 为空时，才会从 sacrificial 里取请求
+3. sacrificial 组内按自己的 key 排序
+
+当前 sacrificial heap key 是：
 
 ```text
 key_sacrificial = +(remaining_service_s - arrival_time_s)
 ```
 
-再配合：
+所以组内语义是：
 
-- `arrival_seq`
-- `heap_version`
-- `request_key`
+```text
+更小的 tail key 先跑
+```
 
-做 tie-break 和 lazy delete。
+这一点最近修过，不能再写反。
 
 
-## 9. 抢占语义
+### 6.3 当前数据结构
 
-### 9.1 事件点
+当前 server 维护两个 heap：
 
-server 的重排发生在这些事件点：
+- `normal_heap`
+- `sacrificial_heap`
+
+实现上对应：
+- `_normal_pending`
+- `_sacrificial_pending`
+
+
+## 7. Server：抢占语义
+
+当前重排事件点：
 
 1. 请求到达
 2. 当前请求完成
-3. abort / shutdown / rpc 等外部事件
-
-### 9.2 到达时抢占
+3. abort / shutdown 等外部事件
 
 arrival 时：
-
-1. 新请求先进入 policy
-2. policy 比较：
-   - `current_req`
-   - 当前最优 waiting 候选
-3. 若候选优先级更高，则抢占当前请求
-
-### 9.3 完成时切换
+- 新请求先进入 policy
+- 若 waiting 中的最优候选优先级高于 incumbent，则可以请求抢占
 
 finish 时：
-
-1. 当前请求出队
-2. 先从 `normal_heap` 取
-3. normal 空了再从 `sacrificial_heap` 取
-
-### 9.4 当前 Qwen 实现状态
-
-为了避免单请求性能回退，当前分支里：
-
-- `QwenImage` 默认 **关闭** step-level preemption
-- 即：
-  - 仍保留 `super_p95` 的 arrival/finish 重排策略
-  - 但不默认走 step-resume 的细粒度抢占路径
-
-这个是当前代码的**实现状态**，不是算法定义本身。
-
-如果要重写 `super_p95`，建议把 step-level preemption 做成：
-
-- 明确 opt-in
-- 或仅在高竞争场景开启
-
-而不要作为默认路径。
+- 当前请求移除
+- 先从 normal 取
+- normal 空了再从 sacrificial 取
 
 
-## 10. 协议与元数据
+### 7.1 当前实现里的 preemption
 
-### 10.1 Dispatcher -> Server
+当前 `Qwen-Image` 和 `Wan2.2` 都支持 step-boundary async preemption。
 
-当前 dispatcher 会通过 header 给请求打标：
+也就是说：
+- 不是任意时刻硬中断
+- 而是在 denoise step 边界检查 `interrupt`
+- 触发后返回 `finished=False` 和恢复状态
 
-- `X-Super-P95-Sacrificial: 1`
+近期 `Wan2.2` 的性能问题说明：
+- preemption-capable path 即使在“没真正发生抢占”时，也可能带来固定额外成本
+- 因此实现上必须特别注意“未抢占 fast path”和“真正 yield/resume path”之间的开销差异
 
-server 收到后，把该请求视为 `sacrificial`。
 
-### 10.2 Benchmark -> Dispatcher
+## 8. 协议与元数据
 
-benchmark client 会通过 header 提供请求 service hint：
+### 8.1 Dispatcher -> Server
+
+dispatcher 会通过 header 传：
 
 - `X-Super-P95-Estimated-Service-S`
+- `X-Super-P95-Sacrificial: 1`（仅 sacrificial 请求）
 
-dispatcher 优先使用这个值，避免逐请求解析 JSON body。
+server 通过 header / `extra_args` 读取这些元数据。
 
-### 10.3 Server -> Dispatcher
 
-server 返回时会带回本机负载：
+### 8.2 Server -> Dispatcher
+
+server 返回：
 
 - `X-Super-P95-Normal-Load-S`
 - `X-Super-P95-Sacrificial-Load-S`
 
-dispatcher 用于纠偏本地估计。
+dispatcher 用于负载纠偏。
 
 
-## 11. 推荐的重写边界
+## 9. 启动与部署
 
-如果要让同事重写，建议严格按下面边界拆分：
+### 9.1 当前推荐拓扑
 
-### Dispatcher 负责
-
-- 估计新请求 `estimated_service_s`
-- 维护：
-  - `arrival_counter`
-  - `credits`
-  - `global_max_service_s`
-- 决定该新请求是否 `sacrificial`
-- 用 `weighted_total_load_s` 分卡
-- 在响应返回后，用 server header 纠偏负载
-
-### Server 负责
-
-- 维护：
-  - `arrival_time_s`
-  - `current_time_s`
-  - `normal_heap`
-  - `sacrificial_heap`
-- 正常请求按 `predicted_latency_s` 最大优先
-- `sacrificial` 整体尾排
-- 在 arrival / finish 时做重排
-
-
-## 12. 当前实现中最容易踩坑的点
-
-### 12.1 不要把 `super_p95` 错写成“从老队列里挑一个请求再改成 sacrificial”
-
-这不是当前主策略。
-
-当前主策略是：
+对外统一走 dispatcher：
 
 ```text
-新请求 arrival 时，dispatcher 直接决定这个新请求自己是否 sacrificial。
+:8080  ->  managed backends :8091, :8092, ...
 ```
 
-### 12.2 不要把 `predicted_latency` 写成 `prefix_wait + remaining`
+即使只有一个 backend，也建议通过 dispatcher 走一遍，避免：
+- baseline / super 拓扑不一致
+- sacrificial metadata 不生效
 
-当前 heap 版主路径不需要：
+
+### 9.2 当前 managed launch 参数
+
+当前 dispatcher 支持的是：
 
 ```text
-prefix_wait_before_me
+--num-servers
 ```
 
-因为一旦把前缀等待加进去，就很难继续用 heap 维护。
-
-当前主路径是：
+不是旧文档里的：
 
 ```text
-predicted_latency_s = current_time_s + remaining_service_s - arrival_time_s
+--managed-backends
 ```
 
-### 12.3 dispatcher 不要维护 server 的真实队列
+`backend` 额外参数要用重复的：
 
-dispatcher 只维护轻量负载账本，不托管 server 真实等待队列。
+```text
+--backend-args=...
+```
+
+不是单个拼接字符串后再二次拆分的旧假设。
 
 
-## 13. 一页纸公式汇总
+### 9.3 NUMA 行为
+
+managed launch 会根据 NPU PCI Bus-Id 推断 NUMA node，并尝试：
+
+```text
+numactl --cpunodebind <node>
+```
+
+当前默认行为：
+- 单设备 backend：保留历史 `membind`
+- 多设备 `--usp > 1` backend：默认关闭 `membind`
+
+原因：
+- `Wan2.2 usp=8` 启动时，若强行 `--membind` 到单个 NUMA node，容易出现宿主机 OOM killer
+- 这是最近踩到并修过的坑
+
+
+## 10. 当前最容易踩坑的点
+
+### 10.1 sacrificial 组内顺序不要写反
+
+当前正确语义是：
+
+```text
+key_sacrificial = +(remaining_service_s - arrival_time_s)
+```
+
+即：
+- sacrificial 组内“小的先跑”
+
+不是：
+- 和 normal 一样“大 predicted latency 先跑”
+
+
+### 10.2 dispatcher 分卡主分数对所有请求都一样
+
+当前实现不是：
+- normal 只看 `normal_load`
+- sacrificial 才看 `normal + α * sacrificial`
+
+而是：
+
+```text
+所有请求都按 normal_load_s + α * sacrificial_load_s 选 backend
+```
+
+
+### 10.3 `Wan2.2` 不经过 dispatcher 跑出的 super 结果不可信
+
+如果 client 直接打 backend：
+- sacrificial 分类不会真正生效
+- 只能得到 local scheduling 的局部效果
+
+所以近期 `Wan2.2` 的 baseline / super 对比，都要求统一走：
+
+```text
+dispatcher :8080
+```
+
+
+### 10.4 本地 localhost 调试要关代理
+
+若环境里有代理，health 检查和本地 benchmark 很容易被错误路由到代理地址。
+
+建议统一带：
+
+```bash
+NO_PROXY=127.0.0.1,localhost
+no_proxy=127.0.0.1,localhost
+```
+
+
+### 10.5 `Wan2.2` 的 8 卡估时 anchor 已经更新
+
+不要再用旧的：
+- 4 卡
+- 910B2-only
+
+那套 anchor 去解释当前 8 卡 `usp=8` 结果。
+
+当前 server / dispatcher 两边都已经对齐到：
+- 8 卡 `usp=8`
+- 910B2/910B3 同一组本地实测值
+
+
+### 10.6 `Wan2.2` preemption path 里 non-expand timestep 构造不能再退回旧实现
+
+近期最重要的性能修复就是：
+- preemption-capable path 在普通 T2V/non-expand 分支里
+- 不再每个 denoise step 现造 `mask -> flatten -> expand` 的 device-side timestep
+- 改回和 baseline 一致的：
+
+```text
+timestep = t.expand(batch)
+```
+
+这个修复显著收敛了 `super_p95` 和 baseline 的系统性性能差。
+
+
+## 11. 当前 benchmark 结论摘要
+
+### 11.1 Qwen-Image
+
+当前观察：
+- 低压区：baseline 与 `super_p95` 接近，甚至 baseline 略好
+- 高压区：`super_p95` 对 `P95` 有明显收益
+
+### 11.2 Wan2.2
+
+近期修复后，当前观察是：
+- `0.012`：还没明显打满，baseline 略好或接近
+- `0.020`：高压下 `super_p95` 开始体现 `P95` 收益
+
+也就是说：
+- `Wan2.2` 的 `super_p95` 价值主要体现在高压区
+- 没打满时，baseline 的简单路径有时反而更占便宜
+
+
+## 12. 一页纸公式汇总
 
 ### 耗时估计
 
 ```text
-known profile:
-  910B2:
-    (512,512,20,1)   -> 8.60
-    (768,768,20,1)   -> 8.94
-    (1024,1024,25,1) -> 14.22
-    (1536,1536,35,1) -> 43.22
-  910B3:
-    (512,512,20,1)   -> 8.64
-    (768,768,20,1)   -> 8.64
-    (1024,1024,25,1) -> 14.22
-    (1536,1536,35,1) -> 49.34
-```
-
-```text
-same-resolution estimate:
-per_pixel_step_ms
-= anchor_latency_s * 1000 / (anchor_width * anchor_height * anchor_steps)
-
+Qwen:
 estimated_service_s
 = per_pixel_step_ms * width * height * steps * frames / 1000
 ```
 
 ```text
-fallback:
+Wan:
 estimated_service_s
-= per_pixel_step_ms_1024 * width * height * steps * frames / 1000
+= per_pixel_frame_step_ms * width * height * steps * frames / 1000
 ```
 
-### Dispatcher sacrificial 规则
+### Dispatcher sacrificial
 
 ```text
 if arrival_counter % quota_every == 0:
@@ -611,18 +581,15 @@ global_max_service_s = max(global_max_service_s, estimated_service_s)
 ```text
 mark_sacrificial =
     credits > 0
+    and global_max_service_s > 0
     and estimated_service_s >= threshold_ratio * global_max_service_s
 ```
 
 ### Dispatcher 分卡
 
 ```text
-weighted_total_load_s
+score_backend
 = normal_load_s + α * sacrificial_load_s
-```
-
-```text
-choose backend = argmin(weighted_total_load_s)
 ```
 
 ### Server 剩余耗时
@@ -638,229 +605,204 @@ remaining_service_s
 current_time_s += total_service_s * work_done / total_cost
 ```
 
-### Server 主优先级
+### Server normal key
 
 ```text
-predicted_latency_s
-= current_time_s + remaining_service_s - arrival_time_s
+key_normal = -(remaining_service_s - arrival_time_s)
 ```
 
-### Server 调度
+### Server sacrificial key
 
 ```text
-normal first
-then sacrificial
+key_sacrificial = +(remaining_service_s - arrival_time_s)
 ```
 
 
-## 14. 建议给重写同事的话
+## 13. 推荐给后续维护者的话
 
-如果目标是“先验证策略本身，而不是优化到极限”，建议第一版只保留：
+如果你要继续改 `super_p95`，优先遵守这三条：
 
-- dispatcher：
-  - `credits`
-  - `global_max_service_s`
-  - `weighted_total_load_s`
-- server：
-  - `normal_heap`
-  - `sacrificial_heap`
-  - `predicted_latency_s = current_time + remaining - arrival`
-
-先不要上：
-
-- prefix wait
-- 老队列选 sacrificial
-- 复杂全局 regret
-- 默认 step-level preemption
-
-这样更容易复现策略本身，也更容易排查性能问题。
+1. 先保证 dispatcher / server / benchmark 三层拓扑一致，再谈性能。
+2. 先检查是不是实现和文档不一致，再怀疑策略本身。
+3. 对 `Wan2.2`，优先怀疑 preemption-capable denoise path 的实现开销，而不是先怀疑调度公式。
 
 
-## 15. Qwen-Image P95 Sweep Commands
+## 14. 最新实验记录
 
-目标：
+这一节记录最近一次已经对齐实现后的 benchmark 结果，避免后续重复踩坑。
 
-- 横轴：`request_rate = 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8`
-- 纵轴：`latency_p95`
-- 对比：`baseline` vs `super_p95`
 
-说明：
+### 14.1 实验 setup
 
-- 当前 benchmark 的 `--request-rate` 实现是固定间隔发请求，不是 Poisson。
-- 建议两组实验都使用相同 workload、相同 seed、相同 `random_request_seed`。
-- 默认 sweep 配置使用 `500` 条请求。
-- `baseline` 和 `super_p95` 都通过同一个 dispatcher 统一对外暴露 `8080`。
-- `baseline` 关闭 sacrificial 分类，关闭 server 异步抢占，并关闭 backend local scheduler，尽量贴近 `v0.16.0` 的直通执行路径。
-- `super_p95` 开启 sacrificial 分类，并开启 server 异步抢占。
-- dispatcher managed launch 在检测到 `numactl` 和有效的 NPU NUMA node 后，会自动为每个 backend 做 `cpunodebind/membind` 绑定。
+#### Qwen-Image
 
-### 15.1 固定 workload
+- 模型：
+  - `Qwen/Qwen-Image`
+- server 拓扑：
+  - dispatcher 对外 `:8080`
+  - 多个 managed backend
+- workload：
+  - `QWEN_IMAGE_RANDOM4`
+  - `500` requests
+- 对比：
+  - `baseline`
+  - `super_p95`
+- 指标：
+  - 重点看 `latency_p95`
+
+#### Wan2.2
+
+- 模型：
+  - `Wan-AI/Wan2.2-T2V-A14B-Diffusers`
+- server 拓扑：
+  - dispatcher `:8080`
+  - 单个 managed backend `:8091`
+- backend 配置：
+  - `--usp 8`
+  - `--enable-layerwise-offload`
+  - `--boundary-ratio 0.875`
+  - `--vae-use-slicing`
+  - `--vae-use-tiling`
+- workload：
+  - `WAN22_RANDOM3`
+  - `160` requests
+  - 固定 `seed=0`
+  - 固定 `random_request_seed=8`
+- 对比：
+  - `baseline`
+  - `super_p95`
+- rate：
+  - `0.012`
+  - `0.020`
+
+#### 统一注意事项
+
+- baseline 和 super 都统一通过 dispatcher 暴露 `:8080`
+- localhost 调试时必须带：
 
 ```bash
-export QWEN_IMAGE_RANDOM4='[
-  {"width":512,"height":512,"num_inference_steps":20,"weight":0.15},
-  {"width":768,"height":768,"num_inference_steps":20,"weight":0.25},
-  {"width":1024,"height":1024,"num_inference_steps":25,"weight":0.45},
-  {"width":1536,"height":1536,"num_inference_steps":35,"weight":0.15}
-]'
+NO_PROXY=127.0.0.1,localhost
+no_proxy=127.0.0.1,localhost
 ```
 
-### 15.2 Baseline Server Command
+- 启动前先检查：
 
 ```bash
-env NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost \
-python benchmarks/diffusion/super_p95_dispatcher.py \
-  --host 127.0.0.1 \
-  --port 8080 \
-  --num-servers 2 \
-  --device-ids 0,1 \
-  --backend-hardware-profiles 910B2,910B2 \
-  --model Qwen/Qwen-Image \
-  --backend-start-port 8091 \
-  --backend-args "--omni --vae-use-slicing --vae-use-tiling" \
-  --backend-env VLLM_PLUGINS=ascend \
-  --backend-env HF_HUB_OFFLINE=1 \
-  --backend-env VLLM_OMNI_ENABLE_DIFFUSION_SERVER_SCHEDULING=0 \
-  --backend-env VLLM_OMNI_ENABLE_DIFFUSION_PREEMPTION=0 \
-  --request-timeout-s 10000 \
-  --quota-every 20 \
-  --quota-amount 0
+npu-smi info
 ```
 
-### 15.3 Super-P95 Server Command
+确认没有残留运行进程
 
-```bash
-env NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost \
-python benchmarks/diffusion/super_p95_dispatcher.py \
-  --host 127.0.0.1 \
-  --port 8080 \
-  --num-servers 2 \
-  --device-ids 0,1 \
-  --backend-hardware-profiles 910B2,910B2 \
-  --model Qwen/Qwen-Image \
-  --backend-start-port 8091 \
-  --backend-args "--omni --vae-use-slicing --vae-use-tiling" \
-  --backend-env VLLM_PLUGINS=ascend \
-  --backend-env HF_HUB_OFFLINE=1 \
-  --backend-env VLLM_OMNI_ENABLE_DIFFUSION_PREEMPTION=1 \
-  --request-timeout-s 10000 \
-  --quota-every 20 \
-  --quota-amount 1 \
-  --threshold-ratio 0.8 \
-  --sacrificial-load-factor 0.1
-```
 
-### 15.4 Baseline Benchmark Command
+### 14.2 实验结果
 
-```bash
-mkdir -p /tmp/super_p95_plot/baseline
+#### Qwen-Image：baseline vs super_p95
 
-for rate in 0.2 0.3 0.4 0.5 0.6 0.7 0.8; do
-  env NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost \
-  python benchmarks/diffusion/diffusion_benchmark_serving.py \
-    --base-url http://127.0.0.1:8080 \
-    --model Qwen/Qwen-Image \
-    --backend vllm-omni \
-    --dataset random \
-    --task t2i \
-    --num-prompts 500 \
-    --max-concurrency 1000 \
-    --request-rate "${rate}" \
-    --warmup-requests 1 \
-    --warmup-num-inference-steps 1 \
-    --seed 0 \
-    --random-request-seed 8 \
-    --random-request-config "${QWEN_IMAGE_RANDOM4}" \
-    --run-label baseline \
-    --output-file "/tmp/super_p95_plot/baseline/rate_${rate}.json"
-done
-```
+| Rate | Baseline P95 (s) | Super P95 (s) | Speedup |
+|---|---:|---:|---:|
+| 0.2 | `49.79` | `49.35` | `1.009x` |
+| 0.3 | `49.57` | `49.64` | `0.999x` |
+| 0.4 | `55.14` | `56.83` | `0.970x` |
+| 0.5 | `141.63` | `95.30` | `1.486x` |
+| 0.6 | `276.89` | `181.82` | `1.523x` |
+| 0.7 | `391.25` | `291.50` | `1.342x` |
+| 0.8 | `461.92` | `374.87` | `1.232x` |
 
-### 15.5 Super-P95 Benchmark Command
+#### Wan2.2：baseline vs super_p95
 
-```bash
-mkdir -p /tmp/super_p95_plot/super_p95
+| Rate | Baseline Duration | Super Duration | Baseline P95 | Super P95 | Speedup |
+|---|---:|---:|---:|---:|---:|
+| 0.012 | `13485.18s` | `13485.96s` | `190.11s` | `195.32s` | `0.973x` |
+| 0.020 | `12641.97s` | `12609.25s` | `4343.80s` | `3890.77s` | `1.116x` |
 
-for rate in 0.2 0.3 0.4 0.5 0.6 0.7 0.8; do
-  env NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost \
-  python benchmarks/diffusion/diffusion_benchmark_serving.py \
-    --base-url http://127.0.0.1:8080 \
-    --model Qwen/Qwen-Image \
-    --backend vllm-omni \
-    --dataset random \
-    --task t2i \
-    --num-prompts 500 \
-    --max-concurrency 1000 \
-    --request-rate "${rate}" \
-    --warmup-requests 1 \
-    --warmup-num-inference-steps 1 \
-    --seed 0 \
-    --random-request-seed 8 \
-    --random-request-config "${QWEN_IMAGE_RANDOM4}" \
-    --run-label super_p95 \
-    --output-file "/tmp/super_p95_plot/super_p95/rate_${rate}.json"
-done
-```
+补充指标：
 
-### 15.6 Smoke Test
+`Wan2.2 @ 0.012`
+- baseline:
+  - `mean = 126.147s`
+  - `median = 124.569s`
+  - `P99 = 204.776s`
+- super:
+  - `mean = 126.387s`
+  - `median = 119.364s`
+  - `P99 = 343.511s`
 
-先做命令连通性验证时，可以把 `num-prompts` 降到 `4`，只跑单个 `request_rate`，例如 `0.2`：
+`Wan2.2 @ 0.020`
+- baseline:
+  - `mean = 2288.197s`
+  - `median = 2311.784s`
+  - `P99 = 4605.198s`
+- super:
+  - `mean = 2205.855s`
+  - `median = 1981.146s`
+  - `P99 = 9906.762s`
 
-```bash
-env NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost \
-python benchmarks/diffusion/diffusion_benchmark_serving.py \
-  --base-url http://127.0.0.1:8080 \
-  --model Qwen/Qwen-Image \
-  --backend vllm-omni \
-  --dataset random \
-  --task t2i \
-  --num-prompts 4 \
-  --max-concurrency 1000 \
-  --request-rate 0.2 \
-  --warmup-requests 1 \
-  --warmup-num-inference-steps 1 \
-  --seed 0 \
-  --random-request-seed 8 \
-  --random-request-config "${QWEN_IMAGE_RANDOM4}" \
-  --run-label smoke \
-  --output-file /tmp/super_p95_plot/smoke_rate_0.2.json
-```
 
-### 15.7 Output JSON Fields
+### 14.3 实验分析
 
-当前 `--output-file` 会写出：
+#### Qwen-Image
 
-- 聚合指标：
-  - `duration`
-  - `completed_requests`
-  - `failed_requests`
-  - `throughput_qps`
-  - `latency_mean`
-  - `latency_median`
-  - `latency_p95`
-  - `latency_p99`
-- 复现元数据：
-  - `run_label`
-  - `generated_at_utc`
-  - `base_url`
-  - `request_rate`
-  - `traffic_schedule`
-  - `num_prompts`
-  - `max_concurrency`
-  - `warmup_requests`
-  - `warmup_num_inference_steps`
-  - `seed`
-  - `random_request_seed`
-  - `random_request_config`
-  - `backend`
-  - `model`
-  - `dataset`
-  - `task`
+当前结论很稳定：
 
-绘图时直接读取每个 JSON 的：
+- 低压区：
+  - `0.2 ~ 0.4`
+  - baseline 与 `super_p95` 接近
+  - 有时 baseline 略好
+- 高压区：
+  - `0.5 ~ 0.8`
+  - `super_p95` 对 `P95` 有明显收益
+
+这说明：
+- `Qwen-Image` 上，`super_p95` 的主要价值在高压区
+- 低压时系统还没形成明显 waiting set，策略收益有限
+
+#### Wan2.2
+
+当前结论是：
+
+- `0.012`
+  - 还没明显打满
+  - baseline 与 `super_p95` 非常接近
+  - baseline 的 `P95` 略好
+- `0.020`
+  - 明显进入高压区
+  - `super_p95` 开始体现 `P95` 收益
+  - 相比 baseline 改善约 `453s`
+
+也就是说：
+
+- `Wan2.2` 的 `super_p95` 不是在所有负载下都占优
+- 它的价值主要体现在高压区
+
+#### Wan2.2 近期关键性能修复
+
+最近这一轮定位到并修复的主问题是：
+
+- `Wan2.2` preemption-capable denoise path 在普通 non-expand T2V 分支里
+- 每个 step 都在 device 上现造一套不必要的 `mask -> flatten -> expand` timestep
+- baseline 路径并不需要这套额外工作
+
+修复后：
+- `super_p95` 的系统性慢问题已经大幅收敛
+- 当前剩余的主要现象已经不是“整体都慢”，而更多是高压下的 tail tradeoff
+
+#### 当前还需记住的结论
+
+- `super_p95` 是策略名
+- `P95` 是指标名
+- 讨论“好不好”时，先明确是在说：
+  - 策略
+  - 还是指标
+
+对当前项目来说，优先级最高的指标仍然是：
 
 ```text
-x = request_rate
-y = latency_p95
-group = run_label
+latency_p95
 ```
+
+不是：
+- `duration`
+- `mean`
+- `P99`
+
+这些指标仍然值得看，但不应该盖过主目标。

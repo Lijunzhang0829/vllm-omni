@@ -21,7 +21,7 @@ set -euo pipefail
 #
 # Baseline, 8x 910B3:
 # env NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost \
-# python benchmarks/diffusion/super_p95_dispatcher.py \
+# python3 benchmarks/diffusion/super_p95_dispatcher.py \
 #   --host 127.0.0.1 \
 #   --port 8080 \
 #   --num-servers 8 \
@@ -29,7 +29,9 @@ set -euo pipefail
 #   --backend-hardware-profiles 910B3 \
 #   --model Qwen/Qwen-Image \
 #   --backend-start-port 8091 \
-#   --backend-args "--omni --vae-use-slicing --vae-use-tiling" \
+#   --backend-args=--omni \
+#   --backend-args=--vae-use-slicing \
+#   --backend-args=--vae-use-tiling \
 #   --backend-env VLLM_PLUGINS=ascend \
 #   --backend-env HF_HUB_OFFLINE=1 \
 #   --backend-env VLLM_OMNI_ENABLE_DIFFUSION_SERVER_SCHEDULING=0 \
@@ -40,7 +42,7 @@ set -euo pipefail
 #
 # Super-P95, 8x 910B3:
 # env NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost \
-# python benchmarks/diffusion/super_p95_dispatcher.py \
+# python3 benchmarks/diffusion/super_p95_dispatcher.py \
 #   --host 127.0.0.1 \
 #   --port 8080 \
 #   --num-servers 8 \
@@ -48,9 +50,12 @@ set -euo pipefail
 #   --backend-hardware-profiles 910B3 \
 #   --model Qwen/Qwen-Image \
 #   --backend-start-port 8091 \
-#   --backend-args "--omni --vae-use-slicing --vae-use-tiling" \
+#   --backend-args=--omni \
+#   --backend-args=--vae-use-slicing \
+#   --backend-args=--vae-use-tiling \
 #   --backend-env VLLM_PLUGINS=ascend \
 #   --backend-env HF_HUB_OFFLINE=1 \
+#   --backend-env VLLM_OMNI_ENABLE_DIFFUSION_SERVER_SCHEDULING=1 \
 #   --backend-env VLLM_OMNI_ENABLE_DIFFUSION_PREEMPTION=1 \
 #   --request-timeout-s 1000000 \
 #   --quota-every 20 \

@@ -12,49 +12,51 @@ set -euo pipefail
 #     flow_shift=5.0  for 720p
 #
 # Baseline via dispatcher with a single managed backend:
-# export VLLM_OMNI_ENABLE_DIFFUSION_SERVER_SCHEDULING=0
-# export VLLM_OMNI_ENABLE_DIFFUSION_PREEMPTION=0
-# python benchmarks/diffusion/super_p95_dispatcher.py \
+# env NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost \
+# VLLM_OMNI_ENABLE_DIFFUSION_SERVER_SCHEDULING=0 \
+# VLLM_OMNI_ENABLE_DIFFUSION_PREEMPTION=0 \
+# python3 benchmarks/diffusion/super_p95_dispatcher.py \
 #   --host 0.0.0.0 \
 #   --port 8080 \
 #   --model Wan-AI/Wan2.2-T2V-A14B-Diffusers \
-#   --managed-backends 1 \
+#   --num-servers 1 \
 #   --backend-start-port 8091 \
 #   --device-env-var ASCEND_RT_VISIBLE_DEVICES \
 #   --backend-hardware-profiles 910B3 \
 #   --backend-log-dir /tmp/super_p95_backends_wan22_baseline \
 #   --request-timeout-s 1000000 \
-#   --backend-arg=--omni \
-#   --backend-arg=--usp \
-#   --backend-arg=8 \
-#   --backend-arg=--enable-layerwise-offload \
-#   --backend-arg=--boundary-ratio \
-#   --backend-arg=0.875 \
-#   --backend-arg=--vae-use-slicing \
-#   --backend-arg=--vae-use-tiling
+#   --backend-args=--omni \
+#   --backend-args=--usp \
+#   --backend-args=8 \
+#   --backend-args=--enable-layerwise-offload \
+#   --backend-args=--boundary-ratio \
+#   --backend-args=0.875 \
+#   --backend-args=--vae-use-slicing \
+#   --backend-args=--vae-use-tiling
 #
 # super_p95 via dispatcher with a single managed backend:
-# export VLLM_OMNI_ENABLE_DIFFUSION_SERVER_SCHEDULING=1
-# export VLLM_OMNI_ENABLE_DIFFUSION_PREEMPTION=1
-# python benchmarks/diffusion/super_p95_dispatcher.py \
+# env NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost \
+# VLLM_OMNI_ENABLE_DIFFUSION_SERVER_SCHEDULING=1 \
+# VLLM_OMNI_ENABLE_DIFFUSION_PREEMPTION=1 \
+# python3 benchmarks/diffusion/super_p95_dispatcher.py \
 #   --host 0.0.0.0 \
 #   --port 8080 \
 #   --model Wan-AI/Wan2.2-T2V-A14B-Diffusers \
-#   --managed-backends 1 \
+#   --num-servers 1 \
 #   --backend-start-port 8091 \
 #   --device-env-var ASCEND_RT_VISIBLE_DEVICES \
 #   --backend-hardware-profiles 910B3 \
 #   --backend-log-dir /tmp/super_p95_backends_wan22 \
 #   --request-timeout-s 1000000 \
 #   --sacrificial-load-factor 0.1 \
-#   --backend-arg=--omni \
-#   --backend-arg=--usp \
-#   --backend-arg=8 \
-#   --backend-arg=--enable-layerwise-offload \
-#   --backend-arg=--boundary-ratio \
-#   --backend-arg=0.875 \
-#   --backend-arg=--vae-use-slicing \
-#   --backend-arg=--vae-use-tiling
+#   --backend-args=--omni \
+#   --backend-args=--usp \
+#   --backend-args=8 \
+#   --backend-args=--enable-layerwise-offload \
+#   --backend-args=--boundary-ratio \
+#   --backend-args=0.875 \
+#   --backend-args=--vae-use-slicing \
+#   --backend-args=--vae-use-tiling
 
 usage() {
   cat <<'EOF'
@@ -70,9 +72,9 @@ Description:
 Environment overrides:
   BASE_URL            Default: http://127.0.0.1:8080
   MODEL               Default: Wan-AI/Wan2.2-T2V-A14B-Diffusers
-  NUM_PROMPTS         Default: 500
+  NUM_PROMPTS         Default: 160
   MAX_CONCURRENCY     Default: 1000
-  REQUEST_RATES       Default: "0.005 0.01 0.015 0.02 0.025 0.03"
+  REQUEST_RATES       Default: "0.012 0.020"
   WARMUP_REQUESTS     Default: 0
   SEED                Default: 0
   RANDOM_REQUEST_SEED Default: 8
@@ -99,9 +101,9 @@ esac
 
 BASE_URL="${BASE_URL:-http://127.0.0.1:8080}"
 MODEL="${MODEL:-Wan-AI/Wan2.2-T2V-A14B-Diffusers}"
-NUM_PROMPTS="${NUM_PROMPTS:-500}"
+NUM_PROMPTS="${NUM_PROMPTS:-160}"
 MAX_CONCURRENCY="${MAX_CONCURRENCY:-1000}"
-REQUEST_RATES="${REQUEST_RATES:-0.005 0.01 0.015 0.02 0.025 0.03}"
+REQUEST_RATES="${REQUEST_RATES:-0.012 0.020}"
 WARMUP_REQUESTS="${WARMUP_REQUESTS:-0}"
 SEED="${SEED:-0}"
 RANDOM_REQUEST_SEED="${RANDOM_REQUEST_SEED:-8}"
