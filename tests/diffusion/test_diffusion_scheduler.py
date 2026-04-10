@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import threading
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
@@ -22,7 +23,6 @@ from vllm_omni.diffusion.super_p95 import (
     EXTRA_ARG_SUPER_P95_SACRIFICIAL,
     parse_super_p95_load_metrics,
 )
-from vllm_omni.diffusion.worker.utils import RunnerOutput
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
@@ -356,26 +356,25 @@ class TestSuperP95RequestScheduler:
         assert snapshot.normal_load_s == 0.0
         assert snapshot.sacrificial_load_s == 100.0
 
-    def test_stepwise_output_requeues_unfinished_request(self) -> None:
+    def test_partial_output_requeues_unfinished_request(self) -> None:
         req_id = self.scheduler.add_request(
             OmniDiffusionRequest(
-                prompts=["prompt_stepwise"],
+                prompts=["prompt_async"],
                 sampling_params=OmniDiffusionSamplingParams(
                     num_inference_steps=4,
                     extra_args={EXTRA_ARG_SUPER_P95_ESTIMATED_SERVICE_S: 40.0},
                 ),
-                request_ids=["stepwise"],
+                request_ids=["async"],
             )
         )
 
         sched_output = self.scheduler.schedule()
         finished = self.scheduler.update_from_output(
             sched_output,
-            RunnerOutput(
-                req_id=req_id,
-                step_index=1,
+            DiffusionOutput(
+                output=None,
                 finished=False,
-                result=None,
+                scheduler_state={"completed_steps": 1},
             ),
         )
 
@@ -483,27 +482,47 @@ class TestDiffusionEngine:
         assert snapshot.normal_load_s == 12.5
         assert snapshot.sacrificial_load_s == 3.0
 
-    def test_add_req_and_wait_uses_stepwise_path_when_preemption_enabled(self) -> None:
+    def test_maybe_request_active_preemption_prefers_urgent_pending_request(self) -> None:
         engine = DiffusionEngine.__new__(DiffusionEngine)
         engine.od_config = Mock(model_class_name="QwenImagePipeline")
         engine.scheduler = SuperP95RequestScheduler()
         engine.scheduler.initialize(Mock())
-        engine.executor = Mock()
-        engine._rpc_lock = threading.Lock()
-
-        request = OmniDiffusionRequest(
-            prompts=["prompt_step_engine"],
-            sampling_params=OmniDiffusionSamplingParams(
-                num_inference_steps=2,
-                extra_args={EXTRA_ARG_SUPER_P95_ESTIMATED_SERVICE_S: 20.0},
-            ),
-            request_ids=["engine-step"],
+        engine.executor = Mock(
+            _preempt_event=Mock(),
+            _active_completed_steps=SimpleNamespace(value=0),
         )
+        engine._active_preemption_requested = False
 
-        engine.executor.collective_rpc.side_effect = [
-            [RunnerOutput(req_id="engine-step", step_index=1, finished=False, result=None)],
-            [RunnerOutput(req_id="engine-step", step_index=2, finished=True, result=DiffusionOutput(output=None))],
-        ]
+        active_req_id = engine.scheduler.add_request(
+            OmniDiffusionRequest(
+                prompts=["active"],
+                sampling_params=OmniDiffusionSamplingParams(
+                    num_inference_steps=4,
+                    extra_args={
+                        EXTRA_ARG_SUPER_P95_SACRIFICIAL: True,
+                        EXTRA_ARG_SUPER_P95_ESTIMATED_SERVICE_S: 40.0,
+                    },
+                ),
+                request_ids=["active"],
+            )
+        )
+        sched_output = engine.scheduler.schedule()
+        assert sched_output.scheduled_req_ids == [active_req_id]
+        engine._active_sched_req_id = active_req_id
+
+        engine.scheduler.add_request(
+            OmniDiffusionRequest(
+                prompts=["pending"],
+                sampling_params=OmniDiffusionSamplingParams(
+                    num_inference_steps=1,
+                    extra_args={
+                        EXTRA_ARG_SUPER_P95_SACRIFICIAL: False,
+                        EXTRA_ARG_SUPER_P95_ESTIMATED_SERVICE_S: 5.0,
+                    },
+                ),
+                request_ids=["pending"],
+            )
+        )
 
         with patch.dict(
             "os.environ",
@@ -513,10 +532,10 @@ class TestDiffusionEngine:
             },
             clear=False,
         ):
-            output = engine.add_req_and_wait_for_response(request)
+            should_preempt = engine._maybe_request_active_preemption_locked()
 
-        assert output.error is None
-        assert engine.executor.collective_rpc.call_count == 2
+        assert should_preempt is True
+        assert engine._active_preemption_requested is True
 
     def test_scheduler_alias_keeps_default_request_scheduler(self) -> None:
         scheduler = Scheduler()

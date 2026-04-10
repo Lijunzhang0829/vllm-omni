@@ -542,7 +542,8 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
 
     @property
     def interrupt(self):
-        return self._interrupt
+        interrupt_event = getattr(self, "_interrupt_event", None)
+        return self._interrupt or (interrupt_event is not None and interrupt_event.is_set())
 
     def _extract_prompts(self, prompts):
         """Extract prompt and negative_prompt from OmniPromptType list."""
@@ -729,6 +730,151 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
         state.sampling.cfg_normalize = True
 
         return state
+
+    def _init_generation_state(
+        self,
+        req: OmniDiffusionRequest,
+        negative_prompt: str | list[str] | None,
+        true_cfg_scale: float,
+        num_inference_steps: int,
+        sigmas: list[float] | None,
+        guidance_scale: float,
+        num_images_per_prompt: int,
+        generator: torch.Generator | list[torch.Generator] | None,
+        latents: torch.Tensor | None,
+        prompt_embeds: torch.Tensor | None,
+        prompt_embeds_mask: torch.Tensor | None,
+        negative_prompt_embeds: torch.Tensor | None,
+        negative_prompt_embeds_mask: torch.Tensor | None,
+        attention_kwargs: dict[str, Any] | None,
+        max_sequence_length: int,
+    ) -> dict[str, Any]:
+        prompt = [p if isinstance(p, str) else (p.get("prompt") or "") for p in req.prompts]
+        height = req.sampling_params.height or self.default_sample_size * self.vae_scale_factor
+        width = req.sampling_params.width or self.default_sample_size * self.vae_scale_factor
+
+        ctx = self._prepare_generation_context(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            height=height,
+            width=width,
+            num_inference_steps=num_inference_steps,
+            sigmas=sigmas,
+            guidance_scale=guidance_scale,
+            num_images_per_prompt=num_images_per_prompt,
+            generator=generator,
+            true_cfg_scale=true_cfg_scale,
+            max_sequence_length=max_sequence_length,
+            prompt_embeds=prompt_embeds,
+            prompt_embeds_mask=prompt_embeds_mask,
+            negative_prompt_embeds=negative_prompt_embeds,
+            negative_prompt_embeds_mask=negative_prompt_embeds_mask,
+            latents=latents,
+            attention_kwargs=attention_kwargs,
+        )
+
+        return {
+            "height": height,
+            "width": width,
+            "latents": ctx["latents"],
+            "timesteps": ctx["timesteps"],
+            "num_inference_steps": num_inference_steps,
+            "sigmas": sigmas,
+            "image_seq_len": ctx["latents"].shape[1],
+            "next_step_index": 0,
+            "do_true_cfg": ctx["do_true_cfg"],
+            "guidance": ctx["guidance"],
+            "true_cfg_scale": true_cfg_scale,
+            "prompt_embeds": ctx["prompt_embeds"],
+            "prompt_embeds_mask": ctx["prompt_embeds_mask"],
+            "negative_prompt_embeds": ctx["negative_prompt_embeds"],
+            "negative_prompt_embeds_mask": ctx["negative_prompt_embeds_mask"],
+            "img_shapes": ctx["img_shapes"],
+            "txt_seq_lens": ctx["txt_seq_lens"],
+            "negative_txt_seq_lens": ctx["negative_txt_seq_lens"],
+            "attention_kwargs": attention_kwargs or {},
+            "output_type": "pil",
+        }
+
+    def _restore_scheduler_state(self, state: dict[str, Any]) -> None:
+        timesteps, _ = self.prepare_timesteps(
+            state["num_inference_steps"],
+            state["sigmas"],
+            state["image_seq_len"],
+        )
+        state["timesteps"] = timesteps
+        self._num_timesteps = len(timesteps)
+
+    def _run_generation_steps(self, state: dict[str, Any]) -> tuple[dict[str, Any], bool, int]:
+        self._restore_scheduler_state(state)
+        timesteps = state["timesteps"]
+        start_index = int(state["next_step_index"])
+        if start_index >= len(timesteps):
+            raise RuntimeError(
+                f"Invalid resume step for request_key={state.get('request_key')}: "
+                f"start_index={start_index} >= timesteps_len={len(timesteps)}"
+            )
+
+        self.scheduler.set_begin_index(start_index)
+        self.transformer.do_true_cfg = state["do_true_cfg"]
+        latents = state["latents"]
+        completed_steps = 0
+        progress = getattr(self, "_active_completed_steps", None)
+
+        for step_index in range(start_index, len(timesteps)):
+            if completed_steps > 0 and self.interrupt:
+                break
+            t = timesteps[step_index]
+            self._current_timestep = t
+            positive_kwargs, negative_kwargs, output_slice = self._build_denoise_kwargs(
+                latents=latents,
+                timestep=t if torch.is_tensor(t) else torch.tensor(t, device=latents.device, dtype=latents.dtype),
+                guidance=state["guidance"],
+                prompt_embeds=state["prompt_embeds"],
+                prompt_embeds_mask=state["prompt_embeds_mask"],
+                img_shapes=state["img_shapes"],
+                txt_seq_lens=state["txt_seq_lens"],
+                do_true_cfg=state["do_true_cfg"],
+                negative_prompt_embeds=state["negative_prompt_embeds"],
+                negative_prompt_embeds_mask=state["negative_prompt_embeds_mask"],
+                negative_txt_seq_lens=state["negative_txt_seq_lens"],
+                extra_transformer_kwargs={
+                    "return_dict": False,
+                    "attention_kwargs": state["attention_kwargs"],
+                },
+            )
+            noise_pred = self.predict_noise_maybe_with_cfg(
+                state["do_true_cfg"],
+                state["true_cfg_scale"],
+                positive_kwargs,
+                negative_kwargs,
+                True,
+                output_slice,
+            )
+            latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, state["do_true_cfg"])
+            completed_steps += 1
+            if progress is not None:
+                try:
+                    if completed_steps > int(progress.value):
+                        progress.value = completed_steps
+                except (AttributeError, TypeError, ValueError):
+                    pass
+
+            if self.interrupt and step_index + 1 < len(timesteps):
+                break
+
+        end_index = start_index + completed_steps
+        state["latents"] = latents
+        state["next_step_index"] = end_index
+        return state, end_index >= len(timesteps), completed_steps
+
+    def _decode_generation_state(self, state: dict[str, Any], output_type: str | None) -> torch.Tensor:
+        return self._decode_latents(
+            state["latents"],
+            state["height"],
+            state["width"],
+            output_type or "pil",
+        ).output
 
     def _build_denoise_kwargs(
         self,
@@ -950,6 +1096,48 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
             if req.sampling_params.num_outputs_per_prompt > 0
             else num_images_per_prompt
         )
+        scheduling_args = req.sampling_params.extra_args
+        preemption_enabled = bool(scheduling_args.get("_server_preemption_enabled", False))
+        state = scheduling_args.get("_server_state")
+        self._interrupt = False
+
+        if preemption_enabled:
+            if state is None:
+                state = self._init_generation_state(
+                    req,
+                    negative_prompt,
+                    true_cfg_scale,
+                    num_inference_steps,
+                    sigmas,
+                    guidance_scale,
+                    num_images_per_prompt,
+                    generator,
+                    latents,
+                    prompt_embeds,
+                    prompt_embeds_mask,
+                    negative_prompt_embeds,
+                    negative_prompt_embeds_mask,
+                    attention_kwargs,
+                    max_sequence_length,
+                )
+            state["output_type"] = output_type
+            state, finished, completed_steps = self._run_generation_steps(state)
+            self._current_timestep = None
+            request_key = req.request_ids[0] if req.request_ids else None
+            if not finished:
+                state["completed_steps"] = completed_steps
+                return DiffusionOutput(
+                    output=None,
+                    finished=False,
+                    request_key=request_key,
+                    scheduler_state=state,
+                )
+            image = self._decode_generation_state(state, output_type)
+            return DiffusionOutput(
+                output=image,
+                finished=True,
+                request_key=request_key,
+            )
 
         ctx = self._prepare_generation_context(
             prompt=prompt,

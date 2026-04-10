@@ -658,6 +658,10 @@ class DiffusionOutput:
     trajectory_latents: torch.Tensor | None = None
     trajectory_decoded: list[torch.Tensor] | None = None
     error: str | None = None
+    finished: bool = True
+    request_key: str | None = None
+    scheduler_metadata: dict[str, Any] = field(default_factory=dict)
+    scheduler_state: dict[str, Any] | None = None
 
     post_process_func: Callable[..., Any] | None = None
 

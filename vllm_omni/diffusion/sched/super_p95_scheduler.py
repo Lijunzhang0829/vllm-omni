@@ -24,8 +24,6 @@ from vllm_omni.diffusion.super_p95 import (
     normalize_super_p95_hardware_profile,
     SuperP95LoadSnapshot,
 )
-from vllm_omni.diffusion.worker.utils import RunnerOutput
-
 logger = init_logger(__name__)
 
 
@@ -38,6 +36,7 @@ class _QueuedRequest:
     estimated_service_s: float = field(compare=False)
     total_steps: int = field(compare=False, default=1)
     completed_steps: int = field(compare=False, default=0)
+    dispatch_start_completed_steps: int = field(compare=False, default=0)
     is_sacrificial: bool = field(compare=False, default=False)
 
     def __post_init__(self) -> None:
@@ -83,9 +82,9 @@ class SuperP95RequestScheduler(_BaseScheduler):
             if queued is None:
                 continue
             if queued.is_sacrificial:
-                sacrificial_load_s += queued.estimated_service_s
+                sacrificial_load_s += queued.remaining_service_s
             else:
-                normal_load_s += queued.estimated_service_s
+                normal_load_s += queued.remaining_service_s
         return SuperP95LoadSnapshot(
             normal_load_s=normal_load_s,
             sacrificial_load_s=sacrificial_load_s,
@@ -162,7 +161,7 @@ class SuperP95RequestScheduler(_BaseScheduler):
         self._finished_req_ids.clear()
         return scheduler_output
 
-    def update_from_output(self, sched_output: DiffusionSchedulerOutput, output: DiffusionOutput | RunnerOutput) -> set[str]:
+    def update_from_output(self, sched_output: DiffusionSchedulerOutput, output: DiffusionOutput) -> set[str]:
         scheduled_req_ids = sched_output.scheduled_req_ids
         if not scheduled_req_ids:
             return set()
@@ -172,15 +171,22 @@ class SuperP95RequestScheduler(_BaseScheduler):
         }
         terminal_statuses: dict[str, DiffusionRequestStatus] = {}
         terminal_errors: dict[str, str | None] = {}
-        if isinstance(output, RunnerOutput):
-            return self._update_from_stepwise_output(scheduled_req_ids, output)
         for sched_req_id in scheduled_req_ids:
             state = self._request_states.get(sched_req_id)
             if state is None or state.is_finished():
                 continue
             queued = self._queue_metadata.get(sched_req_id)
+            if queued is not None and not output.finished:
+                self._apply_partial_progress(queued, output)
+                if sched_req_id in self._running:
+                    self._running.remove(sched_req_id)
+                self._waiting.appendleft(sched_req_id)
+                state.status = DiffusionRequestStatus.PREEMPTED
+                self._push_pending(queued)
+                continue
             if queued is not None:
-                self._current_time_s += queued.estimated_service_s
+                self._current_time_s += queued.remaining_service_s
+                queued.completed_steps = queued.total_steps
             if output.error:
                 terminal_statuses[sched_req_id] = DiffusionRequestStatus.FINISHED_ERROR
                 terminal_errors[sched_req_id] = output.error
@@ -189,41 +195,6 @@ class SuperP95RequestScheduler(_BaseScheduler):
                 terminal_errors[sched_req_id] = None
 
         finished_req_ids |= self._finish_requests(terminal_statuses, terminal_errors)
-        return finished_req_ids
-
-    def _update_from_stepwise_output(self, scheduled_req_ids: list[str], output: RunnerOutput) -> set[str]:
-        finished_req_ids = {
-            sched_req_id for sched_req_id in scheduled_req_ids if sched_req_id in self._finished_req_ids
-        }
-        if len(scheduled_req_ids) != 1:
-            raise ValueError("SuperP95 stepwise mode expects exactly one scheduled request.")
-
-        sched_req_id = scheduled_req_ids[0]
-        state = self._request_states.get(sched_req_id)
-        if state is None or state.is_finished():
-            return finished_req_ids
-        queued = self._queue_metadata.get(sched_req_id)
-        if queued is not None:
-            queued.completed_steps = max(queued.completed_steps, int(output.step_index or 0))
-            self._current_time_s += queued.service_per_step_s
-
-        if sched_req_id in self._running:
-            self._running.remove(sched_req_id)
-
-        if output.finished:
-            error = output.result.error if output.result is not None else None
-            status = (
-                DiffusionRequestStatus.FINISHED_ERROR
-                if error
-                else DiffusionRequestStatus.FINISHED_COMPLETED
-            )
-            finished_req_ids |= self._finish_requests({sched_req_id: status}, {sched_req_id: error})
-            return finished_req_ids
-
-        self._waiting.appendleft(sched_req_id)
-        state.status = DiffusionRequestStatus.PREEMPTED
-        if queued is not None:
-            self._push_pending(queued)
         return finished_req_ids
 
     def abort_request(self, sched_req_id: str) -> bool:
@@ -268,5 +239,45 @@ class SuperP95RequestScheduler(_BaseScheduler):
             state = self._request_states.get(queued.sched_req_id)
             if state is None or state.is_finished():
                 continue
+            queued.dispatch_start_completed_steps = queued.completed_steps
             return queued
         return None
+
+    def peek_next_request(self) -> _QueuedRequest | None:
+        for heap in (self._normal_pending, self._sacrificial_pending):
+            while heap:
+                queued = heap[0]
+                state = self._request_states.get(queued.sched_req_id)
+                if state is None or state.is_finished():
+                    heapq.heappop(heap)
+                    continue
+                return queued
+        return None
+
+    @staticmethod
+    def request_outranks(candidate: _QueuedRequest, incumbent: _QueuedRequest) -> bool:
+        if candidate.is_sacrificial != incumbent.is_sacrificial:
+            return not candidate.is_sacrificial and incumbent.is_sacrificial
+        return candidate.sort_key < incumbent.sort_key
+
+    def get_queued_request(self, sched_req_id: str) -> _QueuedRequest | None:
+        return self._queue_metadata.get(sched_req_id)
+
+    def get_active_remaining_service_s(self, sched_req_id: str, completed_steps: int) -> float:
+        queued = self._queue_metadata.get(sched_req_id)
+        if queued is None:
+            return 0.0
+        dispatch_start_remaining_steps = max(queued.total_steps - queued.dispatch_start_completed_steps, 0)
+        completed_in_quantum = min(max(completed_steps, 0), dispatch_start_remaining_steps)
+        remaining_steps = max(dispatch_start_remaining_steps - completed_in_quantum, 0)
+        return queued.estimated_service_s * remaining_steps / max(queued.total_steps, 1)
+
+    def _apply_partial_progress(self, queued: _QueuedRequest, output: DiffusionOutput) -> None:
+        scheduler_state = output.scheduler_state or {}
+        completed_steps = max(int(scheduler_state.get("completed_steps", 0)), 0)
+        if completed_steps <= 0:
+            raise RuntimeError("Async-preempted diffusion request did not report any completed steps.")
+        dispatch_start_remaining_steps = max(queued.total_steps - queued.dispatch_start_completed_steps, 0)
+        completed_in_quantum = min(completed_steps, dispatch_start_remaining_steps)
+        self._current_time_s += queued.estimated_service_s * completed_in_quantum / max(queued.total_steps, 1)
+        queued.completed_steps = min(queued.dispatch_start_completed_steps + completed_in_quantum, queued.total_steps)

@@ -22,7 +22,6 @@ from vllm_omni.diffusion.registry import (
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched import RequestScheduler, SchedulerInterface, SuperP95RequestScheduler
 from vllm_omni.diffusion.super_p95 import snapshot_to_metrics
-from vllm_omni.diffusion.worker.utils import RunnerOutput
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -90,6 +89,20 @@ class DiffusionEngine:
         self.scheduler = scheduler
         self.scheduler.initialize(od_config)
         self._rpc_lock = threading.Lock()
+        self._scheduler_cv = threading.Condition()
+        self._async_outputs: dict[str, DiffusionOutput] = {}
+        self._async_errors: dict[str, BaseException] = {}
+        self._closed = False
+        self._active_sched_req_id: str | None = None
+        self._active_preemption_requested = False
+        self._scheduler_thread: threading.Thread | None = None
+        if self._uses_async_super_p95():
+            self._scheduler_thread = threading.Thread(
+                target=self._run_super_p95_scheduler_loop,
+                name="DiffusionSuperP95Scheduler",
+                daemon=True,
+            )
+            self._scheduler_thread.start()
 
         try:
             self._dummy_run()
@@ -294,8 +307,8 @@ class DiffusionEngine:
         return DiffusionEngine(config, scheduler=scheduler)
 
     def add_req_and_wait_for_response(self, request: OmniDiffusionRequest) -> DiffusionOutput:
-        if self._should_use_stepwise_super_p95(request):
-            return self._add_req_and_wait_stepwise(request)
+        if self._uses_async_super_p95():
+            return self._add_req_and_wait_async_super_p95(request)
 
         with self._rpc_lock:
             target_sched_req_id = self.scheduler.add_request(request)
@@ -329,44 +342,126 @@ class DiffusionEngine:
                     self.scheduler.pop_request_state(target_sched_req_id)
                     return output
 
-    def _should_use_stepwise_super_p95(self, request: OmniDiffusionRequest) -> bool:
+    def _uses_async_super_p95(self) -> bool:
         return (
             isinstance(self.scheduler, SuperP95RequestScheduler)
             and _server_scheduling_enabled()
-            and _preemption_enabled()
-            and self.od_config.model_class_name in {"QwenImagePipeline", "Wan22Pipeline", "WanPipeline"}
+        )
+
+    def _add_req_and_wait_async_super_p95(self, request: OmniDiffusionRequest) -> DiffusionOutput:
+        with self._scheduler_cv:
+            target_sched_req_id = self.scheduler.add_request(request)
+            should_preempt = self._maybe_request_active_preemption_locked()
+            self._scheduler_cv.notify_all()
+        if should_preempt:
+            preempt_event = getattr(self.executor, "_preempt_event", None)
+            if preempt_event is not None:
+                preempt_event.set()
+
+        with self._scheduler_cv:
+            while True:
+                error = self._async_errors.pop(target_sched_req_id, None)
+                if error is not None:
+                    self.scheduler.pop_request_state(target_sched_req_id)
+                    raise error
+                output = self._async_outputs.pop(target_sched_req_id, None)
+                if output is not None:
+                    self.scheduler.pop_request_state(target_sched_req_id)
+                    return output
+                self._scheduler_cv.wait(timeout=0.1)
+
+    def _run_super_p95_scheduler_loop(self) -> None:
+        while True:
+            with self._scheduler_cv:
+                self._scheduler_cv.wait_for(lambda: self._closed or self.scheduler.has_requests())
+                if self._closed and not self.scheduler.has_requests():
+                    return
+                sched_output = self.scheduler.schedule()
+                if sched_output.is_empty:
+                    continue
+                sched_req_id = sched_output.scheduled_req_ids[0]
+                state = self.scheduler.get_request_state(sched_req_id)
+                if state is None:
+                    continue
+                request = state.req
+                request.sampling_params.extra_args["_server_preemption_enabled"] = self._request_supports_async_preemption(
+                    request
+                )
+                self._mark_active_request_locked(sched_req_id)
+
+            try:
+                with self._rpc_lock:
+                    output = self.executor.add_req(request)
+            except Exception as exc:  # pragma: no cover - surfaced to caller
+                logger.error("Async super-p95 execution failed for %s", sched_req_id, exc_info=True)
+                output = DiffusionOutput(error=str(exc), request_key=request.request_ids[0] if request.request_ids else None)
+
+            with self._scheduler_cv:
+                finished_req_ids = self.scheduler.update_from_output(sched_output, output)
+                if sched_req_id in finished_req_ids:
+                    self._async_outputs[sched_req_id] = output
+                    self._scheduler_cv.notify_all()
+                self._clear_active_request_locked()
+
+    def _request_supports_async_preemption(self, request: OmniDiffusionRequest) -> bool:
+        return (
+            _preemption_enabled()
+            # Only enable async preemption for models whose request-mode
+            # pipeline already supports boundary-yield + resume semantics.
+            # Wan request-mode async preemption still needs a dedicated port;
+            # do not widen this set until that migration is complete.
+            and self.od_config.model_class_name in {"QwenImagePipeline"}
             and bool(getattr(request, "request_ids", None))
         )
 
-    def _add_req_and_wait_stepwise(self, request: OmniDiffusionRequest) -> DiffusionOutput:
-        with self._rpc_lock:
-            target_sched_req_id = self.scheduler.add_request(request)
+    def _mark_active_request_locked(self, sched_req_id: str) -> None:
+        self._active_sched_req_id = sched_req_id
+        self._active_preemption_requested = False
+        preempt_event = getattr(self.executor, "_preempt_event", None)
+        if preempt_event is not None:
+            preempt_event.clear()
+        progress = getattr(self.executor, "_active_completed_steps", None)
+        if progress is not None:
+            progress.value = 0
 
-            while True:
-                sched_output = self.scheduler.schedule()
-                if sched_output.is_empty:
-                    if not self.scheduler.has_requests():
-                        raise RuntimeError("Diffusion scheduler has no runnable requests.")
-                    continue
+    def _clear_active_request_locked(self) -> None:
+        preempt_event = getattr(self.executor, "_preempt_event", None)
+        if preempt_event is not None:
+            preempt_event.clear()
+        progress = getattr(self.executor, "_active_completed_steps", None)
+        if progress is not None:
+            progress.value = 0
+        self._active_sched_req_id = None
+        self._active_preemption_requested = False
 
-                responses = self.executor.collective_rpc(
-                    method="execute_stepwise",
-                    args=(sched_output,),
-                    unique_reply_rank=None,
-                )
-                runner_output = responses[0] if isinstance(responses, list) else responses
-                if not isinstance(runner_output, RunnerOutput):
-                    raise RuntimeError(f"Unexpected response type for execute_stepwise: {type(runner_output)!r}")
-
-                finished_req_ids = self.scheduler.update_from_output(sched_output, runner_output)
-                if target_sched_req_id not in finished_req_ids:
-                    continue
-
-                self.scheduler.pop_request_state(target_sched_req_id)
-                result = runner_output.result
-                if result is None:
-                    return DiffusionOutput(error="stepwise diffusion request finished without result")
-                return result
+    def _maybe_request_active_preemption_locked(self) -> bool:
+        if not _preemption_enabled() or self._active_preemption_requested:
+            return False
+        if not isinstance(self.scheduler, SuperP95RequestScheduler):
+            return False
+        active_sched_req_id = self._active_sched_req_id
+        if active_sched_req_id is None:
+            return False
+        active_state = self.scheduler.get_request_state(active_sched_req_id)
+        if active_state is None or not self._request_supports_async_preemption(active_state.req):
+            return False
+        candidate = self.scheduler.peek_next_request()
+        incumbent = self.scheduler.get_queued_request(active_sched_req_id)
+        if candidate is None or incumbent is None:
+            return False
+        progress = getattr(self.executor, "_active_completed_steps", None)
+        completed_steps = 0 if progress is None else max(int(progress.value), 0)
+        active_remaining_s = self.scheduler.get_active_remaining_service_s(active_sched_req_id, completed_steps)
+        original_sort_key = incumbent.sort_key
+        incumbent.refresh_sort_key(active_remaining_s)
+        try:
+            outranks = self.scheduler.request_outranks(candidate, incumbent)
+        finally:
+            incumbent.sort_key = original_sort_key
+        if not outranks:
+            return False
+        self._active_preemption_requested = True
+        return True
 
     def profile(self, is_start: bool = True, profile_prefix: str | None = None) -> None:
         """Start or stop torch profiling on all diffusion workers.
@@ -491,6 +586,12 @@ class DiffusionEngine:
                 self._rpc_lock.release()
 
     def close(self) -> None:
+        self._closed = True
+        if hasattr(self, "_scheduler_cv"):
+            with self._scheduler_cv:
+                self._scheduler_cv.notify_all()
+        if getattr(self, "_scheduler_thread", None) is not None:
+            self._scheduler_thread.join(timeout=5)
         if hasattr(self, "scheduler"):
             self.scheduler.close()
         if hasattr(self, "executor"):

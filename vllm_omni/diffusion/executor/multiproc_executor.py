@@ -57,6 +57,8 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
     def _init_executor(self) -> None:
         self._processes: list[mp.Process] = []
         self._closed = False
+        self._preempt_event = mp.Event()
+        self._active_completed_steps = mp.Value("i", 0)
 
         num_workers = self.od_config.num_gpus
         self._broadcast_mq = self._init_broadcast_queue(num_workers)
@@ -120,6 +122,8 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                     od_config,
                     writer,
                     broadcast_handle,
+                    self._preempt_event,
+                    self._active_completed_steps,
                     worker_extension_cls,
                     custom_pipeline_args,
                 ),
