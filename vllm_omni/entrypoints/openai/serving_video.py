@@ -14,7 +14,11 @@ from vllm.engine.protocol import EngineClient
 from vllm.logger import init_logger
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni
-from vllm_omni.diffusion.super_p95 import apply_super_p95_request_headers
+from vllm_omni.diffusion.super_p95 import (
+    apply_super_p95_request_headers,
+    snapshot_to_metrics,
+    parse_super_p95_load_metrics,
+)
 from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoData,
     VideoGenerationRequest,
@@ -80,10 +84,6 @@ class OmniOpenAIServingVideo:
         reference_image: ReferenceImage | None = None,
         request_headers: dict[str, str] | None = None,
     ) -> VideoGenerationResponse:
-        # TODO(v0.18-super-p95): Video responses still do not expose
-        # authoritative super-p95 load feedback headers the way chat/image do.
-        # Keep request metadata plumbing here, but add response-side feedback
-        # once the async video job API is wired to surface diffusion metrics.
         prompt: OmniTextPrompt = OmniTextPrompt(prompt=request.prompt)
         if request.negative_prompt is not None:
             prompt["negative_prompt"] = request.negative_prompt
@@ -151,6 +151,10 @@ class OmniOpenAIServingVideo:
         )
 
         result = await self._run_generation(prompt, gen_params, reference_id)
+        response_metrics = None
+        snapshot = parse_super_p95_load_metrics(getattr(result, "metrics", None))
+        if snapshot is not None:
+            response_metrics = snapshot_to_metrics(snapshot)
         _t_encode_start = time.perf_counter()
         videos = self._extract_video_outputs(result)
         audios = self._extract_audio_outputs(result, expected_count=len(videos))
@@ -174,7 +178,7 @@ class OmniOpenAIServingVideo:
         ]
         _t_encode_ms = (time.perf_counter() - _t_encode_start) * 1000
         logger.info("Video response encoding (MP4+base64): %.2f ms", _t_encode_ms)
-        return VideoGenerationResponse(created=int(time.time()), data=video_data)
+        return VideoGenerationResponse(created=int(time.time()), data=video_data, metrics=response_metrics)
 
     @staticmethod
     def _apply_lora(lora_body: Any, gen_params: OmniDiffusionSamplingParams) -> None:

@@ -201,6 +201,10 @@ class VideoGenerationResponse(BaseModel):
 
     created: int = Field(..., description="Unix timestamp of when the generation completed")
     data: list[VideoData] = Field(..., description="Array of generated videos")
+    metrics: dict[str, Any] | None = Field(
+        default=None,
+        description="Internal metrics payload for server-side job bookkeeping.",
+    )
 
 
 class VideoError(BaseModel):
@@ -250,6 +254,14 @@ class VideoResponse(BaseModel):
         description="Filename of the saved output video files for this job.",
     )
     inference_time_s: float | None = Field(default=None, description="End-to-end inference time in seconds.")
+    super_p95_normal_load_s: float | None = Field(
+        default=None,
+        description="Authoritative backend normal-load snapshot recorded when the job completed.",
+    )
+    super_p95_sacrificial_load_s: float | None = Field(
+        default=None,
+        description="Authoritative backend sacrificial-load snapshot recorded when the job completed.",
+    )
 
     @property
     def file_extension(self) -> str:

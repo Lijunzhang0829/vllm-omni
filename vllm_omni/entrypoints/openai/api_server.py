@@ -1956,15 +1956,25 @@ async def _run_video_generation_job(
         output_path = await decode_and_save_video_output(response.data[0], file_name)
         logger.info("Video request %s persisted %s output file.", video_id, output_path)
 
+        response_metrics = _extract_result_metrics(response)
+        snapshot = parse_super_p95_load_metrics(response_metrics)
+        update_fields = {
+            "status": VideoGenerationStatus.COMPLETED,
+            "progress": 100,
+            "file_name": file_name,
+            "completed_at": int(time.time()),
+            "inference_time_s": time.perf_counter() - started_at,
+        }
+        if snapshot is not None:
+            update_fields.update(
+                {
+                    "super_p95_normal_load_s": snapshot.normal_load_s,
+                    "super_p95_sacrificial_load_s": snapshot.sacrificial_load_s,
+                }
+            )
         await VIDEO_STORE.update_fields(
             video_id,
-            {
-                "status": VideoGenerationStatus.COMPLETED,
-                "progress": 100,
-                "file_name": file_name,
-                "completed_at": int(time.time()),
-                "inference_time_s": time.perf_counter() - started_at,
-            },
+            update_fields,
         )
     except Exception as exc:
         logger.exception("Video generation failed for id=%s", video_id)
