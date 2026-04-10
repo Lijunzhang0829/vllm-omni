@@ -22,6 +22,7 @@ from vllm_omni.diffusion.sched.interface import (
 from vllm_omni.diffusion.super_p95 import (
     estimate_service_time_s,
     normalize_super_p95_hardware_profile,
+    SuperP95LoadSnapshot,
 )
 
 logger = init_logger(__name__)
@@ -59,6 +60,22 @@ class SuperP95RequestScheduler(_BaseScheduler):
         self._current_time_s: float = 0.0
         self._hardware_profile = normalize_super_p95_hardware_profile(
             os.environ.get("VLLM_OMNI_SUPER_P95_HARDWARE_PROFILE")
+        )
+
+    def get_load_snapshot(self) -> SuperP95LoadSnapshot:
+        normal_load_s = 0.0
+        sacrificial_load_s = 0.0
+        for sched_req_id in [*self._waiting, *self._running]:
+            queued = self._queue_metadata.get(sched_req_id)
+            if queued is None:
+                continue
+            if queued.is_sacrificial:
+                sacrificial_load_s += queued.estimated_service_s
+            else:
+                normal_load_s += queued.estimated_service_s
+        return SuperP95LoadSnapshot(
+            normal_load_s=normal_load_s,
+            sacrificial_load_s=sacrificial_load_s,
         )
 
     def add_request(self, request: OmniDiffusionRequest) -> str:

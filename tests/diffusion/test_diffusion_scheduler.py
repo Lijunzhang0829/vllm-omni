@@ -20,6 +20,7 @@ from vllm_omni.diffusion.sched.interface import CachedRequestData, NewRequestDat
 from vllm_omni.diffusion.super_p95 import (
     EXTRA_ARG_SUPER_P95_ESTIMATED_SERVICE_S,
     EXTRA_ARG_SUPER_P95_SACRIFICIAL,
+    parse_super_p95_load_metrics,
 )
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
@@ -317,6 +318,43 @@ class TestSuperP95RequestScheduler:
         assert _new_ids(sched_output) == [large_id]
         assert self.scheduler.get_request_state(small_id).status == DiffusionRequestStatus.WAITING
 
+    def test_load_snapshot_tracks_waiting_and_running_requests(self) -> None:
+        normal_id = self.scheduler.add_request(
+            OmniDiffusionRequest(
+                prompts=["prompt_normal"],
+                sampling_params=OmniDiffusionSamplingParams(
+                    num_inference_steps=1,
+                    extra_args={EXTRA_ARG_SUPER_P95_ESTIMATED_SERVICE_S: 10.0},
+                ),
+                request_ids=["normal"],
+            )
+        )
+        self.scheduler.add_request(
+            OmniDiffusionRequest(
+                prompts=["prompt_sacrificial"],
+                sampling_params=OmniDiffusionSamplingParams(
+                    num_inference_steps=1,
+                    extra_args={
+                        EXTRA_ARG_SUPER_P95_SACRIFICIAL: True,
+                        EXTRA_ARG_SUPER_P95_ESTIMATED_SERVICE_S: 100.0,
+                    },
+                ),
+                request_ids=["sacrificial"],
+            )
+        )
+
+        snapshot = self.scheduler.get_load_snapshot()
+        assert snapshot.normal_load_s == 10.0
+        assert snapshot.sacrificial_load_s == 100.0
+
+        sched_output = self.scheduler.schedule()
+        output = _make_request_output(normal_id)
+        self.scheduler.update_from_output(sched_output, output)
+
+        snapshot = self.scheduler.get_load_snapshot()
+        assert snapshot.normal_load_s == 0.0
+        assert snapshot.sacrificial_load_s == 100.0
+
 
 class TestDiffusionEngine:
     def test_add_req_and_wait_for_response_single_path(self) -> None:
@@ -383,6 +421,36 @@ class TestDiffusionEngine:
 
         assert scheduler.initialized_with is od_config
         fake_executor_cls.assert_called_once_with(od_config)
+
+    def test_step_exports_super_p95_load_metrics(self) -> None:
+        engine = DiffusionEngine.__new__(DiffusionEngine)
+        engine.od_config = Mock(
+            model_class_name="mock_model",
+            enable_cpu_offload=False,
+        )
+        engine.pre_process_func = None
+        engine.post_process_func = None
+        engine.scheduler = Mock()
+        engine.scheduler.get_load_snapshot.return_value = Mock(normal_load_s=12.5, sacrificial_load_s=3.0)
+        engine.add_req_and_wait_for_response = Mock(return_value=DiffusionOutput(output=[]))
+
+        request = OmniDiffusionRequest(
+            prompts=["prompt_metric"],
+            sampling_params=OmniDiffusionSamplingParams(
+                num_inference_steps=1,
+                num_outputs_per_prompt=1,
+                resolution=1024,
+            ),
+            request_ids=["metric"],
+        )
+
+        outputs = engine.step(request)
+
+        assert len(outputs) == 1
+        snapshot = parse_super_p95_load_metrics(outputs[0].metrics)
+        assert snapshot is not None
+        assert snapshot.normal_load_s == 12.5
+        assert snapshot.sacrificial_load_s == 3.0
 
     def test_scheduler_alias_keeps_default_request_scheduler(self) -> None:
         scheduler = Scheduler()

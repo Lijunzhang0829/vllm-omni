@@ -21,6 +21,7 @@ from vllm_omni.diffusion.registry import (
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched import RequestScheduler, SchedulerInterface, SuperP95RequestScheduler
+from vllm_omni.diffusion.super_p95 import snapshot_to_metrics
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -166,6 +167,9 @@ class DiffusionEngine:
             "resolution": int(request.sampling_params.resolution),
             "postprocess_time_ms": postprocess_time * 1000,
         }
+        load_snapshot = self.scheduler.get_load_snapshot()
+        if load_snapshot is not None:
+            metrics.update(snapshot_to_metrics(load_snapshot))
         if self.pre_process_func is not None:
             metrics["preprocessing_time_ms"] = preprocess_time * 1000
 

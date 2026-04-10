@@ -13,6 +13,7 @@ from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.super_p95 import SuperP95LoadSnapshot
 
 logger = init_logger(__name__)
 
@@ -151,6 +152,10 @@ class SchedulerInterface(ABC):
     @abstractmethod
     def update_from_output(self, sched_output: DiffusionSchedulerOutput, output: DiffusionOutput) -> set[str]:
         """Update scheduler state from executor output."""
+
+    def get_load_snapshot(self) -> SuperP95LoadSnapshot | None:
+        """Return an authoritative load snapshot if the scheduler tracks one."""
+        return None
 
     @abstractmethod
     def get_request_state(self, sched_req_id: str) -> DiffusionRequestState | None:

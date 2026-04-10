@@ -111,11 +111,28 @@ from vllm_omni.entrypoints.openai.storage import STORAGE_MANAGER
 from vllm_omni.entrypoints.openai.stores import VIDEO_STORE, VIDEO_TASKS
 from vllm_omni.entrypoints.openai.utils import get_stage_type, parse_lora_request
 from vllm_omni.entrypoints.openai.video_api_utils import decode_input_reference
-from vllm_omni.diffusion.super_p95 import apply_super_p95_request_headers
+from vllm_omni.diffusion.super_p95 import (
+    apply_super_p95_request_headers,
+    build_super_p95_response_headers,
+    parse_super_p95_load_metrics,
+)
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams, OmniTextPrompt
 
 logger = init_logger(__name__)
 router = APIRouter()
+
+
+def _merge_super_p95_response_headers(
+    base_headers: dict[str, str],
+    response_metrics: dict[str, Any] | None,
+) -> dict[str, str]:
+    snapshot = parse_super_p95_load_metrics(response_metrics)
+    if snapshot is None:
+        return base_headers
+    return {
+        **base_headers,
+        **build_super_p95_response_headers(snapshot),
+    }
 
 # Supported resolution buckets for layered models (e.g., Qwen-Image-Layered)
 SUPPORTED_LAYERED_RESOLUTIONS = (640, 1024)
@@ -877,7 +894,10 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
                 response_dict = generator.model_dump(mode="json", serialize_as_any=True, warnings="none")
                 return JSONResponse(
                     content=response_dict,
-                    headers=metrics_header(metrics_header_format),
+                    headers=_merge_super_p95_response_headers(
+                        metrics_header(metrics_header_format),
+                        getattr(generator, "metrics", None),
+                    ),
                 )
             except Exception:
                 # Fallback: convert to JSON string and parse back to avoid any serialization issues
@@ -886,7 +906,10 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
                     response_dict = json_lib.loads(response_json)
                     return JSONResponse(
                         content=response_dict,
-                        headers=metrics_header(metrics_header_format),
+                        headers=_merge_super_p95_response_headers(
+                            metrics_header(metrics_header_format),
+                            getattr(generator, "metrics", None),
+                        ),
                     )
                 except Exception:
                     # Last resort: regular dump with warnings suppressed
@@ -894,7 +917,10 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
                         warnings_module.filterwarnings("ignore", category=UserWarning)
                         return JSONResponse(
                             content=generator.model_dump(mode="json", warnings="none"),
-                            headers=metrics_header(metrics_header_format),
+                            headers=_merge_super_p95_response_headers(
+                                metrics_header(metrics_header_format),
+                                getattr(generator, "metrics", None),
+                            ),
                         )
 
     return StreamingResponse(content=generator, media_type="text/event-stream")
