@@ -134,6 +134,11 @@ def _merge_super_p95_response_headers(
         **build_super_p95_response_headers(snapshot),
     }
 
+
+def _extract_result_metrics(result: Any) -> dict[str, Any] | None:
+    metrics = getattr(result, "metrics", None)
+    return metrics if isinstance(metrics, dict) else None
+
 # Supported resolution buckets for layered models (e.g., Qwen-Image-Layered)
 SUPPORTED_LAYERED_RESOLUTIONS = (640, 1024)
 profiler_router = APIRouter()
@@ -1370,9 +1375,13 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
         # Encode images to base64
         image_data = [ImageData(b64_json=encode_image_base64(img), revised_prompt=None) for img in images]
 
-        return ImageGenerationResponse(
+        response = ImageGenerationResponse(
             created=int(time.time()),
             data=image_data,
+        )
+        return JSONResponse(
+            content=response.model_dump(),
+            headers=_merge_super_p95_response_headers({}, _extract_result_metrics(result)),
         )
 
     except HTTPException:
@@ -1576,11 +1585,15 @@ async def edit_images(
             for img in images
         ]
 
-        return ImageGenerationResponse(
+        response = ImageGenerationResponse(
             created=int(time.time()),
             data=image_data,
             output_format=output_format,
             size=size_str,
+        )
+        return JSONResponse(
+            content=response.model_dump(),
+            headers=_merge_super_p95_response_headers({}, _extract_result_metrics(result)),
         )
 
     except HTTPException:
