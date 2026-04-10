@@ -14,6 +14,7 @@ from vllm.engine.protocol import EngineClient
 from vllm.logger import init_logger
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni
+from vllm_omni.diffusion.super_p95 import apply_super_p95_request_headers
 from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoData,
     VideoGenerationRequest,
@@ -77,12 +78,14 @@ class OmniOpenAIServingVideo:
         reference_id: str,
         *,
         reference_image: ReferenceImage | None = None,
+        request_headers: dict[str, str] | None = None,
     ) -> VideoGenerationResponse:
         prompt: OmniTextPrompt = OmniTextPrompt(prompt=request.prompt)
         if request.negative_prompt is not None:
             prompt["negative_prompt"] = request.negative_prompt
 
         gen_params = OmniDiffusionSamplingParams()
+        apply_super_p95_request_headers(gen_params, request_headers)
 
         input_image = None if reference_image is None else reference_image.data
         vp = request.resolve_video_params()

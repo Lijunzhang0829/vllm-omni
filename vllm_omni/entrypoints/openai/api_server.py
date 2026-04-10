@@ -111,6 +111,7 @@ from vllm_omni.entrypoints.openai.storage import STORAGE_MANAGER
 from vllm_omni.entrypoints.openai.stores import VIDEO_STORE, VIDEO_TASKS
 from vllm_omni.entrypoints.openai.utils import get_stage_type, parse_lora_request
 from vllm_omni.entrypoints.openai.video_api_utils import decode_input_reference
+from vllm_omni.diffusion.super_p95 import apply_super_p95_request_headers
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams, OmniTextPrompt
 
 logger = init_logger(__name__)
@@ -1286,6 +1287,7 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
         if request.negative_prompt is not None:
             prompt["negative_prompt"] = request.negative_prompt
         gen_params = OmniDiffusionSamplingParams(num_outputs_per_prompt=request.n)
+        apply_super_p95_request_headers(gen_params, raw_request.headers)
 
         # Parse per-request LoRA (compatible with chat's extra_body.lora shape).
         lora_request, lora_scale = _parse_lora_request(request.lora)
@@ -1433,6 +1435,7 @@ async def edit_images(
 
         # 3 Build sample params
         gen_params = OmniDiffusionSamplingParams()
+        apply_super_p95_request_headers(gen_params, raw_request.headers)
         # 3.0 Init with system default values
         app_state_args = getattr(raw_request.app.state, "args", None)
         default_sample_param = getattr(app_state_args, "default_sampling_params", None)
@@ -1887,6 +1890,7 @@ async def _run_video_generation_job(
     request: VideoGenerationRequest,
     video_id: str,
     reference_image: ReferenceImage | None = None,
+    request_headers: dict[str, str] | None = None,
 ) -> None:
     job = await VIDEO_STORE.get(video_id)
     if job is None:
@@ -1897,7 +1901,12 @@ async def _run_video_generation_job(
     started_at = time.perf_counter()
     output_path = None
     try:
-        response = await handler.generate_videos(request, video_id, reference_image=reference_image)
+        response = await handler.generate_videos(
+            request,
+            video_id,
+            reference_image=reference_image,
+            request_headers=request_headers,
+        )
         if not response.data:
             raise RuntimeError("Video generation completed but returned no outputs.")
 
@@ -2078,7 +2087,15 @@ async def create_video(
 
     reference_image = ReferenceImage(data=image_data) if image_data is not None else image_data
     await VIDEO_STORE.upsert(ref.id, ref)
-    task = asyncio.create_task(_run_video_generation_job(handler, request, ref.id, reference_image))
+    task = asyncio.create_task(
+        _run_video_generation_job(
+            handler,
+            request,
+            ref.id,
+            reference_image,
+            request_headers=dict(raw_request.headers),
+        )
+    )
     await VIDEO_TASKS.upsert(ref.id, task)
     return ref
 

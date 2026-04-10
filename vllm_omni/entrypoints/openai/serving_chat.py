@@ -85,6 +85,7 @@ from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
 from vllm_omni.entrypoints.openai.protocol import OmniChatCompletionStreamResponse
 from vllm_omni.entrypoints.openai.protocol.audio import AudioResponse, CreateAudio
 from vllm_omni.entrypoints.openai.utils import parse_lora_request
+from vllm_omni.diffusion.super_p95 import apply_super_p95_request_headers
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -2121,6 +2122,10 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 width=width,
                 num_outputs_per_prompt=num_outputs_per_prompt,
                 seed=seed,
+            )
+            apply_super_p95_request_headers(
+                gen_params,
+                raw_request.headers if raw_request is not None else None,
             )
 
             # Only override defaults when the user explicitly provides values
