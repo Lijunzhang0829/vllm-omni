@@ -49,6 +49,14 @@ class DiffusionRequestState:
     def is_finished(self) -> bool:
         return DiffusionRequestStatus.is_finished(self.status)
 
+    @property
+    def super_p95_sacrificial(self) -> bool:
+        return self.req.super_p95_sacrificial
+
+    @property
+    def super_p95_estimated_service_s(self) -> float | None:
+        return self.req.super_p95_estimated_service_s
+
 
 @dataclass
 class NewRequestData:

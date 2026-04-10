@@ -16,6 +16,10 @@ from vllm_omni.diffusion.sched import (
     SchedulerInterface,
 )
 from vllm_omni.diffusion.sched.interface import CachedRequestData, NewRequestData
+from vllm_omni.diffusion.super_p95 import (
+    EXTRA_ARG_SUPER_P95_ESTIMATED_SERVICE_S,
+    EXTRA_ARG_SUPER_P95_SACRIFICIAL,
+)
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
@@ -226,6 +230,26 @@ class TestRequestScheduler:
 
         assert self.scheduler.get_sched_req_id("map-a") is None
         assert self.scheduler.get_sched_req_id("map-b") is None
+
+    def test_request_state_exposes_super_p95_metadata(self) -> None:
+        req_id = self.scheduler.add_request(
+            OmniDiffusionRequest(
+                prompts=["prompt_meta"],
+                sampling_params=OmniDiffusionSamplingParams(
+                    num_inference_steps=1,
+                    extra_args={
+                        EXTRA_ARG_SUPER_P95_SACRIFICIAL: True,
+                        EXTRA_ARG_SUPER_P95_ESTIMATED_SERVICE_S: 42.0,
+                    },
+                ),
+                request_ids=["meta"],
+            )
+        )
+
+        state = self.scheduler.get_request_state(req_id)
+        assert state is not None
+        assert state.super_p95_sacrificial is True
+        assert state.super_p95_estimated_service_s == 42.0
 
 
 class TestDiffusionEngine:

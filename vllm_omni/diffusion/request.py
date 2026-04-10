@@ -5,6 +5,7 @@
 import random
 from dataclasses import dataclass, field
 
+from vllm_omni.diffusion.super_p95 import get_super_p95_request_metadata
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
 
 
@@ -26,9 +27,15 @@ class OmniDiffusionRequest:
     sampling_params: OmniDiffusionSamplingParams
 
     request_ids: list[str] = field(default_factory=list)
+    super_p95_sacrificial: bool = False
+    super_p95_estimated_service_s: float | None = None
 
     def __post_init__(self):
         """Initialize dependent fields after dataclass initialization."""
+        self.super_p95_sacrificial, self.super_p95_estimated_service_s = get_super_p95_request_metadata(
+            getattr(self.sampling_params, "extra_args", None)
+        )
+
         # When neither a generator nor a seed is provided, assign a random seed
         # so that all ranks derive the same generator state.
         if self.sampling_params.generator is None and self.sampling_params.seed is None:
