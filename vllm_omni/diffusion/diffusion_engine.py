@@ -22,6 +22,7 @@ from vllm_omni.diffusion.registry import (
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched import RequestScheduler, SchedulerInterface, SuperP95RequestScheduler
 from vllm_omni.diffusion.super_p95 import snapshot_to_metrics
+from vllm_omni.diffusion.worker.utils import RunnerOutput
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -30,6 +31,11 @@ logger = init_logger(__name__)
 
 def _server_scheduling_enabled() -> bool:
     value = os.environ.get("VLLM_OMNI_ENABLE_DIFFUSION_SERVER_SCHEDULING", "0")
+    return value.strip().lower() not in {"0", "false", "off", "no"}
+
+
+def _preemption_enabled() -> bool:
+    value = os.environ.get("VLLM_OMNI_ENABLE_DIFFUSION_PREEMPTION", "0")
     return value.strip().lower() not in {"0", "false", "off", "no"}
 
 
@@ -288,6 +294,9 @@ class DiffusionEngine:
         return DiffusionEngine(config, scheduler=scheduler)
 
     def add_req_and_wait_for_response(self, request: OmniDiffusionRequest) -> DiffusionOutput:
+        if self._should_use_stepwise_super_p95(request):
+            return self._add_req_and_wait_stepwise(request)
+
         with self._rpc_lock:
             target_sched_req_id = self.scheduler.add_request(request)
 
@@ -319,6 +328,45 @@ class DiffusionEngine:
                 if target_sched_req_id in finished_req_ids:
                     self.scheduler.pop_request_state(target_sched_req_id)
                     return output
+
+    def _should_use_stepwise_super_p95(self, request: OmniDiffusionRequest) -> bool:
+        return (
+            isinstance(self.scheduler, SuperP95RequestScheduler)
+            and _server_scheduling_enabled()
+            and _preemption_enabled()
+            and self.od_config.model_class_name in {"QwenImagePipeline", "Wan22Pipeline", "WanPipeline"}
+            and bool(getattr(request, "request_ids", None))
+        )
+
+    def _add_req_and_wait_stepwise(self, request: OmniDiffusionRequest) -> DiffusionOutput:
+        with self._rpc_lock:
+            target_sched_req_id = self.scheduler.add_request(request)
+
+            while True:
+                sched_output = self.scheduler.schedule()
+                if sched_output.is_empty:
+                    if not self.scheduler.has_requests():
+                        raise RuntimeError("Diffusion scheduler has no runnable requests.")
+                    continue
+
+                responses = self.executor.collective_rpc(
+                    method="execute_stepwise",
+                    args=(sched_output,),
+                    unique_reply_rank=None,
+                )
+                runner_output = responses[0] if isinstance(responses, list) else responses
+                if not isinstance(runner_output, RunnerOutput):
+                    raise RuntimeError(f"Unexpected response type for execute_stepwise: {type(runner_output)!r}")
+
+                finished_req_ids = self.scheduler.update_from_output(sched_output, runner_output)
+                if target_sched_req_id not in finished_req_ids:
+                    continue
+
+                self.scheduler.pop_request_state(target_sched_req_id)
+                result = runner_output.result
+                if result is None:
+                    return DiffusionOutput(error="stepwise diffusion request finished without result")
+                return result
 
     def profile(self, is_start: bool = True, profile_prefix: str | None = None) -> None:
         """Start or stop torch profiling on all diffusion workers.

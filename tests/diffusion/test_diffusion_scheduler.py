@@ -22,6 +22,7 @@ from vllm_omni.diffusion.super_p95 import (
     EXTRA_ARG_SUPER_P95_SACRIFICIAL,
     parse_super_p95_load_metrics,
 )
+from vllm_omni.diffusion.worker.utils import RunnerOutput
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
@@ -355,6 +356,36 @@ class TestSuperP95RequestScheduler:
         assert snapshot.normal_load_s == 0.0
         assert snapshot.sacrificial_load_s == 100.0
 
+    def test_stepwise_output_requeues_unfinished_request(self) -> None:
+        req_id = self.scheduler.add_request(
+            OmniDiffusionRequest(
+                prompts=["prompt_stepwise"],
+                sampling_params=OmniDiffusionSamplingParams(
+                    num_inference_steps=4,
+                    extra_args={EXTRA_ARG_SUPER_P95_ESTIMATED_SERVICE_S: 40.0},
+                ),
+                request_ids=["stepwise"],
+            )
+        )
+
+        sched_output = self.scheduler.schedule()
+        finished = self.scheduler.update_from_output(
+            sched_output,
+            RunnerOutput(
+                req_id=req_id,
+                step_index=1,
+                finished=False,
+                result=None,
+            ),
+        )
+
+        assert finished == set()
+        state = self.scheduler.get_request_state(req_id)
+        assert state is not None
+        assert state.status == DiffusionRequestStatus.PREEMPTED
+        snapshot = self.scheduler.get_load_snapshot()
+        assert snapshot.normal_load_s == 30.0
+
 
 class TestDiffusionEngine:
     def test_add_req_and_wait_for_response_single_path(self) -> None:
@@ -451,6 +482,41 @@ class TestDiffusionEngine:
         assert snapshot is not None
         assert snapshot.normal_load_s == 12.5
         assert snapshot.sacrificial_load_s == 3.0
+
+    def test_add_req_and_wait_uses_stepwise_path_when_preemption_enabled(self) -> None:
+        engine = DiffusionEngine.__new__(DiffusionEngine)
+        engine.od_config = Mock(model_class_name="QwenImagePipeline")
+        engine.scheduler = SuperP95RequestScheduler()
+        engine.scheduler.initialize(Mock())
+        engine.executor = Mock()
+        engine._rpc_lock = threading.Lock()
+
+        request = OmniDiffusionRequest(
+            prompts=["prompt_step_engine"],
+            sampling_params=OmniDiffusionSamplingParams(
+                num_inference_steps=2,
+                extra_args={EXTRA_ARG_SUPER_P95_ESTIMATED_SERVICE_S: 20.0},
+            ),
+            request_ids=["engine-step"],
+        )
+
+        engine.executor.collective_rpc.side_effect = [
+            [RunnerOutput(req_id="engine-step", step_index=1, finished=False, result=None)],
+            [RunnerOutput(req_id="engine-step", step_index=2, finished=True, result=DiffusionOutput(output=None))],
+        ]
+
+        with patch.dict(
+            "os.environ",
+            {
+                "VLLM_OMNI_ENABLE_DIFFUSION_SERVER_SCHEDULING": "1",
+                "VLLM_OMNI_ENABLE_DIFFUSION_PREEMPTION": "1",
+            },
+            clear=False,
+        ):
+            output = engine.add_req_and_wait_for_response(request)
+
+        assert output.error is None
+        assert engine.executor.collective_rpc.call_count == 2
 
     def test_scheduler_alias_keeps_default_request_scheduler(self) -> None:
         scheduler = Scheduler()
