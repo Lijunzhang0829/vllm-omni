@@ -61,7 +61,13 @@ class _QueuedRequest:
 
 
 class SuperP95RequestScheduler(_BaseScheduler):
-    """A minimal v0.18-compatible scheduler variant for super-p95 ordering."""
+    """A minimal v0.18-compatible scheduler variant for super-p95 ordering.
+
+    TODO(v0.18-super-p95): Extend this scheduler to full v0.16 parity once
+    async preemption is fully ported for every targeted diffusion model.
+    Remaining work includes model-specific service-time accounting validation
+    and multi-model policy parity checks beyond the current Qwen-first port.
+    """
 
     def __init__(self) -> None:
         super().__init__()

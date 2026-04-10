@@ -71,6 +71,11 @@ class SuperP95Dispatcher:
         sacrificial_load_factor: float,
         request_timeout_s: float,
     ) -> None:
+        # TODO(v0.18-super-p95): This dispatcher intentionally keeps the
+        # minimal explicit-backend shape for the first port. Managed backend
+        # lifecycle, startup orchestration, and runtime-specific stability
+        # controls from v0.16 still need a deliberate re-port instead of
+        # ad-hoc workarounds.
         if not 1 <= len(backend_urls) <= 8:
             raise ValueError("super_p95 dispatcher supports 1 to 8 backends")
         hardware_profiles = _parse_backend_hardware_profiles(backend_hardware_profiles, len(backend_urls))

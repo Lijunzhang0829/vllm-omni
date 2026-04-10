@@ -80,6 +80,10 @@ class OmniOpenAIServingVideo:
         reference_image: ReferenceImage | None = None,
         request_headers: dict[str, str] | None = None,
     ) -> VideoGenerationResponse:
+        # TODO(v0.18-super-p95): Video responses still do not expose
+        # authoritative super-p95 load feedback headers the way chat/image do.
+        # Keep request metadata plumbing here, but add response-side feedback
+        # once the async video job API is wired to surface diffusion metrics.
         prompt: OmniTextPrompt = OmniTextPrompt(prompt=request.prompt)
         if request.negative_prompt is not None:
             prompt["negative_prompt"] = request.negative_prompt
