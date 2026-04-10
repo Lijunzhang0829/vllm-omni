@@ -14,6 +14,7 @@ from vllm_omni.diffusion.sched import (
     RequestScheduler,
     Scheduler,
     SchedulerInterface,
+    SuperP95RequestScheduler,
 )
 from vllm_omni.diffusion.sched.interface import CachedRequestData, NewRequestData
 from vllm_omni.diffusion.super_p95 import (
@@ -252,6 +253,71 @@ class TestRequestScheduler:
         assert state.super_p95_estimated_service_s == 42.0
 
 
+class TestSuperP95RequestScheduler:
+    def setup_method(self) -> None:
+        self.scheduler: SuperP95RequestScheduler = SuperP95RequestScheduler()
+        self.scheduler.initialize(Mock())
+
+    def test_normal_requests_are_prioritized_over_sacrificial(self) -> None:
+        sacrificial_id = self.scheduler.add_request(
+            OmniDiffusionRequest(
+                prompts=["prompt_s"],
+                sampling_params=OmniDiffusionSamplingParams(
+                    num_inference_steps=1,
+                    extra_args={
+                        EXTRA_ARG_SUPER_P95_SACRIFICIAL: True,
+                        EXTRA_ARG_SUPER_P95_ESTIMATED_SERVICE_S: 100.0,
+                    },
+                ),
+                request_ids=["sacrificial"],
+            )
+        )
+        normal_id = self.scheduler.add_request(
+            OmniDiffusionRequest(
+                prompts=["prompt_n"],
+                sampling_params=OmniDiffusionSamplingParams(
+                    num_inference_steps=1,
+                    extra_args={
+                        EXTRA_ARG_SUPER_P95_SACRIFICIAL: False,
+                        EXTRA_ARG_SUPER_P95_ESTIMATED_SERVICE_S: 10.0,
+                    },
+                ),
+                request_ids=["normal"],
+            )
+        )
+
+        sched_output = self.scheduler.schedule()
+        assert _new_ids(sched_output) == [normal_id]
+        assert sched_output.num_waiting_reqs == 1
+        assert self.scheduler.get_request_state(sacrificial_id).status == DiffusionRequestStatus.WAITING
+
+    def test_normal_queue_prefers_larger_priority(self) -> None:
+        small_id = self.scheduler.add_request(
+            OmniDiffusionRequest(
+                prompts=["prompt_small"],
+                sampling_params=OmniDiffusionSamplingParams(
+                    num_inference_steps=1,
+                    extra_args={EXTRA_ARG_SUPER_P95_ESTIMATED_SERVICE_S: 5.0},
+                ),
+                request_ids=["small"],
+            )
+        )
+        large_id = self.scheduler.add_request(
+            OmniDiffusionRequest(
+                prompts=["prompt_large"],
+                sampling_params=OmniDiffusionSamplingParams(
+                    num_inference_steps=1,
+                    extra_args={EXTRA_ARG_SUPER_P95_ESTIMATED_SERVICE_S: 50.0},
+                ),
+                request_ids=["large"],
+            )
+        )
+
+        sched_output = self.scheduler.schedule()
+        assert _new_ids(sched_output) == [large_id]
+        assert self.scheduler.get_request_state(small_id).status == DiffusionRequestStatus.WAITING
+
+
 class TestDiffusionEngine:
     def test_add_req_and_wait_for_response_single_path(self) -> None:
         engine = DiffusionEngine.__new__(DiffusionEngine)
@@ -284,6 +350,22 @@ class TestDiffusionEngine:
 
         assert output is expected
         engine.executor.add_req.assert_called_once_with(request)
+
+    def test_engine_uses_super_p95_scheduler_when_enabled(self) -> None:
+        with patch("vllm_omni.diffusion.diffusion_engine.DiffusionExecutor.get_class") as get_class:
+            executor = Mock()
+            get_class.return_value = Mock(return_value=executor)
+            with patch("vllm_omni.diffusion.diffusion_engine.get_diffusion_post_process_func", return_value=None):
+                with patch("vllm_omni.diffusion.diffusion_engine.get_diffusion_pre_process_func", return_value=None):
+                    with patch.object(DiffusionEngine, "_dummy_run", return_value=None):
+                        with patch.dict(
+                            "os.environ",
+                            {"VLLM_OMNI_ENABLE_DIFFUSION_SERVER_SCHEDULING": "1"},
+                            clear=False,
+                        ):
+                            engine = DiffusionEngine(Mock())
+
+        assert isinstance(engine.scheduler, SuperP95RequestScheduler)
 
     def test_initializes_injected_scheduler(self) -> None:
         request = _make_request("init")

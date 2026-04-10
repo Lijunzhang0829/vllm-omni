@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 import threading
 import time
 from collections.abc import Iterable
@@ -19,11 +20,16 @@ from vllm_omni.diffusion.registry import (
     get_diffusion_pre_process_func,
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.diffusion.sched import RequestScheduler, SchedulerInterface
+from vllm_omni.diffusion.sched import RequestScheduler, SchedulerInterface, SuperP95RequestScheduler
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
+
+
+def _server_scheduling_enabled() -> bool:
+    value = os.environ.get("VLLM_OMNI_ENABLE_DIFFUSION_SERVER_SCHEDULING", "0")
+    return value.strip().lower() not in {"0", "false", "off", "no"}
 
 
 def supports_image_input(model_class_name: str) -> bool:
@@ -72,7 +78,9 @@ class DiffusionEngine:
 
         executor_class = DiffusionExecutor.get_class(od_config)
         self.executor = executor_class(od_config)
-        self.scheduler: SchedulerInterface = scheduler or RequestScheduler()
+        if scheduler is None:
+            scheduler = SuperP95RequestScheduler() if _server_scheduling_enabled() else RequestScheduler()
+        self.scheduler = scheduler
         self.scheduler.initialize(od_config)
         self._rpc_lock = threading.Lock()
 
