@@ -404,14 +404,21 @@ class DiffusionEngine:
                 self._clear_active_request_locked()
 
     def _request_supports_async_preemption(self, request: OmniDiffusionRequest) -> bool:
+        model_name = self.od_config.model_class_name
+        if not _preemption_enabled() or not bool(getattr(request, "request_ids", None)):
+            return False
+        if model_name == "QwenImagePipeline":
+            return True
+        if model_name == "Wan22Pipeline":
+            prompts = getattr(request, "prompts", None) or []
+            if len(prompts) != 1 or isinstance(prompts[0], str):
+                return True
+            multi_modal_data = prompts[0].get("multi_modal_data", {})
+            return multi_modal_data.get("image") is None
         return (
-            _preemption_enabled()
-            # Only enable async preemption for models whose request-mode
-            # pipeline already supports boundary-yield + resume semantics.
-            # Wan request-mode async preemption still needs a dedicated port;
-            # do not widen this set until that migration is complete.
-            and self.od_config.model_class_name in {"QwenImagePipeline"}
-            and bool(getattr(request, "request_ids", None))
+            # TODO(super-p95-v018): widen async preemption support once Wan
+            # image-conditioned request-mode save/load parity is implemented.
+            False
         )
 
     def _mark_active_request_locked(self, sched_req_id: str) -> None:

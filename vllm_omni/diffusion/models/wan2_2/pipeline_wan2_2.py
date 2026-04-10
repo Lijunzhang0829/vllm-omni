@@ -332,6 +332,254 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionPipe
     def current_timestep(self):
         return self._current_timestep
 
+    @property
+    def interrupt(self):
+        interrupt_event = getattr(self, "_interrupt_event", None)
+        return self._interrupt or (interrupt_event is not None and interrupt_event.is_set())
+
+    def _snapshot_scheduler_state(self) -> dict[str, Any]:
+        return {
+            "step_index": getattr(self.scheduler, "step_index", None),
+            "_step_index": getattr(self.scheduler, "_step_index", None),
+            "begin_index": getattr(self.scheduler, "begin_index", None),
+            "_begin_index": getattr(self.scheduler, "_begin_index", None),
+        }
+
+    def _restore_scheduler_state(self, scheduler_state: dict[str, Any] | None) -> None:
+        if scheduler_state is None:
+            return
+        self.scheduler.step_index = scheduler_state.get("step_index")
+        self.scheduler._step_index = scheduler_state.get("_step_index")
+        self.scheduler.begin_index = scheduler_state.get("begin_index")
+        self.scheduler._begin_index = scheduler_state.get("_begin_index")
+
+    def _resolve_flow_shift(self, req: OmniDiffusionRequest) -> float:
+        request_flow_shift = req.sampling_params.extra_args.get("flow_shift")
+        if request_flow_shift is not None:
+            return float(request_flow_shift)
+        if self.od_config.flow_shift is not None:
+            return float(self.od_config.flow_shift)
+        return 5.0
+
+    def _init_generation_state(
+        self,
+        req: OmniDiffusionRequest,
+        prompt: str | None,
+        negative_prompt: str | None,
+        height: int,
+        width: int,
+        num_steps: int,
+        num_frames: int,
+        guidance_low: float,
+        guidance_high: float,
+        generator: torch.Generator | list[torch.Generator] | None,
+        prompt_embeds: torch.Tensor | None,
+        negative_prompt_embeds: torch.Tensor | None,
+        attention_kwargs: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        boundary_ratio = self.boundary_ratio if self.boundary_ratio is not None else req.sampling_params.boundary_ratio
+        if boundary_ratio is None:
+            boundary_ratio = 0.875
+            logger.warning("boundary_ratio is required for T2V generation. using default value 0.875")
+
+        self.check_inputs(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            height=height,
+            width=width,
+            prompt_embeds=prompt_embeds,
+            negative_prompt_embeds=negative_prompt_embeds,
+            guidance_scale_2=guidance_high if boundary_ratio is not None else None,
+            boundary_ratio=boundary_ratio,
+        )
+
+        if num_frames % self.vae_scale_factor_temporal != 1:
+            num_frames = num_frames // self.vae_scale_factor_temporal * self.vae_scale_factor_temporal + 1
+        num_frames = max(num_frames, 1)
+
+        device = self.device
+        if self.transformer is not None:
+            dtype = self.transformer.dtype
+        elif self.transformer_2 is not None:
+            dtype = self.transformer_2.dtype
+        else:
+            dtype = self.text_encoder.dtype
+
+        if prompt_embeds is None:
+            prompt_embeds, negative_prompt_embeds = self.encode_prompt(
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                do_classifier_free_guidance=guidance_low > 1.0 or guidance_high > 1.0,
+                num_videos_per_prompt=req.sampling_params.num_outputs_per_prompt or 1,
+                max_sequence_length=req.sampling_params.max_sequence_length or 512,
+                device=device,
+                dtype=dtype,
+            )
+        else:
+            prompt_embeds = prompt_embeds.to(device=device, dtype=dtype)
+            if negative_prompt_embeds is not None:
+                negative_prompt_embeds = negative_prompt_embeds.to(device=device, dtype=dtype)
+            elif guidance_low > 1.0 or guidance_high > 1.0:
+                raise ValueError("negative_prompt_embeds must be provided when prompt_embeds are given and guidance > 1.")
+
+        flow_shift = self._resolve_flow_shift(req)
+        self.scheduler.set_timesteps(num_steps, device=device, shift=flow_shift)
+        timesteps = self.scheduler.timesteps
+        self._num_timesteps = len(timesteps)
+        boundary_timestep = boundary_ratio * self.scheduler.config.num_train_timesteps if boundary_ratio is not None else None
+
+        num_channels_latents = self.transformer_config.in_channels
+        latents = self.prepare_latents(
+            batch_size=prompt_embeds.shape[0],
+            num_channels_latents=num_channels_latents,
+            height=height,
+            width=width,
+            num_frames=num_frames,
+            dtype=torch.float32,
+            device=device,
+            generator=generator,
+            latents=req.sampling_params.latents,
+        )
+
+        return {
+            "request_key": req.request_ids[0] if req.request_ids else None,
+            "height": height,
+            "width": width,
+            "num_frames": num_frames,
+            "latents": latents,
+            "timesteps": timesteps,
+            "next_step_index": 0,
+            "boundary_timestep": boundary_timestep,
+            "guidance_low": guidance_low,
+            "guidance_high": guidance_high,
+            "prompt_embeds": prompt_embeds,
+            "negative_prompt_embeds": negative_prompt_embeds,
+            "attention_kwargs": attention_kwargs or {},
+            "flow_shift": flow_shift,
+            "num_steps": num_steps,
+            "scheduler_state": self._snapshot_scheduler_state(),
+        }
+
+    def _run_generation_steps(self, state: dict[str, Any]) -> tuple[dict[str, Any], bool, int]:
+        self.scheduler.set_timesteps(state["num_steps"], device=self.device, shift=float(state.get("flow_shift", 5.0)))
+        self._restore_scheduler_state(state.get("scheduler_state"))
+        timesteps = self.scheduler.timesteps
+        state["timesteps"] = timesteps
+        self._num_timesteps = len(timesteps)
+
+        start_index = int(state["next_step_index"])
+        if start_index >= len(timesteps):
+            raise RuntimeError(
+                f"Invalid resume step for request_key={state.get('request_key')}: "
+                f"start_index={start_index} >= timesteps_len={len(timesteps)}"
+            )
+
+        latents = state["latents"]
+        completed_steps = 0
+        progress = getattr(self, "_active_completed_steps", None)
+        request_key = state.get("request_key", "<unknown>")
+
+        for step_index in range(start_index, len(timesteps)):
+            if completed_steps > 0 and self.interrupt:
+                logger.info(
+                    "Wan22 async preemption yield: request=%s completed_steps=%s next_step_index=%s",
+                    request_key,
+                    completed_steps,
+                    step_index,
+                )
+                break
+
+            t = timesteps[step_index]
+            self._current_timestep = t
+            boundary_timestep = state["boundary_timestep"]
+            current_guidance_scale = state["guidance_low"]
+            if boundary_timestep is not None and t < boundary_timestep:
+                current_guidance_scale = state["guidance_high"]
+                if self.transformer_2 is not None:
+                    current_model = self.transformer_2
+                elif self.transformer is not None:
+                    current_model = self.transformer
+                else:
+                    raise RuntimeError("No transformer available for low-noise stage")
+            else:
+                if self.transformer is not None:
+                    current_model = self.transformer
+                elif self.transformer_2 is not None:
+                    current_model = self.transformer_2
+                else:
+                    raise RuntimeError("No transformer available for high-noise stage")
+
+            latent_model_input = latents.to(current_model.dtype)
+            timestep = t.expand(latents.shape[0])
+            do_true_cfg = current_guidance_scale > 1.0 and state["negative_prompt_embeds"] is not None
+            positive_kwargs = {
+                "hidden_states": latent_model_input,
+                "timestep": timestep,
+                "encoder_hidden_states": state["prompt_embeds"],
+                "attention_kwargs": state["attention_kwargs"],
+                "return_dict": False,
+                "current_model": current_model,
+            }
+            negative_kwargs = None
+            if do_true_cfg:
+                negative_kwargs = {
+                    "hidden_states": latent_model_input,
+                    "timestep": timestep,
+                    "encoder_hidden_states": state["negative_prompt_embeds"],
+                    "attention_kwargs": state["attention_kwargs"],
+                    "return_dict": False,
+                    "current_model": current_model,
+                }
+
+            noise_pred = self.predict_noise_maybe_with_cfg(
+                do_true_cfg=do_true_cfg,
+                true_cfg_scale=current_guidance_scale,
+                positive_kwargs=positive_kwargs,
+                negative_kwargs=negative_kwargs,
+                cfg_normalize=False,
+            )
+            latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
+            completed_steps += 1
+            if progress is not None:
+                try:
+                    if completed_steps > int(progress.value):
+                        progress.value = completed_steps
+                except (AttributeError, TypeError, ValueError):
+                    pass
+
+            if self.interrupt and step_index + 1 < len(timesteps):
+                logger.info(
+                    "Wan22 async preemption yield: request=%s completed_steps=%s next_step_index=%s",
+                    request_key,
+                    completed_steps,
+                    step_index + 1,
+                )
+                break
+
+        end_index = start_index + completed_steps
+        state["latents"] = latents
+        state["next_step_index"] = end_index
+        state["completed_steps"] = completed_steps
+        state["scheduler_state"] = self._snapshot_scheduler_state()
+        return state, end_index >= len(timesteps), completed_steps
+
+    def _decode_generation_state(self, state: dict[str, Any], output_type: str | None) -> torch.Tensor:
+        latents = state["latents"]
+        if output_type == "latent":
+            return latents
+
+        latents = latents.to(self.vae.dtype)
+        latents_mean = (
+            torch.tensor(self.vae.config.latents_mean)
+            .view(1, self.vae.config.z_dim, 1, 1, 1)
+            .to(latents.device, latents.dtype)
+        )
+        latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(
+            latents.device, latents.dtype
+        )
+        latents = latents / latents_std + latents_mean
+        return self.vae.decode(latents, return_dict=False)[0]
+
     def forward(
         self,
         req: OmniDiffusionRequest,
@@ -391,6 +639,55 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionPipe
         # record guidance for properties
         self._guidance_scale = guidance_low
         self._guidance_scale_2 = guidance_high
+
+        scheduling_args = req.sampling_params.extra_args
+        preemption_enabled = bool(scheduling_args.get("_server_preemption_enabled", False))
+        self._interrupt = False
+
+        # TODO(super-p95-v018): async request-mode preemption is currently
+        # only implemented for T2V. I2V/TI2V paths still need dedicated state
+        # save/load for latent_condition + first_frame_mask before widening
+        # engine-side enablement beyond the plain T2V path.
+        if preemption_enabled and not self.expand_timesteps:
+            server_state = scheduling_args.get("_server_state")
+            if server_state is None:
+                state = self._init_generation_state(
+                    req,
+                    prompt,
+                    negative_prompt,
+                    height,
+                    width,
+                    num_steps,
+                    num_frames,
+                    guidance_low,
+                    guidance_high,
+                    generator,
+                    prompt_embeds,
+                    negative_prompt_embeds,
+                    attention_kwargs,
+                )
+            else:
+                state = dict(server_state)
+            output_type = output_type or "np"
+            state, finished, completed_steps = self._run_generation_steps(state)
+            self._current_timestep = None
+            request_key = req.request_ids[0] if req.request_ids else None
+            if not finished:
+                state["completed_steps"] = completed_steps
+                return DiffusionOutput(
+                    output=None,
+                    finished=False,
+                    request_key=request_key,
+                    scheduler_state=state,
+                    scheduler_metadata={"completed_steps": completed_steps},
+                )
+            output = self._decode_generation_state(state, output_type)
+            return DiffusionOutput(
+                output=output,
+                finished=True,
+                request_key=request_key,
+                stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
+            )
 
         # Prefer engine-configured boundary_ratio, but allow per-request fallback.
         boundary_ratio = self.boundary_ratio if self.boundary_ratio is not None else req.sampling_params.boundary_ratio
