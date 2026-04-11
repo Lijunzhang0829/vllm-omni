@@ -152,6 +152,7 @@ class ManagedBackendLauncher:
         # Keep managed launch aligned with v0.16 semantics without depending on
         # a serve CLI flag that does not exist in this branch.
         env["VLLM_OMNI_SUPER_P95_HARDWARE_PROFILE"] = spec.hardware_profile
+        env["VLLM_OMNI_MASTER_PORT"] = str(22000 + spec.port)
         trace_log_dir = self.backend_env.get("VLLM_OMNI_TRACE_LOG_DIR")
         if trace_log_dir:
             env["VLLM_OMNI_TRACE_LOG_FILE"] = str(Path(trace_log_dir) / f"backend_{spec.port}.jsonl")
