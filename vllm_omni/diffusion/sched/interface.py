@@ -158,6 +158,22 @@ class SchedulerInterface(ABC):
         return None
 
     @abstractmethod
+    def publish_result(self, request_key: str, output: DiffusionOutput, source: str = "external") -> None:
+        """Publish a finished diffusion output for a waiting caller."""
+
+    @abstractmethod
+    def set_reader_error(self, error: BaseException) -> None:
+        """Surface worker-side control pipe failures to waiting callers."""
+
+    @abstractmethod
+    def wait_for_result(
+        self,
+        request_key: str,
+        poll_interval_s: float = 0.1,
+    ) -> DiffusionOutput:
+        """Wait until a published result or reader error is available for request_key."""
+
+    @abstractmethod
     def get_request_state(self, sched_req_id: str) -> DiffusionRequestState | None:
         """Return request state if present."""
 

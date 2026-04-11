@@ -3,8 +3,10 @@
 
 from __future__ import annotations
 
+import threading
 from collections import deque
 
+from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.sched.interface import (
     DiffusionRequestState,
@@ -20,6 +22,10 @@ class _BaseScheduler(SchedulerInterface):
         self.od_config: OmniDiffusionConfig | None = None
         self._request_states: dict[str, DiffusionRequestState] = {}
         self._request_id_to_sched_req_id: dict[str, str] = {}
+        self._result_lock = threading.Lock()
+        self._result_cv = threading.Condition(self._result_lock)
+        self._pending_results: dict[str, DiffusionOutput] = {}
+        self._reader_error: BaseException | None = None
         self._step_id: int = 0
         self._waiting: deque[str] = deque()
         self._running: list[str] = []
@@ -32,6 +38,9 @@ class _BaseScheduler(SchedulerInterface):
         self.od_config = od_config
         self._request_states.clear()
         self._request_id_to_sched_req_id.clear()
+        with self._result_cv:
+            self._pending_results.clear()
+            self._reader_error = None
         self._step_id = 0
         self._waiting.clear()
         self._running.clear()
@@ -73,10 +82,33 @@ class _BaseScheduler(SchedulerInterface):
     def close(self) -> None:
         self._request_states.clear()
         self._request_id_to_sched_req_id.clear()
+        with self._result_cv:
+            self._pending_results.clear()
+            self._reader_error = None
         self._waiting.clear()
         self._running.clear()
         self._finished_req_ids.clear()
         self._reset_scheduler_state()
+
+    def publish_result(self, request_key: str, output: DiffusionOutput, source: str = "external") -> None:
+        with self._result_cv:
+            self._pending_results[request_key] = output
+            self._result_cv.notify_all()
+
+    def set_reader_error(self, error: BaseException) -> None:
+        with self._result_cv:
+            self._reader_error = error
+            self._result_cv.notify_all()
+
+    def wait_for_result(self, request_key: str, poll_interval_s: float = 0.1) -> DiffusionOutput:
+        with self._result_cv:
+            while True:
+                if self._reader_error is not None:
+                    raise RuntimeError("Worker control pipe failed") from self._reader_error
+                output = self._pending_results.pop(request_key, None)
+                if output is not None:
+                    return output
+                self._result_cv.wait(timeout=poll_interval_s)
 
     def _finish_requests(
         self,

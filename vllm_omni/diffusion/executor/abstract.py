@@ -5,6 +5,7 @@ from vllm.utils.import_utils import resolve_obj_by_qualname
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.sched.interface import SchedulerInterface
 
 
 class DiffusionExecutor(ABC):
@@ -52,6 +53,10 @@ class DiffusionExecutor(ABC):
     def __init__(self, od_config: OmniDiffusionConfig):
         self.od_config = od_config
         self._init_executor()
+
+    def set_result_scheduler(self, scheduler: SchedulerInterface) -> None:
+        """Optional hook for executors that route generation results via scheduler-owned state."""
+        return None
 
     @abstractmethod
     def _init_executor(self) -> None:

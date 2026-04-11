@@ -511,9 +511,6 @@ class WorkerProc:
             scheduler_metadata=dict(output.scheduler_metadata or {}),
             scheduler_state=output.scheduler_state,
             post_process_func=output.post_process_func,
-            custom_output=cls._tensor_tree_to_cpu(output.custom_output or {}),
-            stage_durations=dict(output.stage_durations or {}),
-            peak_memory_mb=float(output.peak_memory_mb or 0.0),
         )
 
     @classmethod

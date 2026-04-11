@@ -3,7 +3,6 @@ import multiprocessing.connection
 import threading
 import time
 import weakref
-from dataclasses import dataclass
 from typing import Any
 
 import zmq
@@ -14,15 +13,10 @@ from vllm_omni.diffusion.data import SHUTDOWN_MESSAGE, DiffusionOutput
 from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
 from vllm_omni.diffusion.ipc import unpack_diffusion_output_shm
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.sched.interface import SchedulerInterface
 from vllm_omni.diffusion.worker import WorkerProc
 
 logger = init_logger(__name__)
-
-
-@dataclass
-class PendingGenerationResult:
-    response: DiffusionOutput | None = None
-    error: BaseException | None = None
 
 
 @dataclass
@@ -76,10 +70,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         self._scheduler_pipe_readers: list[mp.connection.Connection] = []
         self._pipe_reader_stop = threading.Event()
         self._pipe_reader_thread: threading.Thread | None = None
-        self._pending_generation_lock = threading.Lock()
-        self._result_cv = threading.Condition(self._pending_generation_lock)
-        self._pending_generation_results: dict[str, PendingGenerationResult] = {}
-        self._reader_error: BaseException | None = None
+        self._result_scheduler: SchedulerInterface | None = None
         self._preempt_event = self._mp_ctx.Event()
         self._active_completed_steps = self._mp_ctx.Value("i", 0, lock=False)
 
@@ -107,6 +98,9 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             scheduler_pipes=self._scheduler_pipe_readers,
         )
         self._finalizer = weakref.finalize(self, self.resources)
+
+    def set_result_scheduler(self, scheduler: SchedulerInterface) -> None:
+        self._result_scheduler = scheduler
 
     def _init_broadcast_queue(self, num_workers: int) -> MessageQueue:
         return MessageQueue(
@@ -191,13 +185,6 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
 
         return processes, result_handle, scheduler_pipe_readers
 
-    def _set_reader_error(self, exc: BaseException) -> None:
-        self._reader_error = exc
-        with self._result_cv:
-            for pending in self._pending_generation_results.values():
-                pending.error = exc
-            self._result_cv.notify_all()
-
     def _worker_pipe_loop(self) -> None:
         while not self._pipe_reader_stop.is_set():
             readers = list(self._scheduler_pipe_readers)
@@ -209,7 +196,8 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 ready_readers = multiprocessing.connection.wait(readers, timeout=0.1)
             except Exception as exc:
                 logger.warning("Worker control pipe wait failed: %s", exc)
-                self._set_reader_error(RuntimeError(f"Worker control pipe wait failed: {exc}"))
+                if self._result_scheduler is not None:
+                    self._result_scheduler.set_reader_error(RuntimeError(f"Worker control pipe wait failed: {exc}"))
                 return
 
             for reader in ready_readers:
@@ -224,7 +212,8 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                     continue
                 except Exception as exc:
                     logger.warning("Failed to read worker control message: %s", exc)
-                    self._set_reader_error(RuntimeError(f"Worker control pipe failed: {exc}"))
+                    if self._result_scheduler is not None:
+                        self._result_scheduler.set_reader_error(RuntimeError(f"Worker control pipe failed: {exc}"))
                     continue
 
                 if not isinstance(message, dict):
@@ -240,13 +229,10 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                     logger.warning("Ignoring malformed worker generation_result message: %s", message)
                     continue
 
-                with self._result_cv:
-                    pending = self._pending_generation_results.get(payload.request_key)
-                    if pending is None:
-                        logger.warning("Dropping generation_result for unknown request_key=%s", payload.request_key)
-                        continue
-                    pending.response = payload
-                    self._result_cv.notify_all()
+                if self._result_scheduler is None:
+                    logger.warning("Dropping generation_result for request_key=%s before scheduler binding", payload.request_key)
+                    continue
+                self._result_scheduler.publish_result(payload.request_key, payload, source="worker_pipe")
 
     def add_req(self, request: OmniDiffusionRequest) -> DiffusionOutput:
         self._ensure_open()
@@ -263,35 +249,20 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         if request_key is None:
             logger.warning("Generation request missing request_ids; falling back to result_mq path.")
             return self._add_req_via_result_queue(rpc_request)
+        if self._result_scheduler is None:
+            raise RuntimeError("Result scheduler is not bound for control-pipe generation path.")
 
         # Generation results intentionally bypass result_mq/shm_broadcast and
         # return over the worker control pipe. This restores the lighter
         # request->mq, result->pipe split used in v0.16 and keeps large
         # diffusion outputs off the shared-memory ring buffer critical path.
-        pending = PendingGenerationResult()
-        with self._result_cv:
-            if request_key in self._pending_generation_results:
-                raise RuntimeError(f"Duplicate in-flight generation request_key={request_key}")
-            self._pending_generation_results[request_key] = pending
 
         try:
             self._broadcast_mq.enqueue(rpc_request)
-            with self._result_cv:
-                while True:
-                    if self._reader_error is not None:
-                        raise RuntimeError("Worker control pipe failed") from self._reader_error
-                    if pending.error is not None:
-                        raise RuntimeError("Generation request failed on worker control pipe") from pending.error
-                    if pending.response is not None:
-                        return pending.response
-                    self._result_cv.wait(timeout=0.1)
-                    self.check_health()
+            return self._result_scheduler.wait_for_result(request_key)
         except Exception as e:
             logger.error(f"Generate call failed: {e}")
             raise
-        finally:
-            with self._result_cv:
-                self._pending_generation_results.pop(request_key, None)
 
     def _add_req_via_result_queue(self, rpc_request: dict[str, Any]) -> DiffusionOutput:
         self._broadcast_mq.enqueue(rpc_request)

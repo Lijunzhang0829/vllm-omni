@@ -88,6 +88,7 @@ class DiffusionEngine:
             scheduler = SuperP95RequestScheduler() if _server_scheduling_enabled() else RequestScheduler()
         self.scheduler = scheduler
         self.scheduler.initialize(od_config)
+        self.executor.set_result_scheduler(self.scheduler)
         self._rpc_lock = threading.Lock()
         self._scheduler_cv = threading.Condition()
         self._async_outputs: dict[str, DiffusionOutput] = {}
