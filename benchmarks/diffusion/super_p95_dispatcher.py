@@ -147,6 +147,10 @@ class ManagedBackendLauncher:
         env[self.device_env_var] = spec.device_id
         env.setdefault("PYTHONUNBUFFERED", "1")
         env.update(self.backend_env)
+        # v0.18 backend scheduler consumes the hardware profile from env.
+        # Keep managed launch aligned with v0.16 semantics without depending on
+        # a serve CLI flag that does not exist in this branch.
+        env["VLLM_OMNI_SUPER_P95_HARDWARE_PROFILE"] = spec.hardware_profile
         log_path = self.log_dir / f"backend_{spec.port}.log"
         log_file = open(log_path, "a", encoding="utf-8")
         cmd = [
@@ -155,8 +159,6 @@ class ManagedBackendLauncher:
             self.model,
             "--port",
             str(spec.port),
-            "--super-p95-hardware-profile",
-            spec.hardware_profile,
             *self.backend_args,
         ]
         logger.info(
