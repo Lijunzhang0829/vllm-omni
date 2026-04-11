@@ -73,6 +73,7 @@ import tempfile
 import time
 import uuid
 from abc import ABC, abstractmethod
+from collections import Counter
 from collections.abc import AsyncGenerator
 from dataclasses import replace
 from typing import Any
@@ -724,6 +725,7 @@ def _populate_slo_ms_from_warmups(
 async def iter_requests(
     requests_list: list[RequestFuncInput],
     request_rate: float,
+    arrival_seed: int | None = None,
 ) -> AsyncGenerator[RequestFuncInput, None]:
     """Yield requests using a Poisson process if request_rate is set.
 
@@ -735,9 +737,11 @@ async def iter_requests(
         if request_rate <= 0:
             raise ValueError(f"request_rate must be positive or inf, got {request_rate}.")
 
+    rng = random.Random(arrival_seed) if arrival_seed is not None else random
+
     for i, req in enumerate(requests_list):
         if request_rate != float("inf") and i > 0:
-            interval_s = random.expovariate(request_rate)
+            interval_s = rng.expovariate(request_rate)
             await asyncio.sleep(interval_s)
         yield req
 
@@ -782,6 +786,10 @@ def calculate_metrics(
         "stage_durations_p50": stage_durations_p50,
         "stage_durations_p99": stage_durations_p99,
     }
+
+    if error_outputs:
+        counts = Counter((o.error or "unknown_error") for o in error_outputs)
+        metrics["top_error_reasons"] = dict(counts.most_common(10))
 
     if slo_enabled:
         slo_defined_total = 0
@@ -919,7 +927,11 @@ async def benchmark(args):
 
         start_time = time.perf_counter()
         tasks = []
-        async for req in iter_requests(requests_list=requests_list, request_rate=args.request_rate):
+        async for req in iter_requests(
+            requests_list=requests_list,
+            request_rate=args.request_rate,
+            arrival_seed=getattr(args, "arrival_seed", None),
+        ):
             task = asyncio.create_task(limited_request_func(req, session, pbar))
             tasks.append(task)
 
@@ -1077,6 +1089,18 @@ if __name__ == "__main__":
         type=int,
         default=None,
         help="Random seed (for diffusion models).",
+    )
+    parser.add_argument(
+        "--random-request-seed",
+        type=int,
+        default=42,
+        help="Seed for sampling random request profiles from --random-request-config.",
+    )
+    parser.add_argument(
+        "--arrival-seed",
+        type=int,
+        default=None,
+        help="Seed for Poisson inter-arrival sampling. If unset, uses process-global randomness.",
     )
     parser.add_argument("--fps", type=int, default=None, help="FPS (for video).")
     parser.add_argument("--output-file", type=str, default=None, help="Output JSON file for metrics.")
