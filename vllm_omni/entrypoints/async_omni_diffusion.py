@@ -141,8 +141,12 @@ class AsyncOmniDiffusion:
         # Initialize engine
         self.engine: DiffusionEngine = DiffusionEngine.make_engine(od_config)
 
-        # Thread pool for running sync engine in async context
-        self._executor = ThreadPoolExecutor(max_workers=1)
+        # Match the v0.16 serving behavior: multiple request-handling threads
+        # must be able to enter engine.step concurrently so backend-local
+        # scheduling can observe active+pending overlap and trigger
+        # preemption. With max_workers=1, requests serialize before reaching
+        # the scheduler and super-p95 can never preempt.
+        self._executor = ThreadPoolExecutor(max_workers=32)
         self._closed = False
         self._weak_finalizer = weakref.finalize(
             self,
