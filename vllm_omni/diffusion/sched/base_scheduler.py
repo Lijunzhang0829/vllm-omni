@@ -100,7 +100,7 @@ class _BaseScheduler(SchedulerInterface):
             self._reader_error = error
             self._result_cv.notify_all()
 
-    def wait_for_result(self, request_key: str, poll_interval_s: float = 0.1) -> DiffusionOutput:
+    def wait_for_result(self, request_key: str) -> DiffusionOutput:
         with self._result_cv:
             while True:
                 if self._reader_error is not None:
@@ -108,7 +108,7 @@ class _BaseScheduler(SchedulerInterface):
                 output = self._pending_results.pop(request_key, None)
                 if output is not None:
                     return output
-                self._result_cv.wait(timeout=poll_interval_s)
+                self._result_cv.wait()
 
     def _finish_requests(
         self,

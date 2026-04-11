@@ -93,6 +93,7 @@ class DiffusionEngine:
         self._scheduler_cv = threading.Condition()
         self._async_outputs: dict[str, DiffusionOutput] = {}
         self._async_errors: dict[str, BaseException] = {}
+        self._async_waiters: dict[str, threading.Event] = {}
         self._closed = False
         self._active_sched_req_id: str | None = None
         self._active_preemption_requested = False
@@ -359,6 +360,8 @@ class DiffusionEngine:
     def _add_req_and_wait_async_super_p95(self, request: OmniDiffusionRequest) -> DiffusionOutput:
         with self._scheduler_cv:
             target_sched_req_id = self.scheduler.add_request(request)
+            waiter = threading.Event()
+            self._async_waiters[target_sched_req_id] = waiter
             should_preempt = self._maybe_request_active_preemption_locked()
             self._scheduler_cv.notify_all()
         if should_preempt:
@@ -366,17 +369,19 @@ class DiffusionEngine:
             if preempt_event is not None:
                 preempt_event.set()
 
+        waiter.wait()
         with self._scheduler_cv:
-            while True:
-                error = self._async_errors.pop(target_sched_req_id, None)
-                if error is not None:
-                    self.scheduler.pop_request_state(target_sched_req_id)
-                    raise error
-                output = self._async_outputs.pop(target_sched_req_id, None)
-                if output is not None:
-                    self.scheduler.pop_request_state(target_sched_req_id)
-                    return output
-                self._scheduler_cv.wait(timeout=0.1)
+            self._async_waiters.pop(target_sched_req_id, None)
+            error = self._async_errors.pop(target_sched_req_id, None)
+            if error is not None:
+                self.scheduler.pop_request_state(target_sched_req_id)
+                raise error
+            output = self._async_outputs.pop(target_sched_req_id, None)
+            if output is None:
+                self.scheduler.pop_request_state(target_sched_req_id)
+                raise RuntimeError(f"Missing async output for {target_sched_req_id}")
+            self.scheduler.pop_request_state(target_sched_req_id)
+            return output
 
     def _run_super_p95_scheduler_loop(self) -> None:
         while True:
@@ -407,8 +412,13 @@ class DiffusionEngine:
             with self._scheduler_cv:
                 finished_req_ids = self.scheduler.update_from_output(sched_output, output)
                 if sched_req_id in finished_req_ids:
-                    self._async_outputs[sched_req_id] = output
-                    self._scheduler_cv.notify_all()
+                    if output.error:
+                        self._async_errors[sched_req_id] = RuntimeError(output.error)
+                    else:
+                        self._async_outputs[sched_req_id] = output
+                    waiter = self._async_waiters.get(sched_req_id)
+                    if waiter is not None:
+                        waiter.set()
                 self._clear_active_request_locked()
 
     def _request_supports_async_preemption(self, request: OmniDiffusionRequest) -> bool:
