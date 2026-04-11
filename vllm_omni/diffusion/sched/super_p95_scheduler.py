@@ -5,11 +5,13 @@ from __future__ import annotations
 
 import heapq
 import os
+import threading
 from dataclasses import dataclass, field
+from typing import Callable
 
 from vllm.logger import init_logger
 
-from vllm_omni.diffusion.data import DiffusionOutput
+from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.base_scheduler import _BaseScheduler
 from vllm_omni.diffusion.sched.interface import (
@@ -38,6 +40,9 @@ class _QueuedRequest:
     completed_steps: int = field(compare=False, default=0)
     dispatch_start_completed_steps: int = field(compare=False, default=0)
     is_sacrificial: bool = field(compare=False, default=False)
+    output: DiffusionOutput | None = field(default=None, compare=False)
+    error: BaseException | None = field(default=None, compare=False)
+    done_event: threading.Event = field(default_factory=threading.Event, compare=False, repr=False)
 
     def __post_init__(self) -> None:
         self.refresh_sort_key(self.estimated_service_s)
@@ -79,6 +84,53 @@ class SuperP95RequestScheduler(_BaseScheduler):
         self._hardware_profile = normalize_super_p95_hardware_profile(
             os.environ.get("VLLM_OMNI_SUPER_P95_HARDWARE_PROFILE")
         )
+        self._pending_cv = threading.Condition()
+        self._closed = False
+        self._scheduler_thread: threading.Thread | None = None
+        self._execute_request_fn: Callable[[OmniDiffusionRequest], DiffusionOutput] | None = None
+        self._preempt_event = None
+        self._active_completed_steps = None
+        self._active_sched_req_id: str | None = None
+        self._active_preemption_requested = False
+
+    def initialize(self, od_config: OmniDiffusionConfig) -> None:
+        super().initialize(od_config)
+        with self._pending_cv:
+            self._closed = False
+            self._active_sched_req_id = None
+            self._active_preemption_requested = False
+        if self._scheduler_thread is not None and self._scheduler_thread.is_alive():
+            return
+        self._scheduler_thread = threading.Thread(
+            target=self._run_scheduler_loop,
+            name="DiffusionSuperP95Scheduler",
+            daemon=True,
+        )
+        self._scheduler_thread.start()
+
+    def bind_executor(self, execute_request_fn, *, preempt_event=None, active_completed_steps=None) -> None:
+        self._execute_request_fn = execute_request_fn
+        self._preempt_event = preempt_event
+        self._active_completed_steps = active_completed_steps
+
+    def add_req(self, request: OmniDiffusionRequest) -> DiffusionOutput:
+        should_preempt = False
+        with self._pending_cv:
+            sched_req_id = self.add_request(request)
+            queued = self._queue_metadata[sched_req_id]
+            should_preempt = self._maybe_request_active_preemption_locked()
+            self._pending_cv.notify_all()
+        if should_preempt and self._preempt_event is not None:
+            self._preempt_event.set()
+        queued.done_event.wait()
+        if queued.error is not None:
+            self.pop_request_state(sched_req_id)
+            raise queued.error
+        output = queued.output
+        self.pop_request_state(sched_req_id)
+        if output is None:
+            raise RuntimeError(f"Missing output for scheduled request {sched_req_id}")
+        return output
 
     def get_load_snapshot(self) -> SuperP95LoadSnapshot:
         normal_load_s = 0.0
@@ -136,6 +188,15 @@ class SuperP95RequestScheduler(_BaseScheduler):
             estimated_service_s,
         )
         return sched_req_id
+
+    def close(self) -> None:
+        with self._pending_cv:
+            self._closed = True
+            self._pending_cv.notify_all()
+        if self._scheduler_thread is not None and self._scheduler_thread.is_alive():
+            self._scheduler_thread.join(timeout=5)
+        self._scheduler_thread = None
+        super().close()
 
     def schedule(self) -> DiffusionSchedulerOutput:
         scheduled_new_reqs: list[NewRequestData] = []
@@ -299,3 +360,100 @@ class SuperP95RequestScheduler(_BaseScheduler):
         completed_in_quantum = min(completed_steps, dispatch_start_remaining_steps)
         self._current_time_s += queued.estimated_service_s * completed_in_quantum / max(queued.total_steps, 1)
         queued.completed_steps = min(queued.dispatch_start_completed_steps + completed_in_quantum, queued.total_steps)
+
+    def _run_scheduler_loop(self) -> None:
+        while True:
+            with self._pending_cv:
+                self._pending_cv.wait_for(lambda: self._closed or self.has_requests())
+                if self._closed and not self.has_requests():
+                    return
+                sched_output = self.schedule()
+                if sched_output.is_empty:
+                    continue
+                sched_req_id = sched_output.scheduled_req_ids[0]
+                state = self.get_request_state(sched_req_id)
+                if state is None:
+                    continue
+                queued = self._queue_metadata.get(sched_req_id)
+                if queued is None:
+                    continue
+                request = state.req
+                request.sampling_params.extra_args["_server_preemption_enabled"] = self._supports_async_preemption(request)
+                self._mark_active_request_locked(sched_req_id)
+
+            try:
+                if self._execute_request_fn is None:
+                    raise RuntimeError("SuperP95RequestScheduler executor is not bound.")
+                output = self._execute_request_fn(request)
+            except Exception as exc:
+                output = DiffusionOutput(
+                    error=str(exc),
+                    request_key=request.request_ids[0] if request.request_ids else None,
+                )
+
+            with self._pending_cv:
+                finished_req_ids = self.update_from_output(sched_output, output)
+                if sched_req_id in finished_req_ids:
+                    queued.output = output
+                    if output.error:
+                        queued.error = RuntimeError(output.error)
+                    queued.done_event.set()
+                self._clear_active_request_locked()
+
+    def _supports_async_preemption(self, request: OmniDiffusionRequest) -> bool:
+        if self.od_config is None or not bool(getattr(request, "request_ids", None)):
+            return False
+        model_name = self.od_config.model_class_name
+        if model_name == "QwenImagePipeline":
+            return True
+        if model_name == "Wan22Pipeline":
+            prompts = getattr(request, "prompts", None) or []
+            if len(prompts) != 1 or isinstance(prompts[0], str):
+                return True
+            multi_modal_data = prompts[0].get("multi_modal_data", {})
+            return multi_modal_data.get("image") is None
+        return False
+
+    def _mark_active_request_locked(self, sched_req_id: str) -> None:
+        self._active_sched_req_id = sched_req_id
+        self._active_preemption_requested = False
+        if self._preempt_event is not None:
+            self._preempt_event.clear()
+        if self._active_completed_steps is not None:
+            self._active_completed_steps.value = 0
+
+    def _clear_active_request_locked(self) -> None:
+        if self._preempt_event is not None:
+            self._preempt_event.clear()
+        if self._active_completed_steps is not None:
+            self._active_completed_steps.value = 0
+        self._active_sched_req_id = None
+        self._active_preemption_requested = False
+
+    def _maybe_request_active_preemption_locked(self) -> bool:
+        if self._active_preemption_requested:
+            return False
+        active_sched_req_id = self._active_sched_req_id
+        if active_sched_req_id is None:
+            return False
+        active_state = self.get_request_state(active_sched_req_id)
+        if active_state is None or not self._supports_async_preemption(active_state.req):
+            return False
+        candidate = self.peek_next_request()
+        incumbent = self.get_queued_request(active_sched_req_id)
+        if candidate is None or incumbent is None:
+            return False
+        completed_steps = 0
+        if self._active_completed_steps is not None:
+            completed_steps = max(int(self._active_completed_steps.value), 0)
+        active_remaining_s = self.get_active_remaining_service_s(active_sched_req_id, completed_steps)
+        original_sort_key = incumbent.sort_key
+        incumbent.refresh_sort_key(active_remaining_s)
+        try:
+            outranks = self.request_outranks(candidate, incumbent)
+        finally:
+            incumbent.sort_key = original_sort_key
+        if not outranks:
+            return False
+        self._active_preemption_requested = True
+        return True
