@@ -117,8 +117,11 @@ from vllm_omni.diffusion.super_p95 import (
     parse_super_p95_load_metrics,
 )
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams, OmniTextPrompt
+from vllm_omni.trace_logging import write_trace_event
 
 logger = init_logger(__name__)
+_TRACE_LOG_FILE = os.environ.get("VLLM_OMNI_TRACE_LOG_FILE")
+_TRACE_NODE = os.environ.get("VLLM_OMNI_TRACE_NODE", "backend")
 router = APIRouter()
 
 
@@ -885,6 +888,13 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         )
 
     elif isinstance(generator, ChatCompletionResponse):
+        write_trace_event(
+            _TRACE_LOG_FILE,
+            "backend_finish",
+            node=_TRACE_NODE,
+            request_id=request.request_id,
+            server_request_id=getattr(generator, "id", None),
+        )
         # Completely bypass Pydantic serialization warnings for multimodal content
         # by converting to dict first, then serializing with warnings suppressed
         import json as json_lib
