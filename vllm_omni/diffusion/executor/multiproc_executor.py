@@ -21,7 +21,6 @@ logger = init_logger(__name__)
 
 @dataclass
 class PendingGenerationResult:
-    event: threading.Event
     response: DiffusionOutput | None = None
     error: BaseException | None = None
 
@@ -78,6 +77,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         self._pipe_reader_stop = threading.Event()
         self._pipe_reader_thread: threading.Thread | None = None
         self._pending_generation_lock = threading.Lock()
+        self._result_cv = threading.Condition(self._pending_generation_lock)
         self._pending_generation_results: dict[str, PendingGenerationResult] = {}
         self._reader_error: BaseException | None = None
         self._preempt_event = self._mp_ctx.Event()
@@ -193,10 +193,10 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
 
     def _set_reader_error(self, exc: BaseException) -> None:
         self._reader_error = exc
-        with self._pending_generation_lock:
+        with self._result_cv:
             for pending in self._pending_generation_results.values():
                 pending.error = exc
-                pending.event.set()
+            self._result_cv.notify_all()
 
     def _worker_pipe_loop(self) -> None:
         while not self._pipe_reader_stop.is_set():
@@ -240,15 +240,13 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                     logger.warning("Ignoring malformed worker generation_result message: %s", message)
                     continue
 
-                with self._pending_generation_lock:
+                with self._result_cv:
                     pending = self._pending_generation_results.get(payload.request_key)
-
-                if pending is None:
-                    logger.warning("Dropping generation_result for unknown request_key=%s", payload.request_key)
-                    continue
-
-                pending.response = payload
-                pending.event.set()
+                    if pending is None:
+                        logger.warning("Dropping generation_result for unknown request_key=%s", payload.request_key)
+                        continue
+                    pending.response = payload
+                    self._result_cv.notify_all()
 
     def add_req(self, request: OmniDiffusionRequest) -> DiffusionOutput:
         self._ensure_open()
@@ -270,32 +268,29 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         # return over the worker control pipe. This restores the lighter
         # request->mq, result->pipe split used in v0.16 and keeps large
         # diffusion outputs off the shared-memory ring buffer critical path.
-        pending = PendingGenerationResult(event=threading.Event())
-        with self._pending_generation_lock:
+        pending = PendingGenerationResult()
+        with self._result_cv:
             if request_key in self._pending_generation_results:
                 raise RuntimeError(f"Duplicate in-flight generation request_key={request_key}")
             self._pending_generation_results[request_key] = pending
 
         try:
             self._broadcast_mq.enqueue(rpc_request)
-            while True:
-                pending.event.wait(timeout=0.5)
-                if pending.event.is_set():
-                    break
-                self.check_health()
-                if self._reader_error is not None:
-                    raise RuntimeError("Worker control pipe failed") from self._reader_error
-
-            if pending.error is not None:
-                raise RuntimeError("Generation request failed on worker control pipe") from pending.error
-            if pending.response is None:
-                raise RuntimeError(f"Generation result for request_key={request_key} was never populated")
-            return pending.response
+            with self._result_cv:
+                while True:
+                    if self._reader_error is not None:
+                        raise RuntimeError("Worker control pipe failed") from self._reader_error
+                    if pending.error is not None:
+                        raise RuntimeError("Generation request failed on worker control pipe") from pending.error
+                    if pending.response is not None:
+                        return pending.response
+                    self._result_cv.wait(timeout=0.1)
+                    self.check_health()
         except Exception as e:
             logger.error(f"Generate call failed: {e}")
             raise
         finally:
-            with self._pending_generation_lock:
+            with self._result_cv:
                 self._pending_generation_results.pop(request_key, None)
 
     def _add_req_via_result_queue(self, rpc_request: dict[str, Any]) -> DiffusionOutput:
