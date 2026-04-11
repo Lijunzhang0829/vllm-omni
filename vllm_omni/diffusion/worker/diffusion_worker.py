@@ -44,6 +44,7 @@ from vllm_omni.diffusion.worker.utils import RunnerOutput
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.profiler import OmniTorchProfilerWrapper, create_omni_profiler
+from vllm_omni.trace_logging import write_trace_event
 from vllm_omni.worker.gpu_memory_utils import get_process_gpu_memory
 
 logger = init_logger(__name__)
@@ -220,7 +221,15 @@ class DiffusionWorker:
         preemption_enabled = bool(req.sampling_params.extra_args.get("_server_preemption_enabled", False))
         request_key = self._get_request_key(req) if getattr(req, "request_ids", None) else None
         if preemption_enabled and request_key in self._resident_scheduler_states:
+            resident_state = self._resident_scheduler_states[request_key]
             req.sampling_params.extra_args["_server_state"] = self._resident_scheduler_states[request_key]
+            write_trace_event(
+                os.environ.get("VLLM_OMNI_TRACE_LOG_FILE"),
+                "worker_resume",
+                node=os.environ.get("VLLM_OMNI_TRACE_NODE"),
+                request_id=request_key,
+                completed_steps=int(resident_state.get("completed_steps", 0)),
+            )
         else:
             req.sampling_params.extra_args.pop("_server_state", None)
         if self.lora_manager is not None:
@@ -246,6 +255,13 @@ class DiffusionWorker:
                 elif output.scheduler_state is not None:
                     state = output.scheduler_state
                     self._resident_scheduler_states[request_key] = state
+                    write_trace_event(
+                        os.environ.get("VLLM_OMNI_TRACE_LOG_FILE"),
+                        "worker_partial_yield",
+                        node=os.environ.get("VLLM_OMNI_TRACE_NODE"),
+                        request_id=request_key,
+                        completed_steps=int(state.get("completed_steps", 0)),
+                    )
                     output.scheduler_state = {
                         "request_key": request_key,
                         "completed_steps": int(state.get("completed_steps", 0)),

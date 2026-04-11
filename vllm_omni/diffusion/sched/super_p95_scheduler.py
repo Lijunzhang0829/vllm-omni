@@ -26,6 +26,7 @@ from vllm_omni.diffusion.super_p95 import (
     normalize_super_p95_hardware_profile,
     SuperP95LoadSnapshot,
 )
+from vllm_omni.trace_logging import write_trace_event
 logger = init_logger(__name__)
 
 
@@ -456,4 +457,13 @@ class SuperP95RequestScheduler(_BaseScheduler):
         if not outranks:
             return False
         self._active_preemption_requested = True
+        write_trace_event(
+            os.environ.get("VLLM_OMNI_TRACE_LOG_FILE"),
+            "scheduler_preempt_request",
+            node=os.environ.get("VLLM_OMNI_TRACE_NODE"),
+            request_id=active_sched_req_id,
+            candidate_request_id=candidate.sched_req_id,
+            active_remaining_s=active_remaining_s,
+            candidate_remaining_s=candidate.remaining_service_s,
+        )
         return True
