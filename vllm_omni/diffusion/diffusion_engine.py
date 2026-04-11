@@ -311,6 +311,13 @@ class DiffusionEngine:
         if self._uses_async_super_p95():
             return self._add_req_and_wait_async_super_p95(request)
 
+        # Keep the baseline/request-mode path aligned with v0.16: a direct
+        # executor round-trip without the extra v0.18 request-scheduler
+        # state-machine. The executor already routes generation results back
+        # through the scheduler-owned publish/wait path.
+        if not _server_scheduling_enabled():
+            return self.executor.add_req(request)
+
         with self._rpc_lock:
             target_sched_req_id = self.scheduler.add_request(request)
 
