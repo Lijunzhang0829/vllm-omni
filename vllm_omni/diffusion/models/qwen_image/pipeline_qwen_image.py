@@ -773,11 +773,18 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
             attention_kwargs=attention_kwargs,
         )
 
+        # Keep a request-scoped scheduler instance in resident worker state so
+        # resume can continue from in-memory scheduler/timestep state instead
+        # of materializing timesteps again on every partial yield.
+        req_scheduler = copy.deepcopy(self.scheduler)
+        req_scheduler.set_begin_index(0)
+
         return {
             "height": height,
             "width": width,
             "latents": ctx["latents"],
             "timesteps": ctx["timesteps"],
+            "scheduler": req_scheduler,
             "num_inference_steps": num_inference_steps,
             "sigmas": sigmas,
             "image_seq_len": ctx["latents"].shape[1],
@@ -797,17 +804,26 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
         }
 
     def _restore_scheduler_state(self, state: dict[str, Any]) -> None:
-        timesteps, _ = self.prepare_timesteps(
-            state["num_inference_steps"],
-            state["sigmas"],
-            state["image_seq_len"],
-        )
-        state["timesteps"] = timesteps
-        self._num_timesteps = len(timesteps)
+        timesteps = state.get("timesteps")
+        if timesteps is None:
+            timesteps, _ = self.prepare_timesteps(
+                state["num_inference_steps"],
+                state["sigmas"],
+                state["image_seq_len"],
+            )
+            state["timesteps"] = timesteps
+        if "scheduler" not in state:
+            # TODO(v0.18-super-p95): Remove this fallback once all resident
+            # states are guaranteed to carry request-local scheduler objects.
+            req_scheduler = copy.deepcopy(self.scheduler)
+            req_scheduler.set_begin_index(0)
+            state["scheduler"] = req_scheduler
+        self._num_timesteps = len(state["timesteps"])
 
     def _run_generation_steps(self, state: dict[str, Any]) -> tuple[dict[str, Any], bool, int]:
         self._restore_scheduler_state(state)
         timesteps = state["timesteps"]
+        req_scheduler = state["scheduler"]
         start_index = int(state["next_step_index"])
         if start_index >= len(timesteps):
             raise RuntimeError(
@@ -815,7 +831,7 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
                 f"start_index={start_index} >= timesteps_len={len(timesteps)}"
             )
 
-        self.scheduler.set_begin_index(start_index)
+        req_scheduler.set_begin_index(start_index)
         self.transformer.do_true_cfg = state["do_true_cfg"]
         latents = state["latents"]
         completed_steps = 0
@@ -851,7 +867,13 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
                 True,
                 output_slice,
             )
-            latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, state["do_true_cfg"])
+            latents = self.scheduler_step_maybe_with_cfg(
+                noise_pred,
+                t,
+                latents,
+                state["do_true_cfg"],
+                per_request_scheduler=req_scheduler,
+            )
             completed_steps += 1
             if progress is not None:
                 try:
