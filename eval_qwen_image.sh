@@ -16,30 +16,32 @@ set -euo pipefail
 # python3 benchmarks/diffusion/super_p95_dispatcher.py \
 #   --host 127.0.0.1 \
 #   --port 8080 \
-#   --backend-url http://127.0.0.1:8091 \
-#   --backend-url http://127.0.0.1:8092 \
-#   --backend-url http://127.0.0.1:8093 \
-#   --backend-url http://127.0.0.1:8094 \
-#   --backend-url http://127.0.0.1:8095 \
-#   --backend-url http://127.0.0.1:8096 \
-#   --backend-url http://127.0.0.1:8097 \
-#   --backend-url http://127.0.0.1:8098 \
-#   --hardware-profile 910B3
+#   --num-servers 8 \
+#   --device-ids 0,1,2,3,4,5,6,7 \
+#   --model Qwen/Qwen-Image \
+#   --backend-start-port 8091 \
+#   --backend-hardware-profiles 910B3 \
+#   --backend-args=--omni \
+#   --backend-args=--vae-use-slicing \
+#   --backend-args=--vae-use-tiling
 #
 # Super-P95, 8x 910B3:
 # env NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost \
 # python3 benchmarks/diffusion/super_p95_dispatcher.py \
 #   --host 127.0.0.1 \
 #   --port 8080 \
-#   --backend-url http://127.0.0.1:8091 \
-#   --backend-url http://127.0.0.1:8092 \
-#   --backend-url http://127.0.0.1:8093 \
-#   --backend-url http://127.0.0.1:8094 \
-#   --backend-url http://127.0.0.1:8095 \
-#   --backend-url http://127.0.0.1:8096 \
-#   --backend-url http://127.0.0.1:8097 \
-#   --backend-url http://127.0.0.1:8098 \
-#   --hardware-profile 910B3
+#   --num-servers 8 \
+#   --device-ids 0,1,2,3,4,5,6,7 \
+#   --model Qwen/Qwen-Image \
+#   --backend-start-port 8091 \
+#   --backend-hardware-profiles 910B3 \
+#   --quota-every 20 \
+#   --quota-amount 1 \
+#   --threshold-ratio 0.8 \
+#   --sacrificial-load-factor 0.1 \
+#   --backend-args=--omni \
+#   --backend-args=--vae-use-slicing \
+#   --backend-args=--vae-use-tiling
 
 usage() {
   cat <<'EOF'

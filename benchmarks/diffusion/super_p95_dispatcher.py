@@ -4,8 +4,17 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
+import os
+import shlex
+import subprocess
+import time
+from contextlib import suppress
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 
 import httpx
 import uvicorn
@@ -59,6 +68,157 @@ class DispatchDecision:
     is_sacrificial: bool
 
 
+@dataclass(frozen=True)
+class ManagedBackendSpec:
+    device_id: str
+    port: int
+    base_url: str
+    hardware_profile: str
+
+
+@dataclass
+class ManagedBackendProcess:
+    spec: ManagedBackendSpec
+    process: subprocess.Popen[str]
+    log_file: Any
+
+
+class ManagedBackendLauncher:
+    def __init__(
+        self,
+        *,
+        specs: list[ManagedBackendSpec],
+        model: str,
+        backend_args: list[str],
+        backend_env: dict[str, str],
+        device_env_var: str,
+        health_timeout_s: float,
+        health_poll_interval_s: float,
+        log_dir: str,
+        backend_command: str = "vllm-omni",
+    ) -> None:
+        self.specs = specs
+        self.model = model
+        self.backend_args = backend_args
+        self.backend_env = backend_env
+        self.device_env_var = device_env_var
+        self.health_timeout_s = health_timeout_s
+        self.health_poll_interval_s = health_poll_interval_s
+        self.log_dir = Path(log_dir)
+        self.backend_command = backend_command
+        self._processes: list[ManagedBackendProcess] = []
+
+    def start_all(self) -> None:
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        logger.info(
+            "Starting %d managed super_p95 backends in parallel. Logs: %s",
+            len(self.specs),
+            self.log_dir,
+        )
+        try:
+            for spec in self.specs:
+                self._processes.append(self._start_one(spec))
+            self._wait_until_healthy()
+            logger.info("All managed super_p95 backends are healthy.")
+        except Exception:
+            self.stop_all()
+            raise
+
+    def stop_all(self) -> None:
+        for managed in reversed(self._processes):
+            if managed.process.poll() is None:
+                managed.process.terminate()
+        deadline = time.time() + 20.0
+        for managed in reversed(self._processes):
+            if managed.process.poll() is None:
+                timeout_s = max(deadline - time.time(), 0.0)
+                with suppress(subprocess.TimeoutExpired):
+                    managed.process.wait(timeout=timeout_s)
+            if managed.process.poll() is None:
+                managed.process.kill()
+                with suppress(subprocess.TimeoutExpired):
+                    managed.process.wait(timeout=5.0)
+            with suppress(Exception):
+                managed.log_file.close()
+        self._processes.clear()
+
+    def _start_one(self, spec: ManagedBackendSpec) -> ManagedBackendProcess:
+        env = os.environ.copy()
+        env[self.device_env_var] = spec.device_id
+        env.setdefault("PYTHONUNBUFFERED", "1")
+        env.update(self.backend_env)
+        log_path = self.log_dir / f"backend_{spec.port}.log"
+        log_file = open(log_path, "a", encoding="utf-8")
+        cmd = [
+            self.backend_command,
+            "serve",
+            self.model,
+            "--port",
+            str(spec.port),
+            *self.backend_args,
+        ]
+        logger.info(
+            "Launching backend port=%s device_id=%s base_url=%s hardware_profile=%s log=%s cmd=%s",
+            spec.port,
+            spec.device_id,
+            spec.base_url,
+            spec.hardware_profile,
+            log_path,
+            shlex.join(cmd),
+        )
+        process = subprocess.Popen(
+            cmd,
+            env=env,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        return ManagedBackendProcess(spec=spec, process=process, log_file=log_file)
+
+    def _wait_until_healthy(self) -> None:
+        deadline = time.time() + self.health_timeout_s
+        pending = {managed.spec.port: managed for managed in self._processes}
+        while pending:
+            failed = [managed for managed in pending.values() if managed.process.poll() is not None]
+            if failed:
+                details = ", ".join(
+                    f"{managed.spec.port}(device={managed.spec.device_id}, log={managed.log_file.name})"
+                    for managed in failed
+                )
+                raise RuntimeError(f"super_p95 backend exited before becoming healthy: {details}")
+
+            ready_ports = [port for port, managed in pending.items() if self._is_healthy(managed.spec.base_url)]
+            for port in ready_ports:
+                managed = pending.pop(port, None)
+                if managed is not None:
+                    logger.info(
+                        "Managed backend healthy: port=%s device=%s url=%s log=%s",
+                        managed.spec.port,
+                        managed.spec.device_id,
+                        managed.spec.base_url,
+                        managed.log_file.name,
+                    )
+
+            if not pending:
+                return
+            if time.time() >= deadline:
+                details = ", ".join(
+                    f"{managed.spec.port}(device={managed.spec.device_id}, log={managed.log_file.name})"
+                    for managed in pending.values()
+                )
+                raise TimeoutError(f"Timed out waiting for super_p95 backends to become healthy: {details}")
+            time.sleep(self.health_poll_interval_s)
+
+    @staticmethod
+    def _is_healthy(base_url: str) -> bool:
+        try:
+            opener = urllib_request.build_opener(urllib_request.ProxyHandler({}))
+            with opener.open(f"{base_url}/health", timeout=2.0) as response:
+                return response.status == 200
+        except (urllib_error.URLError, TimeoutError, ValueError):
+            return False
+
+
 class SuperP95Dispatcher:
     def __init__(
         self,
@@ -70,12 +230,8 @@ class SuperP95Dispatcher:
         threshold_ratio: float,
         sacrificial_load_factor: float,
         request_timeout_s: float,
+        backend_launcher: ManagedBackendLauncher | None = None,
     ) -> None:
-        # TODO(v0.18-super-p95): This dispatcher intentionally keeps the
-        # minimal explicit-backend shape for the first port. Managed backend
-        # lifecycle, startup orchestration, and runtime-specific stability
-        # controls from v0.16 still need a deliberate re-port instead of
-        # ad-hoc workarounds.
         if not 1 <= len(backend_urls) <= 8:
             raise ValueError("super_p95 dispatcher supports 1 to 8 backends")
         hardware_profiles = _parse_backend_hardware_profiles(backend_hardware_profiles, len(backend_urls))
@@ -93,18 +249,24 @@ class SuperP95Dispatcher:
         self.sacrificial_load_factor = sacrificial_load_factor
         self.request_timeout_s = request_timeout_s
 
+        self._lock = asyncio.Lock()
         self.arrival_counter = 0
         self.credits = 0
         self.global_max_service_s = 0.0
         self._client: httpx.AsyncClient | None = None
+        self._backend_launcher = backend_launcher
 
     async def startup(self) -> None:
+        if self._backend_launcher is not None:
+            await asyncio.to_thread(self._backend_launcher.start_all)
         self._client = httpx.AsyncClient(timeout=self.request_timeout_s, trust_env=False)
 
     async def shutdown(self) -> None:
         if self._client is not None:
             await self._client.aclose()
             self._client = None
+        if self._backend_launcher is not None:
+            await asyncio.to_thread(self._backend_launcher.stop_all)
 
     async def dispatch_json(self, path: str, body: dict[str, Any], incoming_headers: dict[str, str]) -> Response:
         decision = self._choose_backend(path, body)
@@ -201,8 +363,12 @@ class SuperP95Dispatcher:
         estimated_service_s_by_backend = [
             self._estimate_service_s(path, body, backend.hardware_profile) for backend in self.backends
         ]
-        self.arrival_counter += 1
         estimated_service_s = min(estimated_service_s_by_backend)
+        # TODO(v0.18-super-p95): When the dispatcher grows multi-request
+        # reconciliation tests, keep this accounting synchronized with the
+        # backend authoritative load headers. Right now we preserve the
+        # v0.16 policy math but do not yet prove it under concurrent races.
+        self.arrival_counter += 1
         if self.arrival_counter % self.quota_every == 0:
             self.credits += self.quota_amount
 
@@ -413,12 +579,53 @@ def parse_args() -> argparse.Namespace:
         "--backend-url",
         dest="backend_urls",
         action="append",
-        required=True,
         help="Backend base URL. Repeat 1 to 8 times, e.g. http://127.0.0.1:8091",
     )
+    parser.add_argument("--num-servers", type=int, help="Number of managed backend servers to launch (1-8).")
+    parser.add_argument(
+        "--device-ids",
+        help="Comma-separated device ids for managed launch, e.g. 0,1,2,3. Defaults to 0..num_servers-1.",
+    )
+    parser.add_argument("--model", help="Model name for managed backend launch, e.g. Qwen/Qwen-Image.")
+    parser.add_argument("--backend-host", default="127.0.0.1", help="Host used for managed backend URLs.")
+    parser.add_argument("--backend-start-port", type=int, default=8091, help="Starting port for managed backends.")
     parser.add_argument(
         "--backend-hardware-profiles",
         help="Comma-separated hardware profiles for backends, e.g. 910B2,910B3.",
+    )
+    parser.add_argument(
+        "--backend-args",
+        action="append",
+        default=["--omni"],
+        help="Extra CLI args appended to each managed backend command.",
+    )
+    parser.add_argument(
+        "--backend-env",
+        action="append",
+        default=[],
+        help="Extra environment for managed backends in KEY=VALUE form. Repeat as needed.",
+    )
+    parser.add_argument(
+        "--device-env-var",
+        default="ASCEND_RT_VISIBLE_DEVICES",
+        help="Environment variable used to pin a managed backend to a single device.",
+    )
+    parser.add_argument(
+        "--backend-health-timeout-s",
+        type=float,
+        default=900.0,
+        help="How long dispatcher startup waits for managed backends to pass /health.",
+    )
+    parser.add_argument(
+        "--backend-health-poll-interval-s",
+        type=float,
+        default=5.0,
+        help="Polling interval while waiting for managed backends to pass /health.",
+    )
+    parser.add_argument(
+        "--backend-log-dir",
+        default="/tmp/super_p95_backends",
+        help="Directory for managed backend stdout/stderr logs.",
     )
     parser.add_argument("--quota-every", type=int, default=20)
     parser.add_argument("--quota-amount", type=int, default=1)
@@ -428,16 +635,88 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _parse_backend_env(values: list[str]) -> dict[str, str]:
+    env: dict[str, str] = {}
+    for item in values:
+        if "=" not in item:
+            raise ValueError(f"Invalid --backend-env value {item!r}; expected KEY=VALUE")
+        key, value = item.split("=", 1)
+        key = key.strip()
+        if not key:
+            raise ValueError(f"Invalid --backend-env value {item!r}; key cannot be empty")
+        env[key] = value
+    return env
+
+
+def _parse_device_ids(device_ids: str | None, num_servers: int) -> list[str]:
+    if device_ids is None:
+        return [str(idx) for idx in range(num_servers)]
+    parsed = [item.strip() for item in device_ids.split(",") if item.strip()]
+    if len(parsed) != num_servers:
+        raise ValueError(f"--device-ids must provide exactly {num_servers} entries")
+    return parsed
+
+
+def _build_managed_specs(
+    host: str,
+    start_port: int,
+    device_ids: list[str],
+    hardware_profiles: list[str],
+) -> list[ManagedBackendSpec]:
+    return [
+        ManagedBackendSpec(
+            device_id=device_id,
+            port=start_port + idx,
+            base_url=f"http://{host}:{start_port + idx}",
+            hardware_profile=hardware_profiles[idx],
+        )
+        for idx, device_id in enumerate(device_ids)
+    ]
+
+
 def build_dispatcher_from_args(args: argparse.Namespace) -> SuperP95Dispatcher:
-    backend_urls = [url.rstrip("/") for url in args.backend_urls]
+    manual_urls = [url.rstrip("/") for url in (args.backend_urls or [])]
+    use_managed = args.num_servers is not None or args.model is not None or args.device_ids is not None
+    backend_hardware_profiles_arg = getattr(args, "backend_hardware_profiles", None)
+
+    if manual_urls and use_managed:
+        raise ValueError("Choose either --backend-url or managed launch args, not both")
+
+    backend_launcher = None
+    if manual_urls:
+        backend_urls = manual_urls
+    else:
+        if args.num_servers is None or args.model is None:
+            raise ValueError("Managed launch requires both --num-servers and --model")
+        if not 1 <= args.num_servers <= 8:
+            raise ValueError("--num-servers must be between 1 and 8")
+        device_ids = _parse_device_ids(args.device_ids, args.num_servers)
+        hardware_profiles = _parse_backend_hardware_profiles(backend_hardware_profiles_arg, args.num_servers)
+        specs = _build_managed_specs(args.backend_host, args.backend_start_port, device_ids, hardware_profiles)
+        backend_urls = [spec.base_url for spec in specs]
+        backend_args: list[str] = []
+        for raw in args.backend_args:
+            backend_args.extend(shlex.split(raw))
+        backend_launcher = ManagedBackendLauncher(
+            specs=specs,
+            model=args.model,
+            backend_args=backend_args,
+            backend_env=_parse_backend_env(args.backend_env),
+            device_env_var=args.device_env_var,
+            health_timeout_s=args.backend_health_timeout_s,
+            health_poll_interval_s=args.backend_health_poll_interval_s,
+            log_dir=args.backend_log_dir,
+        )
+
     return SuperP95Dispatcher(
         backend_urls=backend_urls,
-        backend_hardware_profiles=args.backend_hardware_profiles,
+        backend_hardware_profiles=_parse_backend_hardware_profiles(backend_hardware_profiles_arg, len(backend_urls)),
         quota_every=args.quota_every,
         quota_amount=args.quota_amount,
         threshold_ratio=args.threshold_ratio,
         sacrificial_load_factor=args.sacrificial_load_factor,
         request_timeout_s=args.request_timeout_s,
+        backend_launcher=backend_launcher,
     )
 
 
