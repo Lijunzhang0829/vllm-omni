@@ -155,6 +155,8 @@ class ManagedBackendLauncher:
             self.model,
             "--port",
             str(spec.port),
+            "--super-p95-hardware-profile",
+            spec.hardware_profile,
             *self.backend_args,
         ]
         logger.info(
@@ -270,13 +272,21 @@ class SuperP95Dispatcher:
             await asyncio.to_thread(self._backend_launcher.stop_all)
 
     async def dispatch_json(self, path: str, body: dict[str, Any], incoming_headers: dict[str, str]) -> Response:
-        decision = self._choose_backend(path, body)
+        decision = await self._choose_backend(path, body)
         backend = self.backends[decision.backend_index]
         headers = self._build_forward_headers(incoming_headers, decision)
         assert self._client is not None
 
-        response = await self._client.post(f"{backend.base_url}{path}", json=body, headers=headers)
-        self._apply_response_feedback(decision, response.headers)
+        start_time = time.perf_counter()
+        try:
+            response = await self._client.post(f"{backend.base_url}{path}", json=body, headers=headers)
+        except Exception:
+            elapsed_s = time.perf_counter() - start_time
+            await self._mark_failed_response(decision, elapsed_s)
+            raise
+
+        elapsed_s = time.perf_counter() - start_time
+        await self._apply_response_feedback(decision, response.headers, elapsed_s)
         return Response(
             content=response.content,
             status_code=response.status_code,
@@ -286,7 +296,7 @@ class SuperP95Dispatcher:
 
     async def dispatch_form(self, path: str, form: FormData, incoming_headers: dict[str, str]) -> Response:
         body = _form_to_estimation_dict(form)
-        decision = self._choose_backend(path, body)
+        decision = await self._choose_backend(path, body)
         backend = self.backends[decision.backend_index]
         headers = self._build_forward_headers(incoming_headers, decision)
         headers.pop("content-type", None)
@@ -310,8 +320,16 @@ class SuperP95Dispatcher:
                 data[key] = str(value)
 
         assert self._client is not None
-        response = await self._client.post(f"{backend.base_url}{path}", data=data, files=files or None, headers=headers)
-        self._apply_response_feedback(decision, response.headers)
+        start_time = time.perf_counter()
+        try:
+            response = await self._client.post(f"{backend.base_url}{path}", data=data, files=files or None, headers=headers)
+        except Exception:
+            elapsed_s = time.perf_counter() - start_time
+            await self._mark_failed_response(decision, elapsed_s)
+            raise
+
+        elapsed_s = time.perf_counter() - start_time
+        await self._apply_response_feedback(decision, response.headers, elapsed_s)
         return Response(
             content=response.content,
             status_code=response.status_code,
@@ -360,55 +378,75 @@ class SuperP95Dispatcher:
             content={"status": "healthy" if overall_healthy else "degraded", "backends": statuses},
         )
 
-    def _choose_backend(self, path: str, body: dict[str, Any]) -> DispatchDecision:
+    async def _choose_backend(self, path: str, body: dict[str, Any]) -> DispatchDecision:
         estimated_service_s_by_backend = [
             self._estimate_service_s(path, body, backend.hardware_profile) for backend in self.backends
         ]
         estimated_service_s = min(estimated_service_s_by_backend)
-        # TODO(v0.18-super-p95): When the dispatcher grows multi-request
-        # reconciliation tests, keep this accounting synchronized with the
-        # backend authoritative load headers. Right now we preserve the
-        # v0.16 policy math but do not yet prove it under concurrent races.
-        self.arrival_counter += 1
-        if self.arrival_counter % self.quota_every == 0:
-            self.credits += self.quota_amount
+        async with self._lock:
+            self.arrival_counter += 1
+            if self.arrival_counter % self.quota_every == 0:
+                self.credits += self.quota_amount
 
-        self.global_max_service_s = max(self.global_max_service_s, estimated_service_s)
-        is_sacrificial = (
-            self.credits > 0
-            and self.global_max_service_s > 0.0
-            and estimated_service_s >= self.threshold_ratio * self.global_max_service_s
-        )
-        if is_sacrificial:
-            self.credits -= 1
+            self.global_max_service_s = max(self.global_max_service_s, estimated_service_s)
+            is_sacrificial = (
+                self.credits > 0
+                and self.global_max_service_s > 0.0
+                and estimated_service_s >= self.threshold_ratio * self.global_max_service_s
+            )
+            if is_sacrificial:
+                self.credits -= 1
 
-        backend_index = min(
-            range(len(self.backends)),
-            key=lambda idx: self.backends[idx].score_tuple(self.sacrificial_load_factor),
-        )
-        backend = self.backends[backend_index]
-        selected_estimated_service_s = estimated_service_s_by_backend[backend_index]
-        if is_sacrificial:
-            backend.sacrificial_load_s += selected_estimated_service_s
-            backend.inflight_sacrificial_requests += 1
-        else:
-            backend.normal_load_s += selected_estimated_service_s
-            backend.inflight_normal_requests += 1
-        return DispatchDecision(
-            backend_index=backend_index,
-            estimated_service_s=selected_estimated_service_s,
-            is_sacrificial=is_sacrificial,
-        )
+            backend_index = min(
+                range(len(self.backends)),
+                key=lambda idx: self.backends[idx].score_tuple(self.sacrificial_load_factor),
+            )
+            backend = self.backends[backend_index]
+            selected_estimated_service_s = estimated_service_s_by_backend[backend_index]
+            if is_sacrificial:
+                backend.sacrificial_load_s += selected_estimated_service_s
+                backend.inflight_sacrificial_requests += 1
+            else:
+                backend.normal_load_s += selected_estimated_service_s
+                backend.inflight_normal_requests += 1
+            return DispatchDecision(
+                backend_index=backend_index,
+                estimated_service_s=selected_estimated_service_s,
+                is_sacrificial=is_sacrificial,
+            )
 
-    def _apply_response_feedback(self, decision: DispatchDecision, headers: httpx.Headers) -> None:
-        backend = self.backends[decision.backend_index]
-        self._dec_inflight(backend, decision.is_sacrificial)
-        authoritative = parse_super_p95_load_headers(headers)
-        if authoritative is not None:
-            backend.normal_load_s = authoritative.normal_load_s
-            backend.sacrificial_load_s = authoritative.sacrificial_load_s
+    async def _apply_response_feedback(
+        self,
+        decision: DispatchDecision,
+        headers: httpx.Headers,
+        elapsed_s: float,
+    ) -> None:
+        async with self._lock:
+            backend = self.backends[decision.backend_index]
+            self._update_latency_ema(backend, elapsed_s)
+            self._dec_inflight(backend, decision.is_sacrificial)
+            authoritative = parse_super_p95_load_headers(headers)
+            if authoritative is not None:
+                backend.normal_load_s = authoritative.normal_load_s
+                backend.sacrificial_load_s = authoritative.sacrificial_load_s
+                return
+            self._fallback_remove_estimated_load(backend, decision)
+
+    async def _mark_failed_response(self, decision: DispatchDecision, elapsed_s: float) -> None:
+        async with self._lock:
+            backend = self.backends[decision.backend_index]
+            self._update_latency_ema(backend, elapsed_s)
+            self._dec_inflight(backend, decision.is_sacrificial)
+            self._fallback_remove_estimated_load(backend, decision)
+
+    @staticmethod
+    def _update_latency_ema(backend: BackendState, elapsed_s: float) -> None:
+        if elapsed_s <= 0.0:
             return
-        self._fallback_remove_estimated_load(backend, decision)
+        if backend.latency_ema_s <= 0.0:
+            backend.latency_ema_s = elapsed_s
+        else:
+            backend.latency_ema_s = 0.9 * backend.latency_ema_s + 0.1 * elapsed_s
 
     @staticmethod
     def _dec_inflight(backend: BackendState, is_sacrificial: bool) -> None:

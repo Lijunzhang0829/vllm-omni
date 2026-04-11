@@ -96,6 +96,18 @@ class SuperP95RequestScheduler(_BaseScheduler):
             sacrificial_load_s=sacrificial_load_s,
         )
 
+    def _get_effective_current_time_s(self) -> float:
+        queued = None
+        if self._running:
+            queued = self._queue_metadata.get(self._running[0])
+        if queued is None:
+            return self._current_time_s
+        completed_steps = max(queued.completed_steps - queued.dispatch_start_completed_steps, 0)
+        dispatch_start_remaining_steps = max(queued.total_steps - queued.dispatch_start_completed_steps, 0)
+        completed_in_quantum = min(completed_steps, dispatch_start_remaining_steps)
+        elapsed_s = queued.estimated_service_s * completed_in_quantum / max(queued.total_steps, 1)
+        return self._current_time_s + elapsed_s
+
     def add_request(self, request: OmniDiffusionRequest) -> str:
         sched_req_id = self._make_sched_req_id(request)
         state = DiffusionRequestState(sched_req_id=sched_req_id, req=request)
@@ -108,7 +120,7 @@ class SuperP95RequestScheduler(_BaseScheduler):
             estimated_service_s = estimate_service_time_s(request, hardware_profile=self._hardware_profile)
         queued = _QueuedRequest(
             arrival_seq=self._arrival_seq,
-            arrival_time_s=self._current_time_s,
+            arrival_time_s=self._get_effective_current_time_s(),
             sched_req_id=sched_req_id,
             estimated_service_s=estimated_service_s,
             total_steps=max(int(request.sampling_params.num_inference_steps or 1), 1),
