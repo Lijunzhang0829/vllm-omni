@@ -10,6 +10,8 @@ from typing import Any
 import aiohttp
 from tqdm import tqdm
 
+from vllm_omni.trace_logging import write_trace_event
+
 
 @dataclass
 class RequestFuncInput:
@@ -28,6 +30,8 @@ class RequestFuncInput:
     image_paths: list[str] | None = None
     video_poll_timeout_s: float | None = None
     request_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    trace_log_file: str | None = None
+    trace_label: str | None = None
 
 
 @dataclass
@@ -100,10 +104,18 @@ async def async_request_chat_completions(
     payload = {
         "model": input.model,
         "messages": messages,
+        "request_id": input.request_id,
     }
     if extra_body:
         payload["extra_body"] = extra_body
 
+    write_trace_event(
+        input.trace_log_file,
+        "client_arrive",
+        node=input.trace_label or "client",
+        request_id=input.request_id,
+        api_url=input.api_url,
+    )
     try:
         async with session.post(input.api_url, json=payload) as response:
             if response.status == 200:
@@ -131,6 +143,15 @@ async def async_request_chat_completions(
         output.success = False
 
     output.latency = time.perf_counter() - output.start_time
+    write_trace_event(
+        input.trace_log_file,
+        "client_finish",
+        node=input.trace_label or "client",
+        request_id=input.request_id,
+        success=output.success,
+        latency_s=output.latency,
+        error=output.error,
+    )
 
     if output.success and input.slo_ms is not None:
         output.slo_achieved = (output.latency * 1000.0) <= float(input.slo_ms)

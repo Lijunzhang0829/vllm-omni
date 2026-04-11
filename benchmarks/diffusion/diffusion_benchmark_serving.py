@@ -550,6 +550,8 @@ class TraceDataset(BaseDataset):
             image_paths=image_paths,
             video_poll_timeout_s=self.args.video_poll_timeout_s,
             request_id=str(row.get("request_id")) if row.get("request_id") is not None else str(uuid.uuid4()),
+            trace_log_file=getattr(self.args, "trace_log_file", None),
+            trace_label=getattr(self.args, "trace_label", None),
         )
 
     def get_requests(self) -> list[RequestFuncInput]:
@@ -617,6 +619,8 @@ class RandomDataset(BaseDataset):
             extra_body=extra_body,
             image_paths=self._random_image_path,
             video_poll_timeout_s=self.args.video_poll_timeout_s,
+            trace_log_file=getattr(self.args, "trace_log_file", None),
+            trace_label=getattr(self.args, "trace_label", None),
             **params,
         )
 
@@ -1125,6 +1129,18 @@ if __name__ == "__main__":
     )
     parser.add_argument("--fps", type=int, default=None, help="FPS (for video).")
     parser.add_argument("--output-file", type=str, default=None, help="Output JSON file for metrics.")
+    parser.add_argument(
+        "--trace-log-file",
+        type=str,
+        default=None,
+        help="Optional JSONL trace file for client_arrive/client_finish events.",
+    )
+    parser.add_argument(
+        "--trace-label",
+        type=str,
+        default="client",
+        help="Node label to write into --trace-log-file.",
+    )
     parser.add_argument(
         "--slo",
         action="store_true",

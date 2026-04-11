@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import json
+import os
 import time
 import uuid
 from collections.abc import AsyncGenerator, AsyncIterator, Callable
@@ -17,6 +18,7 @@ from pydantic import TypeAdapter
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.protocol.chat_completion import OmniChatCompletionResponse
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
+from vllm_omni.trace_logging import write_trace_event
 
 try:
     import soundfile
@@ -1566,6 +1568,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             kv_transfer_params=kv_transfer_params,
             metrics=response_metrics,
         )
+        write_trace_event(
+            _TRACE_LOG_FILE,
+            "backend_finish",
+            node=_TRACE_NODE,
+            request_id=request.request_id or request_id,
+            server_request_id=request_id,
+        )
 
         # Log complete response if output logging is enabled
         if self.enable_log_outputs and self.request_logger:
@@ -2350,3 +2359,5 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 code=status_code,
             )
         )
+_TRACE_LOG_FILE = os.environ.get("VLLM_OMNI_TRACE_LOG_FILE")
+_TRACE_NODE = os.environ.get("VLLM_OMNI_TRACE_NODE", "backend")

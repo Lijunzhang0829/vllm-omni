@@ -32,6 +32,7 @@ from vllm_omni.diffusion.super_p95 import (
     parse_super_p95_load_headers,
 )
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.trace_logging import write_trace_event
 
 logger = init_logger(__name__)
 
@@ -151,6 +152,10 @@ class ManagedBackendLauncher:
         # Keep managed launch aligned with v0.16 semantics without depending on
         # a serve CLI flag that does not exist in this branch.
         env["VLLM_OMNI_SUPER_P95_HARDWARE_PROFILE"] = spec.hardware_profile
+        trace_log_dir = self.backend_env.get("VLLM_OMNI_TRACE_LOG_DIR")
+        if trace_log_dir:
+            env["VLLM_OMNI_TRACE_LOG_FILE"] = str(Path(trace_log_dir) / f"backend_{spec.port}.jsonl")
+            env["VLLM_OMNI_TRACE_NODE"] = f"backend-{spec.port}"
         log_path = self.log_dir / f"backend_{spec.port}.log"
         log_file = open(log_path, "a", encoding="utf-8")
         cmd = [
@@ -234,6 +239,7 @@ class SuperP95Dispatcher:
         threshold_ratio: float,
         sacrificial_load_factor: float,
         request_timeout_s: float,
+        trace_log_file: str | None = None,
         backend_launcher: ManagedBackendLauncher | None = None,
     ) -> None:
         if not 1 <= len(backend_urls) <= 8:
@@ -252,6 +258,7 @@ class SuperP95Dispatcher:
         self.threshold_ratio = threshold_ratio
         self.sacrificial_load_factor = sacrificial_load_factor
         self.request_timeout_s = request_timeout_s
+        self.trace_log_file = trace_log_file
 
         self._lock = asyncio.Lock()
         self.arrival_counter = 0
@@ -276,6 +283,18 @@ class SuperP95Dispatcher:
     async def dispatch_json(self, path: str, body: dict[str, Any], incoming_headers: dict[str, str]) -> Response:
         decision = await self._choose_backend(path, body)
         backend = self.backends[decision.backend_index]
+        request_id = str(body.get("request_id", ""))
+        write_trace_event(
+            self.trace_log_file,
+            "dispatch",
+            node="dispatcher",
+            request_id=request_id or None,
+            path=path,
+            backend=backend.name,
+            backend_url=backend.base_url,
+            sacrificial=decision.is_sacrificial,
+            estimated_service_s=decision.estimated_service_s,
+        )
         headers = self._build_forward_headers(incoming_headers, decision)
         assert self._client is not None
 
@@ -300,6 +319,18 @@ class SuperP95Dispatcher:
         body = _form_to_estimation_dict(form)
         decision = await self._choose_backend(path, body)
         backend = self.backends[decision.backend_index]
+        request_id = str(body.get("request_id", ""))
+        write_trace_event(
+            self.trace_log_file,
+            "dispatch",
+            node="dispatcher",
+            request_id=request_id or None,
+            path=path,
+            backend=backend.name,
+            backend_url=backend.base_url,
+            sacrificial=decision.is_sacrificial,
+            estimated_service_s=decision.estimated_service_s,
+        )
         headers = self._build_forward_headers(incoming_headers, decision)
         headers.pop("content-type", None)
 
@@ -678,6 +709,12 @@ def parse_args() -> argparse.Namespace:
         default=0.0,
         help="Dispatcher-to-backend request timeout in seconds. Set to 0 to disable timeout entirely.",
     )
+    parser.add_argument(
+        "--trace-log-dir",
+        type=str,
+        default=None,
+        help="Optional directory for dispatcher/backend JSONL trace logs.",
+    )
     return parser.parse_args()
 
 
@@ -740,6 +777,9 @@ def build_dispatcher_from_args(args: argparse.Namespace) -> SuperP95Dispatcher:
         hardware_profiles = _parse_backend_hardware_profiles(backend_hardware_profiles_arg, args.num_servers)
         specs = _build_managed_specs(args.backend_host, args.backend_start_port, device_ids, hardware_profiles)
         backend_urls = [spec.base_url for spec in specs]
+        backend_env = _parse_backend_env(args.backend_env)
+        if args.trace_log_dir:
+            backend_env["VLLM_OMNI_TRACE_LOG_DIR"] = args.trace_log_dir
         backend_args: list[str] = []
         for raw in args.backend_args:
             backend_args.extend(shlex.split(raw))
@@ -747,7 +787,7 @@ def build_dispatcher_from_args(args: argparse.Namespace) -> SuperP95Dispatcher:
             specs=specs,
             model=args.model,
             backend_args=backend_args,
-            backend_env=_parse_backend_env(args.backend_env),
+            backend_env=backend_env,
             device_env_var=args.device_env_var,
             health_timeout_s=args.backend_health_timeout_s,
             health_poll_interval_s=args.backend_health_poll_interval_s,
@@ -762,6 +802,7 @@ def build_dispatcher_from_args(args: argparse.Namespace) -> SuperP95Dispatcher:
         threshold_ratio=args.threshold_ratio,
         sacrificial_load_factor=args.sacrificial_load_factor,
         request_timeout_s=args.request_timeout_s,
+        trace_log_file=(str(Path(args.trace_log_dir) / "dispatcher.jsonl") if args.trace_log_dir else None),
         backend_launcher=backend_launcher,
     )
 
