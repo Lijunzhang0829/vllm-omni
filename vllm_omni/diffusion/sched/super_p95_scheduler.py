@@ -182,6 +182,16 @@ class SuperP95RequestScheduler(_BaseScheduler):
         self._arrival_seq += 1
         self._queue_metadata[sched_req_id] = queued
         self._push_pending(queued)
+        write_trace_event(
+            os.environ.get("VLLM_OMNI_TRACE_LOG_FILE"),
+            "scheduler_enqueue",
+            node=os.environ.get("VLLM_OMNI_TRACE_NODE"),
+            request_id=sched_req_id,
+            sacrificial=request.super_p95_sacrificial,
+            estimated_service_s=estimated_service_s,
+            arrival_time_s=queued.arrival_time_s,
+            total_steps=queued.total_steps,
+        )
         logger.debug(
             "SuperP95 add_request: %s sacrificial=%s estimated_service_s=%.3f",
             sched_req_id,
@@ -433,16 +443,46 @@ class SuperP95RequestScheduler(_BaseScheduler):
 
     def _maybe_request_active_preemption_locked(self) -> bool:
         if self._active_preemption_requested:
+            write_trace_event(
+                os.environ.get("VLLM_OMNI_TRACE_LOG_FILE"),
+                "scheduler_preempt_check",
+                node=os.environ.get("VLLM_OMNI_TRACE_NODE"),
+                result="already_requested",
+                request_id=self._active_sched_req_id,
+            )
             return False
         active_sched_req_id = self._active_sched_req_id
         if active_sched_req_id is None:
+            write_trace_event(
+                os.environ.get("VLLM_OMNI_TRACE_LOG_FILE"),
+                "scheduler_preempt_check",
+                node=os.environ.get("VLLM_OMNI_TRACE_NODE"),
+                result="no_active",
+            )
             return False
         active_state = self.get_request_state(active_sched_req_id)
         if active_state is None or not self._supports_async_preemption(active_state.req):
+            write_trace_event(
+                os.environ.get("VLLM_OMNI_TRACE_LOG_FILE"),
+                "scheduler_preempt_check",
+                node=os.environ.get("VLLM_OMNI_TRACE_NODE"),
+                result="active_not_preemptible",
+                request_id=active_sched_req_id,
+                active_exists=active_state is not None,
+            )
             return False
         candidate = self.peek_next_request()
         incumbent = self.get_queued_request(active_sched_req_id)
         if candidate is None or incumbent is None:
+            write_trace_event(
+                os.environ.get("VLLM_OMNI_TRACE_LOG_FILE"),
+                "scheduler_preempt_check",
+                node=os.environ.get("VLLM_OMNI_TRACE_NODE"),
+                result="missing_candidate_or_incumbent",
+                request_id=active_sched_req_id,
+                candidate_exists=candidate is not None,
+                incumbent_exists=incumbent is not None,
+            )
             return False
         completed_steps = 0
         if self._active_completed_steps is not None:
@@ -454,6 +494,21 @@ class SuperP95RequestScheduler(_BaseScheduler):
             outranks = self.request_outranks(candidate, incumbent)
         finally:
             incumbent.sort_key = original_sort_key
+        write_trace_event(
+            os.environ.get("VLLM_OMNI_TRACE_LOG_FILE"),
+            "scheduler_preempt_check",
+            node=os.environ.get("VLLM_OMNI_TRACE_NODE"),
+            result="compare",
+            request_id=active_sched_req_id,
+            candidate_request_id=candidate.sched_req_id,
+            active_sacrificial=incumbent.is_sacrificial,
+            candidate_sacrificial=candidate.is_sacrificial,
+            active_remaining_s=active_remaining_s,
+            candidate_remaining_s=candidate.remaining_service_s,
+            active_sort_key=list(incumbent.sort_key),
+            candidate_sort_key=list(candidate.sort_key),
+            outranks=outranks,
+        )
         if not outranks:
             return False
         self._active_preemption_requested = True
