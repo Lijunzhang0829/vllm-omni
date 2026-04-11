@@ -273,6 +273,21 @@ class SuperP95RequestScheduler(_BaseScheduler):
                 self._waiting.appendleft(sched_req_id)
                 state.status = DiffusionRequestStatus.PREEMPTED
                 self._push_pending(queued)
+                next_queued = self.peek_next_request()
+                write_trace_event(
+                    os.environ.get("VLLM_OMNI_TRACE_LOG_FILE"),
+                    "scheduler_requeue",
+                    node=os.environ.get("VLLM_OMNI_TRACE_NODE"),
+                    request_id=sched_req_id,
+                    requeued_sort_key=list(queued.sort_key),
+                    requeued_remaining_service_s=queued.remaining_service_s,
+                    requeued_sacrificial=queued.is_sacrificial,
+                    current_time_s=self._current_time_s,
+                    heap_head_request_id=next_queued.sched_req_id if next_queued is not None else None,
+                    heap_head_sort_key=list(next_queued.sort_key) if next_queued is not None else None,
+                    heap_head_remaining_service_s=next_queued.remaining_service_s if next_queued is not None else None,
+                    heap_head_sacrificial=next_queued.is_sacrificial if next_queued is not None else None,
+                )
                 continue
             if queued is not None:
                 self._current_time_s += queued.remaining_service_s
@@ -369,8 +384,30 @@ class SuperP95RequestScheduler(_BaseScheduler):
             raise RuntimeError("Async-preempted diffusion request did not report any completed steps.")
         dispatch_start_remaining_steps = max(queued.total_steps - queued.dispatch_start_completed_steps, 0)
         completed_in_quantum = min(completed_steps, dispatch_start_remaining_steps)
+        old_current_time_s = self._current_time_s
+        old_completed_steps = queued.completed_steps
+        old_remaining_service_s = queued.remaining_service_s
+        old_sort_key = queued.sort_key
         self._current_time_s += queued.estimated_service_s * completed_in_quantum / max(queued.total_steps, 1)
         queued.completed_steps = min(queued.dispatch_start_completed_steps + completed_in_quantum, queued.total_steps)
+        queued.refresh_sort_key(queued.remaining_service_s)
+        write_trace_event(
+            os.environ.get("VLLM_OMNI_TRACE_LOG_FILE"),
+            "scheduler_partial_progress",
+            node=os.environ.get("VLLM_OMNI_TRACE_NODE"),
+            request_id=queued.sched_req_id,
+            completed_in_quantum=completed_in_quantum,
+            old_current_time_s=old_current_time_s,
+            new_current_time_s=self._current_time_s,
+            old_completed_steps=old_completed_steps,
+            new_completed_steps=queued.completed_steps,
+            old_remaining_service_s=old_remaining_service_s,
+            new_remaining_service_s=queued.remaining_service_s,
+            old_sort_key=list(old_sort_key),
+            new_sort_key=list(queued.sort_key),
+            arrival_time_s=queued.arrival_time_s,
+            sacrificial=queued.is_sacrificial,
+        )
 
     def _run_scheduler_loop(self) -> None:
         while True:
