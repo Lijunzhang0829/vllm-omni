@@ -320,6 +320,7 @@ class VBenchDataset(BaseDataset):
             seed=self.args.seed,
             fps=self.args.fps,
             image_paths=image_paths,
+            video_poll_timeout_s=args.video_poll_timeout_s,
         )
 
     def get_requests(self) -> list[RequestFuncInput]:
@@ -547,6 +548,7 @@ class TraceDataset(BaseDataset):
             timestamp=timestamp,
             slo_ms=slo_ms,
             image_paths=image_paths,
+            video_poll_timeout_s=self.args.video_poll_timeout_s,
             request_id=str(row.get("request_id")) if row.get("request_id") is not None else str(uuid.uuid4()),
         )
 
@@ -614,6 +616,7 @@ class RandomDataset(BaseDataset):
             seed=self.args.seed,
             extra_body=extra_body,
             image_paths=self._random_image_path,
+            video_poll_timeout_s=self.args.video_poll_timeout_s,
             **params,
         )
 
@@ -898,7 +901,13 @@ async def benchmark(args):
     # Run benchmark
     pbar = tqdm(total=len(requests_list), disable=args.disable_tqdm)
 
-    async with aiohttp.ClientSession() as session:
+    client_timeout = (
+        aiohttp.ClientTimeout(total=args.client_timeout_s)
+        if args.client_timeout_s is not None and args.client_timeout_s > 0
+        else aiohttp.ClientTimeout(total=None)
+    )
+
+    async with aiohttp.ClientSession(timeout=client_timeout) as session:
         warmup_pairs: list[tuple[RequestFuncInput, RequestFuncOutput]] = []
         if args.warmup_requests and requests_list:
             print(
@@ -1101,6 +1110,18 @@ if __name__ == "__main__":
         type=int,
         default=None,
         help="Seed for Poisson inter-arrival sampling. If unset, uses process-global randomness.",
+    )
+    parser.add_argument(
+        "--client-timeout-s",
+        type=float,
+        default=0.0,
+        help="HTTP client total timeout in seconds. Set to 0 to disable timeout entirely.",
+    )
+    parser.add_argument(
+        "--video-poll-timeout-s",
+        type=float,
+        default=0.0,
+        help="Timeout for polling async video jobs. Set to 0 to disable timeout entirely.",
     )
     parser.add_argument("--fps", type=int, default=None, help="FPS (for video).")
     parser.add_argument("--output-file", type=str, default=None, help="Output JSON file for metrics.")

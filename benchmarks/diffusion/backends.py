@@ -26,6 +26,7 @@ class RequestFuncInput:
     slo_ms: float | None = None
     extra_body: dict[str, Any] = field(default_factory=dict)
     image_paths: list[str] | None = None
+    video_poll_timeout_s: float | None = None
     request_id: str = field(default_factory=lambda: str(uuid.uuid4()))
 
 
@@ -267,8 +268,11 @@ async def async_request_v1_videos(
 
         # invoke a poll request (GET /v1/videos/{video_id})
         poll_interval = 2.0  # Unit(s)
-        timeout_seconds = 600.0
-        deadline = time.perf_counter() + timeout_seconds
+        deadline = (
+            time.perf_counter() + input.video_poll_timeout_s
+            if input.video_poll_timeout_s is not None and input.video_poll_timeout_s > 0
+            else None
+        )
         job_url = f"{input.api_url}/{job_id}"
 
         while job_status not in {"completed", "failed"}:
@@ -283,7 +287,7 @@ async def async_request_v1_videos(
                 poll_json = await poll_response.json()
                 job_status = poll_json.get("status")
 
-                if time.perf_counter() >= deadline:
+                if deadline is not None and time.perf_counter() >= deadline:
                     output.error = f"Timed out waiting for video job {job_id} to complete."
                     output.success = False
                     return output

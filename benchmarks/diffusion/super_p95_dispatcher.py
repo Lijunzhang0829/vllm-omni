@@ -259,7 +259,8 @@ class SuperP95Dispatcher:
     async def startup(self) -> None:
         if self._backend_launcher is not None:
             await asyncio.to_thread(self._backend_launcher.start_all)
-        self._client = httpx.AsyncClient(timeout=self.request_timeout_s, trust_env=False)
+        timeout = self.request_timeout_s if self.request_timeout_s > 0 else None
+        self._client = httpx.AsyncClient(timeout=timeout, trust_env=False)
 
     async def shutdown(self) -> None:
         if self._client is not None:
@@ -631,7 +632,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--quota-amount", type=int, default=1)
     parser.add_argument("--threshold-ratio", type=float, default=0.8)
     parser.add_argument("--sacrificial-load-factor", type=float, default=0.1)
-    parser.add_argument("--request-timeout-s", type=float, default=10000.0)
+    parser.add_argument(
+        "--request-timeout-s",
+        type=float,
+        default=0.0,
+        help="Dispatcher-to-backend request timeout in seconds. Set to 0 to disable timeout entirely.",
+    )
     return parser.parse_args()
 
 
