@@ -150,16 +150,22 @@ class SuperP95RequestScheduler(_BaseScheduler):
         )
 
     def _get_effective_current_time_s(self) -> float:
-        queued = None
-        if self._running:
-            queued = self._queue_metadata.get(self._running[0])
+        return self._current_time_s + self._get_active_elapsed_service_s()
+
+    def _get_active_elapsed_service_s(self) -> float:
+        if not self._running:
+            return 0.0
+        queued = self._queue_metadata.get(self._running[0])
         if queued is None:
-            return self._current_time_s
-        completed_steps = max(queued.completed_steps - queued.dispatch_start_completed_steps, 0)
+            return 0.0
+        completed_steps = 0
+        if self._active_completed_steps is not None:
+            completed_steps = max(int(self._active_completed_steps.value), 0)
+        if completed_steps <= 0:
+            return 0.0
         dispatch_start_remaining_steps = max(queued.total_steps - queued.dispatch_start_completed_steps, 0)
         completed_in_quantum = min(completed_steps, dispatch_start_remaining_steps)
-        elapsed_s = queued.estimated_service_s * completed_in_quantum / max(queued.total_steps, 1)
-        return self._current_time_s + elapsed_s
+        return queued.estimated_service_s * completed_in_quantum / max(queued.total_steps, 1)
 
     def add_request(self, request: OmniDiffusionRequest) -> str:
         sched_req_id = self._make_sched_req_id(request)
