@@ -3,6 +3,7 @@ import multiprocessing.connection
 import threading
 import time
 import weakref
+from dataclasses import dataclass
 from typing import Any
 
 import zmq
