@@ -7,6 +7,7 @@ import json
 import logging
 import math
 import os
+import time
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -42,8 +43,17 @@ if TYPE_CHECKING:
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
 )
+from vllm_omni.trace_logging import write_trace_event
 
 logger = logging.getLogger(__name__)
+
+
+def _trace_file() -> str | None:
+    return os.environ.get("VLLM_OMNI_TRACE_LOG_FILE")
+
+
+def _trace_node() -> str | None:
+    return os.environ.get("VLLM_OMNI_TRACE_NODE")
 
 
 def get_qwen_image_post_process_func(
@@ -749,6 +759,8 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
         attention_kwargs: dict[str, Any] | None,
         max_sequence_length: int,
     ) -> dict[str, Any]:
+        trace_start = time.perf_counter()
+        request_key = req.request_ids[0] if req.request_ids else None
         prompt = [p if isinstance(p, str) else (p.get("prompt") or "") for p in req.prompts]
         height = req.sampling_params.height or self.default_sample_size * self.vae_scale_factor
         width = req.sampling_params.width or self.default_sample_size * self.vae_scale_factor
@@ -779,7 +791,7 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
         req_scheduler = copy.deepcopy(self.scheduler)
         req_scheduler.set_begin_index(0)
 
-        return {
+        state = {
             "height": height,
             "width": width,
             "latents": ctx["latents"],
@@ -802,8 +814,20 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
             "attention_kwargs": attention_kwargs or {},
             "output_type": "pil",
         }
+        write_trace_event(
+            _trace_file(),
+            "qwen_init_generation_state",
+            node=_trace_node(),
+            request_id=request_key,
+            duration_ms=(time.perf_counter() - trace_start) * 1000.0,
+            num_inference_steps=num_inference_steps,
+            image_seq_len=state["image_seq_len"],
+        )
+        return state
 
     def _restore_scheduler_state(self, state: dict[str, Any]) -> None:
+        trace_start = time.perf_counter()
+        rebuilt_timesteps = False
         timesteps = state.get("timesteps")
         if timesteps is None:
             timesteps, _ = self.prepare_timesteps(
@@ -812,6 +836,7 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
                 state["image_seq_len"],
             )
             state["timesteps"] = timesteps
+            rebuilt_timesteps = True
         if "scheduler" not in state:
             # TODO(v0.18-super-p95): Remove this fallback once all resident
             # states are guaranteed to carry request-local scheduler objects.
@@ -819,8 +844,18 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
             req_scheduler.set_begin_index(0)
             state["scheduler"] = req_scheduler
         self._num_timesteps = len(state["timesteps"])
+        write_trace_event(
+            _trace_file(),
+            "qwen_restore_scheduler_state",
+            node=_trace_node(),
+            request_id=state.get("request_key"),
+            duration_ms=(time.perf_counter() - trace_start) * 1000.0,
+            rebuilt_timesteps=rebuilt_timesteps,
+            next_step_index=int(state.get("next_step_index", 0)),
+        )
 
     def _run_generation_steps(self, state: dict[str, Any]) -> tuple[dict[str, Any], bool, int]:
+        trace_start = time.perf_counter()
         self._restore_scheduler_state(state)
         timesteps = state["timesteps"]
         req_scheduler = state["scheduler"]
@@ -888,15 +923,35 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
         end_index = start_index + completed_steps
         state["latents"] = latents
         state["next_step_index"] = end_index
+        write_trace_event(
+            _trace_file(),
+            "qwen_run_generation_steps",
+            node=_trace_node(),
+            request_id=state.get("request_key"),
+            duration_ms=(time.perf_counter() - trace_start) * 1000.0,
+            start_index=start_index,
+            end_index=end_index,
+            completed_steps=completed_steps,
+            finished=end_index >= len(timesteps),
+        )
         return state, end_index >= len(timesteps), completed_steps
 
     def _decode_generation_state(self, state: dict[str, Any], output_type: str | None) -> torch.Tensor:
-        return self._decode_latents(
+        trace_start = time.perf_counter()
+        output = self._decode_latents(
             state["latents"],
             state["height"],
             state["width"],
             output_type or "pil",
         ).output
+        write_trace_event(
+            _trace_file(),
+            "qwen_decode_generation_state",
+            node=_trace_node(),
+            request_id=state.get("request_key"),
+            duration_ms=(time.perf_counter() - trace_start) * 1000.0,
+        )
+        return output
 
     def _build_denoise_kwargs(
         self,
