@@ -1176,6 +1176,7 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
         scheduling_args = req.sampling_params.extra_args
         preemption_enabled = bool(scheduling_args.get("_server_preemption_enabled", False))
         state = scheduling_args.get("_server_state")
+        request_key = req.request_ids[0] if req.request_ids else None
         self._interrupt = False
 
         if preemption_enabled:
@@ -1200,7 +1201,6 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
             state["output_type"] = output_type
             state, finished, completed_steps = self._run_generation_steps(state)
             self._current_timestep = None
-            request_key = req.request_ids[0] if req.request_ids else None
             if not finished:
                 state["completed_steps"] = completed_steps
                 return DiffusionOutput(
@@ -1216,6 +1216,7 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
                 request_key=request_key,
             )
 
+        trace_start = time.perf_counter()
         ctx = self._prepare_generation_context(
             prompt=prompt,
             negative_prompt=negative_prompt,
@@ -1236,7 +1237,17 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
             attention_kwargs=attention_kwargs,
             callback_on_step_end_tensor_inputs=callback_on_step_end_tensor_inputs,
         )
+        write_trace_event(
+            _trace_file(),
+            "qwen_init_generation_state",
+            node=_trace_node(),
+            request_id=request_key,
+            duration_ms=(time.perf_counter() - trace_start) * 1000.0,
+            num_inference_steps=num_inference_steps,
+            image_seq_len=ctx["latents"].shape[1],
+        )
 
+        run_trace_start = time.perf_counter()
         latents = self.diffuse(
             ctx["prompt_embeds"],
             ctx["prompt_embeds_mask"],
@@ -1257,9 +1268,29 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
                 "attention_kwargs": self.attention_kwargs,
             },
         )
+        write_trace_event(
+            _trace_file(),
+            "qwen_run_generation_steps",
+            node=_trace_node(),
+            request_id=request_key,
+            duration_ms=(time.perf_counter() - run_trace_start) * 1000.0,
+            start_index=0,
+            end_index=len(ctx["timesteps"]),
+            completed_steps=len(ctx["timesteps"]),
+            finished=True,
+        )
 
         self._current_timestep = None
-        return self._decode_latents(latents, height, width, output_type)
+        decode_trace_start = time.perf_counter()
+        output = self._decode_latents(latents, height, width, output_type)
+        write_trace_event(
+            _trace_file(),
+            "qwen_decode_generation_state",
+            node=_trace_node(),
+            request_id=request_key,
+            duration_ms=(time.perf_counter() - decode_trace_start) * 1000.0,
+        )
+        return output
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
