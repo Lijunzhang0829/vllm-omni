@@ -6,7 +6,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
+import re
 import shlex
+import shutil
 import subprocess
 import time
 from contextlib import suppress
@@ -82,6 +84,7 @@ class ManagedBackendProcess:
     spec: ManagedBackendSpec
     process: subprocess.Popen[str]
     log_file: Any
+    numa_node: int | None = None
 
 
 class ManagedBackendLauncher:
@@ -93,6 +96,7 @@ class ManagedBackendLauncher:
         backend_args: list[str],
         backend_env: dict[str, str],
         device_env_var: str,
+        numa_membind: bool,
         health_timeout_s: float,
         health_poll_interval_s: float,
         log_dir: str,
@@ -103,11 +107,14 @@ class ManagedBackendLauncher:
         self.backend_args = backend_args
         self.backend_env = backend_env
         self.device_env_var = device_env_var
+        self.numa_membind = numa_membind
         self.health_timeout_s = health_timeout_s
         self.health_poll_interval_s = health_poll_interval_s
         self.log_dir = Path(log_dir)
         self.backend_command = backend_command
         self._processes: list[ManagedBackendProcess] = []
+        self._warned_messages: set[str] = set()
+        self._device_bus_ids: dict[str, str] | None = None
 
     def start_all(self) -> None:
         self.log_dir.mkdir(parents=True, exist_ok=True)
@@ -167,12 +174,19 @@ class ManagedBackendLauncher:
             str(spec.port),
             *self.backend_args,
         ]
+        numa_node = self._resolve_numa_node(spec.device_id)
+        if numa_node is not None:
+            cmd = ["numactl", "--cpunodebind", str(numa_node), *cmd]
+            if self.numa_membind:
+                cmd[3:3] = ["--membind", str(numa_node)]
         logger.info(
-            "Launching backend port=%s device_id=%s base_url=%s hardware_profile=%s log=%s cmd=%s",
+            "Launching backend port=%s device_id=%s base_url=%s hardware_profile=%s numa_node=%s membind=%s log=%s cmd=%s",
             spec.port,
             spec.device_id,
             spec.base_url,
             spec.hardware_profile,
+            numa_node if numa_node is not None else "none",
+            self.numa_membind,
             log_path,
             shlex.join(cmd),
         )
@@ -183,7 +197,7 @@ class ManagedBackendLauncher:
             stderr=subprocess.STDOUT,
             text=True,
         )
-        return ManagedBackendProcess(spec=spec, process=process, log_file=log_file)
+        return ManagedBackendProcess(spec=spec, process=process, log_file=log_file, numa_node=numa_node)
 
     def _wait_until_healthy(self) -> None:
         deadline = time.time() + self.health_timeout_s
@@ -202,9 +216,10 @@ class ManagedBackendLauncher:
                 managed = pending.pop(port, None)
                 if managed is not None:
                     logger.info(
-                        "Managed backend healthy: port=%s device=%s url=%s log=%s",
+                        "Managed backend healthy: port=%s device=%s numa=%s url=%s log=%s",
                         managed.spec.port,
                         managed.spec.device_id,
+                        managed.numa_node if managed.numa_node is not None else "none",
                         managed.spec.base_url,
                         managed.log_file.name,
                     )
@@ -227,6 +242,86 @@ class ManagedBackendLauncher:
                 return response.status == 200
         except (urllib_error.URLError, TimeoutError, ValueError):
             return False
+
+    def _resolve_numa_node(self, device_id: str) -> int | None:
+        if shutil.which("numactl") is None:
+            self._warn_once("numactl is not installed; managed backends will start without NUMA binding.")
+            return None
+
+        bus_id = self._get_device_bus_id(device_id)
+        if bus_id is None:
+            self._warn_once(
+                f"Could not map device_id={device_id} to a PCI Bus-Id via `npu-smi info`; "
+                "managed backends will start without NUMA binding."
+            )
+            return None
+
+        numa_node = _read_pci_numa_node(bus_id)
+        if numa_node is None:
+            self._warn_once(
+                f"Could not resolve NUMA node for PCI device {bus_id}; managed backends will start without NUMA binding."
+            )
+            return None
+        return numa_node
+
+    def _get_device_bus_id(self, device_id: str) -> str | None:
+        if self._device_bus_ids is None:
+            self._device_bus_ids = _query_npu_device_bus_ids()
+        return self._device_bus_ids.get(str(device_id))
+
+    def _warn_once(self, message: str) -> None:
+        if message in self._warned_messages:
+            return
+        self._warned_messages.add(message)
+        logger.warning(message)
+
+
+def _query_npu_device_bus_ids() -> dict[str, str]:
+    try:
+        completed = subprocess.run(
+            ["npu-smi", "info"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        logger.warning("Failed to query `npu-smi info` for NUMA auto-binding: %s", exc)
+        return {}
+    return _parse_npu_smi_bus_ids(completed.stdout)
+
+
+def _parse_npu_smi_bus_ids(output: str) -> dict[str, str]:
+    mapping: dict[str, str] = {}
+    current_device_id: str | None = None
+    device_line_re = re.compile(r"^\|\s*(\d+)\s+([^\s|]+)\s+\|")
+    bus_line_re = re.compile(r"^\|\s*\d+\s*\|\s*([0-9A-Fa-f]{4}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}\.[0-9A-Fa-f])\s+\|")
+
+    for raw_line in output.splitlines():
+        line = raw_line.rstrip()
+        bus_match = bus_line_re.match(line)
+        if bus_match and current_device_id is not None:
+            mapping[current_device_id] = bus_match.group(1).lower()
+            current_device_id = None
+            continue
+
+        device_match = device_line_re.match(line)
+        if device_match and "Bus-Id" not in line and "Process id" not in line:
+            current_device_id = device_match.group(1)
+
+    return mapping
+
+
+def _read_pci_numa_node(bus_id: str) -> int | None:
+    path = Path("/sys/bus/pci/devices") / bus_id.lower() / "numa_node"
+    if not path.exists():
+        return None
+    try:
+        numa_node = int(path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+    if numa_node < 0:
+        return None
+    return numa_node
 
 
 class SuperP95Dispatcher:
@@ -684,6 +779,16 @@ def parse_args() -> argparse.Namespace:
         help="Environment variable used to pin a managed backend to a single device.",
     )
     parser.add_argument(
+        "--numa-membind",
+        action="store_true",
+        help="Bind managed backend host memory to the device NUMA node.",
+    )
+    parser.add_argument(
+        "--no-numa-membind",
+        action="store_true",
+        help="Disable NUMA memory binding for managed backends.",
+    )
+    parser.add_argument(
         "--backend-health-timeout-s",
         type=float,
         default=900.0,
@@ -741,6 +846,19 @@ def _parse_device_ids(device_ids: str | None, num_servers: int) -> list[str]:
     return parsed
 
 
+def _resolve_numa_membind(
+    backend_args: list[str],
+    explicit: bool | None,
+) -> bool:
+    if explicit is not None:
+        return explicit
+    for idx, token in enumerate(backend_args):
+        if token == "--usp" and idx + 1 < len(backend_args):
+            with suppress(ValueError):
+                return int(backend_args[idx + 1]) <= 1
+    return True
+
+
 def _build_managed_specs(
     host: str,
     start_port: int,
@@ -784,12 +902,18 @@ def build_dispatcher_from_args(args: argparse.Namespace) -> SuperP95Dispatcher:
         backend_args: list[str] = []
         for raw in args.backend_args:
             backend_args.extend(shlex.split(raw))
+        explicit_numa_membind = None
+        if getattr(args, "numa_membind", False):
+            explicit_numa_membind = True
+        elif getattr(args, "no_numa_membind", False):
+            explicit_numa_membind = False
         backend_launcher = ManagedBackendLauncher(
             specs=specs,
             model=args.model,
             backend_args=backend_args,
             backend_env=backend_env,
             device_env_var=args.device_env_var,
+            numa_membind=_resolve_numa_membind(backend_args, explicit_numa_membind),
             health_timeout_s=args.backend_health_timeout_s,
             health_poll_interval_s=args.backend_health_poll_interval_s,
             log_dir=args.backend_log_dir,
