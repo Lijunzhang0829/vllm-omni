@@ -2132,6 +2132,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 num_outputs_per_prompt=num_outputs_per_prompt,
                 seed=seed,
             )
+            if gen_params.extra_args is None:
+                gen_params.extra_args = {}
+            gen_params.extra_args["_trace_request_id"] = request.request_id or request_id
             apply_super_p95_request_headers(
                 gen_params,
                 raw_request.headers if raw_request is not None else None,

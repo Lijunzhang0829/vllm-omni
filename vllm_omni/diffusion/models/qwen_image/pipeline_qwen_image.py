@@ -761,6 +761,7 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
     ) -> dict[str, Any]:
         trace_start = time.perf_counter()
         request_key = req.request_ids[0] if req.request_ids else None
+        trace_request_id = getattr(req, "trace_request_id", None) or request_key
         prompt = [p if isinstance(p, str) else (p.get("prompt") or "") for p in req.prompts]
         height = req.sampling_params.height or self.default_sample_size * self.vae_scale_factor
         width = req.sampling_params.width or self.default_sample_size * self.vae_scale_factor
@@ -813,12 +814,15 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
             "negative_txt_seq_lens": ctx["negative_txt_seq_lens"],
             "attention_kwargs": attention_kwargs or {},
             "output_type": "pil",
+            "trace_request_id": trace_request_id,
+            "request_key": request_key,
         }
         write_trace_event(
             _trace_file(),
             "qwen_init_generation_state",
             node=_trace_node(),
-            request_id=request_key,
+            request_id=trace_request_id,
+            server_request_id=request_key,
             duration_ms=(time.perf_counter() - trace_start) * 1000.0,
             num_inference_steps=num_inference_steps,
             image_seq_len=state["image_seq_len"],
@@ -848,7 +852,8 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
             _trace_file(),
             "qwen_restore_scheduler_state",
             node=_trace_node(),
-            request_id=state.get("request_key"),
+            request_id=state.get("trace_request_id") or state.get("request_key"),
+            server_request_id=state.get("request_key"),
             duration_ms=(time.perf_counter() - trace_start) * 1000.0,
             rebuilt_timesteps=rebuilt_timesteps,
             next_step_index=int(state.get("next_step_index", 0)),
@@ -927,7 +932,8 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
             _trace_file(),
             "qwen_run_generation_steps",
             node=_trace_node(),
-            request_id=state.get("request_key"),
+            request_id=state.get("trace_request_id") or state.get("request_key"),
+            server_request_id=state.get("request_key"),
             duration_ms=(time.perf_counter() - trace_start) * 1000.0,
             start_index=start_index,
             end_index=end_index,
@@ -948,7 +954,8 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
             _trace_file(),
             "qwen_decode_generation_state",
             node=_trace_node(),
-            request_id=state.get("request_key"),
+            request_id=state.get("trace_request_id") or state.get("request_key"),
+            server_request_id=state.get("request_key"),
             duration_ms=(time.perf_counter() - trace_start) * 1000.0,
         )
         return output
@@ -1177,6 +1184,7 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
         preemption_enabled = bool(scheduling_args.get("_server_preemption_enabled", False))
         state = scheduling_args.get("_server_state")
         request_key = req.request_ids[0] if req.request_ids else None
+        trace_request_id = getattr(req, "trace_request_id", None) or request_key
         self._interrupt = False
 
         if preemption_enabled:
@@ -1241,7 +1249,8 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
             _trace_file(),
             "qwen_init_generation_state",
             node=_trace_node(),
-            request_id=request_key,
+            request_id=trace_request_id,
+            server_request_id=request_key,
             duration_ms=(time.perf_counter() - trace_start) * 1000.0,
             num_inference_steps=num_inference_steps,
             image_seq_len=ctx["latents"].shape[1],
@@ -1272,7 +1281,8 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
             _trace_file(),
             "qwen_run_generation_steps",
             node=_trace_node(),
-            request_id=request_key,
+            request_id=trace_request_id,
+            server_request_id=request_key,
             duration_ms=(time.perf_counter() - run_trace_start) * 1000.0,
             start_index=0,
             end_index=len(ctx["timesteps"]),
@@ -1287,7 +1297,8 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
             _trace_file(),
             "qwen_decode_generation_state",
             node=_trace_node(),
-            request_id=request_key,
+            request_id=trace_request_id,
+            server_request_id=request_key,
             duration_ms=(time.perf_counter() - decode_trace_start) * 1000.0,
         )
         return output

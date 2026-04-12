@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 import threading
 from collections import deque
 
@@ -13,6 +14,7 @@ from vllm_omni.diffusion.sched.interface import (
     DiffusionRequestStatus,
     SchedulerInterface,
 )
+from vllm_omni.trace_logging import write_trace_event
 
 
 class _BaseScheduler(SchedulerInterface):
@@ -101,12 +103,25 @@ class _BaseScheduler(SchedulerInterface):
             self._result_cv.notify_all()
 
     def wait_for_result(self, request_key: str) -> DiffusionOutput:
+        write_trace_event(
+            os.environ.get("VLLM_OMNI_TRACE_LOG_FILE"),
+            "scheduler_wait_for_result_enter",
+            node=os.environ.get("VLLM_OMNI_TRACE_NODE"),
+            request_id=request_key,
+        )
         with self._result_cv:
             while True:
                 if self._reader_error is not None:
                     raise RuntimeError("Worker control pipe failed") from self._reader_error
                 output = self._pending_results.pop(request_key, None)
                 if output is not None:
+                    write_trace_event(
+                        os.environ.get("VLLM_OMNI_TRACE_LOG_FILE"),
+                        "scheduler_wait_for_result_exit",
+                        node=os.environ.get("VLLM_OMNI_TRACE_NODE"),
+                        request_id=getattr(output, "request_key", None) or request_key,
+                        source="pending_results",
+                    )
                     return output
                 self._result_cv.wait()
 

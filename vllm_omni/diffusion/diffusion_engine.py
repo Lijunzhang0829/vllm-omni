@@ -21,10 +21,13 @@ from vllm_omni.diffusion.registry import (
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched import RequestScheduler, SchedulerInterface, SuperP95RequestScheduler
 from vllm_omni.diffusion.super_p95 import snapshot_to_metrics
+from vllm_omni.trace_logging import write_trace_event
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
+_TRACE_LOG_FILE = os.environ.get("VLLM_OMNI_TRACE_LOG_FILE")
+_TRACE_NODE = os.environ.get("VLLM_OMNI_TRACE_NODE")
 
 
 def _server_scheduling_enabled() -> bool:
@@ -104,6 +107,14 @@ class DiffusionEngine:
 
     def step(self, request: OmniDiffusionRequest) -> list[OmniRequestOutput]:
         diffusion_engine_start_time = time.perf_counter()
+        trace_request_id = request.trace_request_id or (request.request_ids[0] if request.request_ids else None)
+        write_trace_event(
+            _TRACE_LOG_FILE,
+            "engine_step_enter",
+            node=_TRACE_NODE,
+            request_id=trace_request_id,
+            server_request_id=request.request_ids[0] if request.request_ids else None,
+        )
 
         # Apply pre-processing if available
         preprocess_time = 0.0
@@ -155,6 +166,14 @@ class DiffusionEngine:
         logger.info(f"Post-processing completed in {postprocess_time:.4f} seconds")
 
         step_total_ms = (time.perf_counter() - diffusion_engine_start_time) * 1000
+        write_trace_event(
+            _TRACE_LOG_FILE,
+            "engine_step_exit",
+            node=_TRACE_NODE,
+            request_id=trace_request_id,
+            server_request_id=request.request_ids[0] if request.request_ids else None,
+            duration_ms=step_total_ms,
+        )
         logger.info(
             "DiffusionEngine.step breakdown: preprocess=%.2f ms, "
             "add_req_and_wait=%.2f ms, postprocess=%.2f ms, total=%.2f ms",

@@ -29,12 +29,17 @@ class OmniDiffusionRequest:
     request_ids: list[str] = field(default_factory=list)
     super_p95_sacrificial: bool = False
     super_p95_estimated_service_s: float | None = None
+    trace_request_id: str | None = None
 
     def __post_init__(self):
         """Initialize dependent fields after dataclass initialization."""
+        extra_args = getattr(self.sampling_params, "extra_args", None) or {}
         self.super_p95_sacrificial, self.super_p95_estimated_service_s = get_super_p95_request_metadata(
-            getattr(self.sampling_params, "extra_args", None)
+            extra_args
         )
+        self.trace_request_id = extra_args.get("_trace_request_id")
+        if self.trace_request_id is None and self.request_ids:
+            self.trace_request_id = self.request_ids[0]
 
         # When neither a generator nor a seed is provided, assign a random seed
         # so that all ranks derive the same generator state.

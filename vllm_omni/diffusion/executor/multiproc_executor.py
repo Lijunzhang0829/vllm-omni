@@ -15,6 +15,7 @@ from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
 from vllm_omni.diffusion.ipc import unpack_diffusion_output_shm
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import SchedulerInterface
+from vllm_omni.trace_logging import write_trace_event
 from vllm_omni.diffusion.worker import WorkerProc
 
 logger = init_logger(__name__)
@@ -238,6 +239,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
     def add_req(self, request: OmniDiffusionRequest) -> DiffusionOutput:
         self._ensure_open()
         request_key = request.request_ids[0] if request.request_ids else None
+        trace_request_id = request.trace_request_id or request_key
         rpc_request = {
             "type": "rpc",
             "method": "generate",
@@ -259,8 +261,30 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         # diffusion outputs off the shared-memory ring buffer critical path.
 
         try:
+            write_trace_event(
+                os.environ.get("VLLM_OMNI_TRACE_LOG_FILE"),
+                "executor_add_req_enter",
+                node=os.environ.get("VLLM_OMNI_TRACE_NODE"),
+                request_id=trace_request_id,
+                server_request_id=request_key,
+            )
             self._broadcast_mq.enqueue(rpc_request)
-            return self._result_scheduler.wait_for_result(request_key)
+            write_trace_event(
+                os.environ.get("VLLM_OMNI_TRACE_LOG_FILE"),
+                "executor_add_req_enqueued",
+                node=os.environ.get("VLLM_OMNI_TRACE_NODE"),
+                request_id=trace_request_id,
+                server_request_id=request_key,
+            )
+            output = self._result_scheduler.wait_for_result(request_key)
+            write_trace_event(
+                os.environ.get("VLLM_OMNI_TRACE_LOG_FILE"),
+                "executor_add_req_exit",
+                node=os.environ.get("VLLM_OMNI_TRACE_NODE"),
+                request_id=trace_request_id,
+                server_request_id=request_key,
+            )
+            return output
         except Exception as e:
             logger.error(f"Generate call failed: {e}")
             raise

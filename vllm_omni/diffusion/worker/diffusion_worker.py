@@ -220,6 +220,7 @@ class DiffusionWorker:
         assert self.model_runner is not None, "Model runner not initialized"
         preemption_enabled = bool(req.sampling_params.extra_args.get("_server_preemption_enabled", False))
         request_key = self._get_request_key(req) if getattr(req, "request_ids", None) else None
+        trace_request_id = getattr(req, "trace_request_id", None) or request_key
         if preemption_enabled and request_key in self._resident_scheduler_states:
             resident_state = self._resident_scheduler_states[request_key]
             req.sampling_params.extra_args["_server_state"] = self._resident_scheduler_states[request_key]
@@ -227,7 +228,8 @@ class DiffusionWorker:
                 os.environ.get("VLLM_OMNI_TRACE_LOG_FILE"),
                 "worker_resume",
                 node=os.environ.get("VLLM_OMNI_TRACE_NODE"),
-                request_id=request_key,
+                request_id=trace_request_id,
+                server_request_id=request_key,
                 completed_steps=int(resident_state.get("completed_steps", 0)),
             )
         else:
@@ -259,11 +261,13 @@ class DiffusionWorker:
                         os.environ.get("VLLM_OMNI_TRACE_LOG_FILE"),
                         "worker_partial_yield",
                         node=os.environ.get("VLLM_OMNI_TRACE_NODE"),
-                        request_id=request_key,
+                        request_id=trace_request_id,
+                        server_request_id=request_key,
                         completed_steps=int(state.get("completed_steps", 0)),
                     )
                     output.scheduler_state = {
                         "request_key": request_key,
+                        "trace_request_id": trace_request_id,
                         "completed_steps": int(state.get("completed_steps", 0)),
                     }
             return output
