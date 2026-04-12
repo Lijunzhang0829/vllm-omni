@@ -133,17 +133,28 @@ class SuperP95RequestScheduler(_BaseScheduler):
             raise RuntimeError(f"Missing output for scheduled request {sched_req_id}")
         return output
 
+    def has_requests(self) -> bool:
+        return bool(
+            self._active_sched_req_id is not None
+            or self._normal_pending
+            or self._sacrificial_pending
+        )
+
     def get_load_snapshot(self) -> SuperP95LoadSnapshot:
         normal_load_s = 0.0
         sacrificial_load_s = 0.0
-        for sched_req_id in [*self._waiting, *self._running]:
-            queued = self._queue_metadata.get(sched_req_id)
-            if queued is None:
-                continue
+        for queued in [*self._normal_pending, *self._sacrificial_pending]:
             if queued.is_sacrificial:
                 sacrificial_load_s += queued.remaining_service_s
             else:
                 normal_load_s += queued.remaining_service_s
+        if self._active_sched_req_id is not None:
+            queued = self._queue_metadata.get(self._active_sched_req_id)
+            if queued is not None:
+                if queued.is_sacrificial:
+                    sacrificial_load_s += queued.remaining_service_s
+                else:
+                    normal_load_s += queued.remaining_service_s
         return SuperP95LoadSnapshot(
             normal_load_s=normal_load_s,
             sacrificial_load_s=sacrificial_load_s,
@@ -172,7 +183,6 @@ class SuperP95RequestScheduler(_BaseScheduler):
         state = DiffusionRequestState(sched_req_id=sched_req_id, req=request)
         self._request_states[sched_req_id] = state
         self._register_request_ids(request.request_ids, sched_req_id)
-        self._waiting.append(sched_req_id)
 
         estimated_service_s = request.super_p95_estimated_service_s
         if estimated_service_s is None:
@@ -232,10 +242,6 @@ class SuperP95RequestScheduler(_BaseScheduler):
             state = self._request_states.get(sched_req_id)
             if state is None:
                 continue
-            try:
-                self._waiting.remove(sched_req_id)
-            except ValueError:
-                continue
             was_new_request = state.status == DiffusionRequestStatus.WAITING
             state.status = DiffusionRequestStatus.RUNNING
             self._running.append(sched_req_id)
@@ -250,7 +256,7 @@ class SuperP95RequestScheduler(_BaseScheduler):
             scheduled_cached_reqs=CachedRequestData(sched_req_ids=scheduled_cached_req_ids),
             finished_req_ids=set(self._finished_req_ids),
             num_running_reqs=len(self._running),
-            num_waiting_reqs=len(self._waiting),
+            num_waiting_reqs=len(self._normal_pending) + len(self._sacrificial_pending),
         )
 
         self._step_id += 1
@@ -276,7 +282,6 @@ class SuperP95RequestScheduler(_BaseScheduler):
                 self._apply_partial_progress(queued, output)
                 if sched_req_id in self._running:
                     self._running.remove(sched_req_id)
-                self._waiting.appendleft(sched_req_id)
                 state.status = DiffusionRequestStatus.PREEMPTED
                 self._push_pending(queued)
                 next_queued = self.peek_next_request()
@@ -319,7 +324,6 @@ class SuperP95RequestScheduler(_BaseScheduler):
             return False
         if sched_req_id in self._running:
             self._running.remove(sched_req_id)
-            self._waiting.appendleft(sched_req_id)
             state = self._request_states[sched_req_id]
             state.status = DiffusionRequestStatus.PREEMPTED
             queued = self._queue_metadata.get(sched_req_id)
