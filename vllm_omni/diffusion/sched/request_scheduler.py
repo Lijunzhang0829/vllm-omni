@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import DiffusionOutput
@@ -15,6 +17,8 @@ from vllm_omni.diffusion.sched.interface import (
     DiffusionSchedulerOutput,
     NewRequestData,
 )
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.worker.utils import RunnerOutput
 
 logger = init_logger(__name__)
 
@@ -94,6 +98,44 @@ class RequestScheduler(_BaseScheduler):
             else:
                 terminal_statuses[sched_req_id] = DiffusionRequestStatus.FINISHED_COMPLETED
                 terminal_errors[sched_req_id] = None
+
+        finished_req_ids |= self._finish_requests(terminal_statuses, terminal_errors)
+        return finished_req_ids
+
+    def update_from_runner_output(
+        self,
+        sched_output: DiffusionSchedulerOutput,
+        runner_output: "RunnerOutput",
+    ) -> set[str]:
+        scheduled_req_ids = sched_output.scheduled_req_ids
+        if not scheduled_req_ids:
+            return set()
+
+        finished_req_ids = {
+            sched_req_id for sched_req_id in scheduled_req_ids if sched_req_id in self._finished_req_ids
+        }
+        terminal_statuses: dict[str, DiffusionRequestStatus] = {}
+        terminal_errors: dict[str, str | None] = {}
+
+        if runner_output.req_id not in scheduled_req_ids:
+            raise ValueError(
+                f"RunnerOutput req_id {runner_output.req_id!r} does not match scheduled requests {scheduled_req_ids!r}"
+            )
+
+        state = self._request_states.get(runner_output.req_id)
+        if state is None or state.is_finished():
+            return finished_req_ids
+
+        if not runner_output.finished:
+            return finished_req_ids
+
+        result = runner_output.result
+        if result is not None and result.error:
+            terminal_statuses[runner_output.req_id] = DiffusionRequestStatus.FINISHED_ERROR
+            terminal_errors[runner_output.req_id] = result.error
+        else:
+            terminal_statuses[runner_output.req_id] = DiffusionRequestStatus.FINISHED_COMPLETED
+            terminal_errors[runner_output.req_id] = None
 
         finished_req_ids |= self._finish_requests(terminal_statuses, terminal_errors)
         return finished_req_ids

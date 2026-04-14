@@ -8,14 +8,22 @@ import pytest
 
 from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
+from vllm_omni.diffusion.diffusion_engine import _make_default_scheduler
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched import (
     DiffusionRequestStatus,
     RequestScheduler,
     Scheduler,
     SchedulerInterface,
+    SuperP95StepScheduler,
 )
 from vllm_omni.diffusion.sched.interface import CachedRequestData, NewRequestData
+from vllm_omni.diffusion.super_p95 import (
+    EXTRA_ARG_SUPER_P95_ESTIMATED_SERVICE_S,
+    EXTRA_ARG_SUPER_P95_SACRIFICIAL,
+    estimate_service_time_s,
+)
+from vllm_omni.diffusion.worker.utils import RunnerOutput
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
@@ -27,6 +35,23 @@ def _make_request(req_id: str) -> OmniDiffusionRequest:
         sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1),
         request_ids=[req_id],
     )
+
+
+def _make_super_request(
+    req_id: str,
+    *,
+    estimated_service_s: float,
+    sacrificial: bool = False,
+    num_inference_steps: int = 10,
+) -> OmniDiffusionRequest:
+    req = OmniDiffusionRequest(
+        prompts=[f"prompt_{req_id}"],
+        sampling_params=OmniDiffusionSamplingParams(num_inference_steps=num_inference_steps),
+        request_ids=[req_id],
+    )
+    req.sampling_params.extra_args[EXTRA_ARG_SUPER_P95_SACRIFICIAL] = sacrificial
+    req.sampling_params.extra_args[EXTRA_ARG_SUPER_P95_ESTIMATED_SERVICE_S] = estimated_service_s
+    return req
 
 
 def _make_request_output(req_id: str, *, error: str | None = None) -> DiffusionOutput:
@@ -78,6 +103,12 @@ class _StubScheduler(SchedulerInterface):
     def update_from_output(self, sched_output, output: DiffusionOutput) -> set[str]:
         del sched_output
         assert output is self._output
+        return {self._sched_req_id}
+
+    def update_from_runner_output(self, sched_output, runner_output: RunnerOutput) -> set[str]:
+        del sched_output
+        assert runner_output.req_id == self._sched_req_id
+        assert runner_output.result is self._output
         return {self._sched_req_id}
 
     def has_requests(self) -> bool:
@@ -141,6 +172,26 @@ class TestRequestScheduler:
         state = self.scheduler.get_request_state(req_id)
         assert state.status == DiffusionRequestStatus.FINISHED_ERROR
         assert state.error == "worker failed"
+
+    def test_stepwise_runner_output_keeps_request_running_until_finished(self) -> None:
+        req_id = self.scheduler.add_request(_make_request("step"))
+
+        first = self.scheduler.schedule()
+        unfinished = RunnerOutput(req_id=req_id, step_index=1, finished=False, result=None)
+        finished = self.scheduler.update_from_runner_output(first, unfinished)
+
+        assert finished == set()
+        assert self.scheduler.get_request_state(req_id).status == DiffusionRequestStatus.RUNNING
+        assert self.scheduler.has_requests() is True
+
+        second = self.scheduler.schedule()
+        assert _new_ids(second) == []
+        assert _cached_ids(second) == [req_id]
+
+        done = RunnerOutput(req_id=req_id, step_index=2, finished=True, result=DiffusionOutput(output=None))
+        finished = self.scheduler.update_from_runner_output(second, done)
+        assert finished == {req_id}
+        assert self.scheduler.get_request_state(req_id).status == DiffusionRequestStatus.FINISHED_COMPLETED
 
     def test_empty_output_without_error_marks_completed(self) -> None:
         req_id = self.scheduler.add_request(_make_request("empty"))
@@ -227,6 +278,44 @@ class TestRequestScheduler:
         assert self.scheduler.get_sched_req_id("map-a") is None
         assert self.scheduler.get_sched_req_id("map-b") is None
 
+    def test_estimate_service_time_uses_wan_profile_for_video_requests(self) -> None:
+        request = OmniDiffusionRequest(
+            prompts=["prompt_video"],
+            sampling_params=OmniDiffusionSamplingParams(
+                width=854,
+                height=480,
+                num_inference_steps=3,
+                num_frames=80,
+            ),
+            request_ids=["video"],
+        )
+
+        assert estimate_service_time_s(request) == pytest.approx(38.07)
+
+
+class TestSuperP95StepScheduler:
+    def setup_method(self) -> None:
+        self.scheduler = SuperP95StepScheduler()
+        self.scheduler.initialize(Mock())
+
+    def test_prefers_longer_normal_request_over_shorter_normal(self) -> None:
+        short_id = self.scheduler.add_request(_make_super_request("short", estimated_service_s=5.0))
+        long_id = self.scheduler.add_request(_make_super_request("long", estimated_service_s=20.0))
+
+        sched_output = self.scheduler.schedule()
+        assert _new_ids(sched_output) == [long_id]
+        assert short_id != long_id
+
+    def test_prefers_normal_request_over_sacrificial(self) -> None:
+        sacrificial_id = self.scheduler.add_request(
+            _make_super_request("s", estimated_service_s=20.0, sacrificial=True)
+        )
+        normal_id = self.scheduler.add_request(_make_super_request("n", estimated_service_s=5.0, sacrificial=False))
+
+        sched_output = self.scheduler.schedule()
+        assert _new_ids(sched_output) == [normal_id]
+        assert sacrificial_id != normal_id
+
 
 class TestDiffusionEngine:
     def test_add_req_and_wait_for_response_single_path(self) -> None:
@@ -261,6 +350,26 @@ class TestDiffusionEngine:
         assert output is expected
         engine.executor.add_req.assert_called_once_with(request)
 
+    def test_add_req_and_wait_for_response_step_execution_path(self) -> None:
+        engine = DiffusionEngine.__new__(DiffusionEngine)
+        engine.od_config = Mock(step_execution=True)
+        engine.scheduler = RequestScheduler()
+        engine.scheduler.initialize(Mock())
+        engine.executor = Mock()
+        engine._rpc_lock = threading.Lock()
+
+        request = _make_request("step-engine")
+        expected = DiffusionOutput(output=None)
+        engine.executor.execute_stepwise.side_effect = [
+            RunnerOutput(req_id="step-engine", step_index=1, finished=False, result=None),
+            RunnerOutput(req_id="step-engine", step_index=2, finished=True, result=expected),
+        ]
+
+        output = engine.add_req_and_wait_for_response(request)
+
+        assert output is expected
+        assert engine.executor.execute_stepwise.call_count == 2
+
     def test_initializes_injected_scheduler(self) -> None:
         request = _make_request("init")
         scheduler = _StubScheduler(request, DiffusionOutput(output=None))
@@ -288,6 +397,15 @@ class TestDiffusionEngine:
 
         assert req_id in finished
         assert scheduler.get_request_state(req_id).status == DiffusionRequestStatus.FINISHED_COMPLETED
+
+    def test_make_default_scheduler_uses_super_p95_step_env(self, monkeypatch) -> None:
+        od_config = Mock(step_execution=False)
+        monkeypatch.setenv("VLLM_OMNI_DIFFUSION_SCHEDULER", "super_p95_step")
+
+        scheduler = _make_default_scheduler(od_config)
+
+        assert isinstance(scheduler, SuperP95StepScheduler)
+        assert od_config.step_execution is True
 
     def test_dummy_run_raises_on_output_error(self) -> None:
         engine = DiffusionEngine.__new__(DiffusionEngine)

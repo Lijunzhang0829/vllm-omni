@@ -8,11 +8,15 @@ import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from functools import cached_property
+from typing import TYPE_CHECKING
 
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.worker.utils import RunnerOutput
 
 logger = init_logger(__name__)
 
@@ -143,6 +147,14 @@ class SchedulerInterface(ABC):
     @abstractmethod
     def update_from_output(self, sched_output: DiffusionSchedulerOutput, output: DiffusionOutput) -> set[str]:
         """Update scheduler state from executor output."""
+
+    @abstractmethod
+    def update_from_runner_output(
+        self,
+        sched_output: DiffusionSchedulerOutput,
+        runner_output: "RunnerOutput",
+    ) -> set[str]:
+        """Update scheduler state from a single step-execution runner output."""
 
     @abstractmethod
     def get_request_state(self, sched_req_id: str) -> DiffusionRequestState | None:

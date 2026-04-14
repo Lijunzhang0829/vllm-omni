@@ -9,6 +9,13 @@ from vllm_omni.diffusion.layers.custom_op import CustomOp
 logger = init_logger(__name__)
 
 _HAS_MINDIESD = find_spec("mindiesd") is not None
+_NPU_LAYER_NORM_DEBUG_COUNT = 0
+_NPU_LAYER_NORM_DEBUG_LIMIT = 16
+
+
+def reset_npu_layer_norm_debug_counter() -> None:
+    global _NPU_LAYER_NORM_DEBUG_COUNT
+    _NPU_LAYER_NORM_DEBUG_COUNT = 0
 
 
 class AdaLayerNorm(CustomOp):
@@ -85,6 +92,7 @@ class AdaLayerNorm(CustomOp):
         mod_params: torch.Tensor,
         index: torch.Tensor = None,
     ) -> torch.Tensor:
+        global _NPU_LAYER_NORM_DEBUG_COUNT
         shift_result, scale_result, gate_result = self.preprocess(mod_params, index)
 
         if _HAS_MINDIESD:
@@ -98,6 +106,21 @@ class AdaLayerNorm(CustomOp):
                 logger.warning_once(f"mindiesd import failed, falling back to torch_npu: {e}")
 
         import torch_npu
+
+        if _NPU_LAYER_NORM_DEBUG_COUNT < _NPU_LAYER_NORM_DEBUG_LIMIT:
+            logger.info(
+                "adalayernorm npu debug[%d]: x_shape=%s x_dtype=%s mod_shape=%s mod_dtype=%s shift_shape=%s scale_shape=%s hidden_size=%s eps=%s",
+                _NPU_LAYER_NORM_DEBUG_COUNT,
+                tuple(x.shape),
+                x.dtype,
+                tuple(mod_params.shape),
+                mod_params.dtype,
+                tuple(shift_result.shape),
+                tuple(scale_result.shape),
+                self.hidden_size,
+                self.eps,
+            )
+            _NPU_LAYER_NORM_DEBUG_COUNT += 1
 
         output = (
             torch_npu.npu_layer_norm_eval(x, normalized_shape=[self.hidden_size], eps=self.eps) * (1 + scale_result)

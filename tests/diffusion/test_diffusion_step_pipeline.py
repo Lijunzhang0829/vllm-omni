@@ -469,6 +469,16 @@ class TestSupportedPipelines:
         assert supports_step_execution(pipeline) is True
         assert isinstance(pipeline, SupportsStepExecution) is True
 
+    def test_wan22_t2v_supports_step_execution(self):
+        from vllm_omni.diffusion.models.interface import SupportsStepExecution, supports_step_execution
+        from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import Wan22Pipeline
+
+        pipeline = object.__new__(Wan22Pipeline)
+
+        assert pipeline.supports_step_execution is True
+        assert supports_step_execution(pipeline) is True
+        assert isinstance(pipeline, SupportsStepExecution) is True
+
 
 @hardware_test(
     res={"cuda": "L4"},

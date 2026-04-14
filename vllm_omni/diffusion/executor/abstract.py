@@ -1,10 +1,14 @@
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from vllm.utils.import_utils import resolve_obj_by_qualname
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
+    from vllm_omni.diffusion.worker.utils import RunnerOutput
 
 
 class DiffusionExecutor(ABC):
@@ -61,6 +65,11 @@ class DiffusionExecutor(ABC):
     @abstractmethod
     def add_req(self, requests: OmniDiffusionRequest) -> DiffusionOutput:
         """Add requests to the execution queue."""
+        pass
+
+    @abstractmethod
+    def execute_stepwise(self, scheduler_output: "DiffusionSchedulerOutput") -> "RunnerOutput":
+        """Execute one scheduled diffusion step on workers."""
         pass
 
     @abstractmethod

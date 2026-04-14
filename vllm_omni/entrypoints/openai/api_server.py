@@ -111,6 +111,7 @@ from vllm_omni.entrypoints.openai.storage import STORAGE_MANAGER
 from vllm_omni.entrypoints.openai.stores import VIDEO_STORE, VIDEO_TASKS
 from vllm_omni.entrypoints.openai.utils import get_stage_type, parse_lora_request
 from vllm_omni.entrypoints.openai.video_api_utils import decode_input_reference
+from vllm_omni.diffusion.super_p95 import apply_super_p95_request_headers
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams, OmniTextPrompt
 
 logger = init_logger(__name__)
@@ -1314,6 +1315,7 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
             gen_params, "seed", request.seed if request.seed is not None else random.randint(0, 2**32 - 1)
         )
         _update_if_not_none(gen_params, "generator_device", request.generator_device)
+        apply_super_p95_request_headers(gen_params.extra_args, raw_request.headers)
 
         request_id = f"img_gen-{random_uuid()}"
 

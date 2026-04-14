@@ -26,6 +26,7 @@ from vllm_omni.diffusion.cache.selector import get_cache_backend
 from vllm_omni.diffusion.compile import regionally_compile
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.forward_context import set_forward_context
+from vllm_omni.diffusion.layers.adalayernorm import reset_npu_layer_norm_debug_counter
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import supports_step_execution
 from vllm_omni.diffusion.offloader import get_offload_backend
@@ -270,6 +271,9 @@ class DiffusionModelRunner:
             if is_primary:
                 current_omni_platform.reset_peak_memory_stats()
 
+            if req.request_ids != ["dummy_req_id"]:
+                reset_npu_layer_norm_debug_counter()
+
             with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config):
                 with record_function("pipeline_forward"):
                     output = self.pipeline.forward(req)
@@ -370,9 +374,34 @@ class DiffusionModelRunner:
             with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config):
                 # step0/new request: encode
                 if is_new_request:
-                    self.pipeline.prepare_encode(state)
+                    reset_npu_layer_norm_debug_counter()
+                    try:
+                        logger.info("stepwise stage begin: prepare_encode req_id=%s", state.req_id)
+                        self.pipeline.prepare_encode(state)
+                        logger.info("stepwise stage end: prepare_encode req_id=%s", state.req_id)
+                    except Exception:
+                        logger.exception("stepwise stage failed: prepare_encode req_id=%s", state.req_id)
+                        raise
 
-                noise_pred = self.pipeline.denoise_step(state)
+                try:
+                    logger.info(
+                        "stepwise stage begin: denoise_step req_id=%s step_index=%s",
+                        state.req_id,
+                        state.step_index,
+                    )
+                    noise_pred = self.pipeline.denoise_step(state)
+                    logger.info(
+                        "stepwise stage end: denoise_step req_id=%s step_index=%s",
+                        state.req_id,
+                        state.step_index,
+                    )
+                except Exception:
+                    logger.exception(
+                        "stepwise stage failed: denoise_step req_id=%s step_index=%s",
+                        state.req_id,
+                        state.step_index,
+                    )
+                    raise
                 finished = False
 
                 # In CFG parallel mode, only rank 0 gets the actual noise_pred; non-rank-0 workers receive None.
@@ -381,10 +410,46 @@ class DiffusionModelRunner:
                     finished = True
                     result = DiffusionOutput(error="stepwise denoise interrupted")
                 else:
-                    self.pipeline.step_scheduler(state, noise_pred)
+                    try:
+                        logger.info(
+                            "stepwise stage begin: step_scheduler req_id=%s step_index=%s",
+                            state.req_id,
+                            state.step_index,
+                        )
+                        self.pipeline.step_scheduler(state, noise_pred)
+                        logger.info(
+                            "stepwise stage end: step_scheduler req_id=%s step_index=%s",
+                            state.req_id,
+                            state.step_index,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "stepwise stage failed: step_scheduler req_id=%s step_index=%s",
+                            state.req_id,
+                            state.step_index,
+                        )
+                        raise
                     finished = state.denoise_completed
                     if finished:
-                        result = self.pipeline.post_decode(state)
+                        try:
+                            logger.info(
+                                "stepwise stage begin: post_decode req_id=%s step_index=%s",
+                                state.req_id,
+                                state.step_index,
+                            )
+                            result = self.pipeline.post_decode(state)
+                            logger.info(
+                                "stepwise stage end: post_decode req_id=%s step_index=%s",
+                                state.req_id,
+                                state.step_index,
+                            )
+                        except Exception:
+                            logger.exception(
+                                "stepwise stage failed: post_decode req_id=%s step_index=%s",
+                                state.req_id,
+                                state.step_index,
+                            )
+                            raise
                     else:
                         result = None
 
