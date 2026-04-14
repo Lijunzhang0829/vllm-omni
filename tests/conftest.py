@@ -2,6 +2,7 @@ import base64
 import datetime
 import io
 import json
+import logging
 import math
 import os
 import random
@@ -10,6 +11,9 @@ import tempfile
 import requests
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+# Disable platform plugin auto-loading during tests unless the caller
+# explicitly requests plugins. This avoids import-time Ascend/NPU init.
+os.environ.setdefault("VLLM_PLUGINS", "")
 # Set CPU device for CI environments without GPU
 if "VLLM_TARGET_DEVICE" not in os.environ:
     os.environ["VLLM_TARGET_DEVICE"] = "cpu"
@@ -37,20 +41,29 @@ import torch
 import yaml
 from openai import OpenAI, omit
 from PIL import Image
-from vllm import TextPrompt
-from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
-from vllm.logger import init_logger
-from vllm.utils.network_utils import get_open_port
 
-from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 
-logger = init_logger(__name__)
+logger = logging.getLogger(__name__)
 
+TextPrompt = dict[str, Any]
 PromptAudioInput = list[tuple[Any, int]] | tuple[Any, int] | None
 PromptImageInput = list[Any] | Any | None
 PromptVideoInput = list[Any] | Any | None
+
+
+def cleanup_dist_env_and_memory() -> None:
+    from vllm.distributed.parallel_state import cleanup_dist_env_and_memory as _cleanup
+
+    _cleanup()
+
+
+def get_open_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        sock.listen(1)
+        return int(sock.getsockname()[1])
 
 
 class OmniServerParams(NamedTuple):
@@ -1582,9 +1595,7 @@ class OpenAIClientHandler:
     supporting both single request and concurrent request modes.
     """
 
-    def __init__(
-        self, host: str = "127.0.0.1", port: int = get_open_port(), api_key: str = "EMPTY", run_level: str = None
-    ):
+    def __init__(self, host: str = "127.0.0.1", port: int | None = None, api_key: str = "EMPTY", run_level: str = None):
         """
         Initialize the OpenAI client.
 
@@ -1593,6 +1604,8 @@ class OpenAIClientHandler:
             port: vLLM-Omni server port
             api_key: API key (defaults to "EMPTY")
         """
+        if port is None:
+            port = get_open_port()
         self.base_url = f"http://{host}:{port}"
         self.client = OpenAI(base_url=f"http://{host}:{port}/v1", api_key=api_key)
         self.run_level = run_level
@@ -2033,6 +2046,8 @@ class OmniRunner:
         _run_post_test_cleanup(enable_force=True)
         self.model_name = model_name
         self.seed = seed
+
+        from vllm_omni.entrypoints.omni import Omni
 
         self.omni = Omni(
             model=model_name,

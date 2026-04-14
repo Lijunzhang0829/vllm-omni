@@ -87,6 +87,45 @@ from tqdm.asyncio import tqdm
 
 logger = logging.getLogger(__name__)
 
+_REQUEST_FUNC_INPUT_TOP_LEVEL_FIELDS = {
+    "width",
+    "height",
+    "num_frames",
+    "num_inference_steps",
+    "seed",
+    "fps",
+    "timestamp",
+    "slo_ms",
+    "image_paths",
+    "image_path",
+    "request_id",
+}
+
+
+def _split_request_profile_fields(
+    profile: dict[str, Any] | None,
+    *,
+    extra_body: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Split per-request profile fields into RequestFuncInput kwargs vs extra_body.
+
+    `RequestFuncInput` should remain transport-oriented and only keep the common
+    benchmark fields. Model-specific request fields such as Wan2.2's
+    `flow_shift`/`boundary_ratio` are forwarded via `extra_body`.
+    """
+
+    if not profile:
+        return {}, dict(extra_body or {})
+
+    top_level: dict[str, Any] = {}
+    merged_extra_body = dict(extra_body or {})
+    for key, value in profile.items():
+        if key in _REQUEST_FUNC_INPUT_TOP_LEVEL_FIELDS:
+            top_level[key] = value
+        else:
+            merged_extra_body[key] = value
+    return top_level, merged_extra_body
+
 
 class BaseDataset(ABC):
     def __init__(self, args, api_url: str, model: str):
@@ -535,21 +574,37 @@ class TraceDataset(BaseDataset):
             width = row_width
             height = row_height
 
+        top_level_fields, extra_body = _split_request_profile_fields(
+            {
+                k: v
+                for k, v in row.items()
+                if k not in {"prompt", "text", "_source", "image_paths", "image_path"}
+            }
+        )
+
         return RequestFuncInput(
             prompt=str(prompt),
             api_url=self.api_url,
             model=self.model,
-            width=width,
-            height=height,
-            num_frames=num_frames if num_frames is not None else self.args.num_frames,
-            num_inference_steps=num_steps if num_steps is not None else self.args.num_inference_steps,
-            seed=seed if seed is not None else self.args.seed,
-            fps=fps if fps is not None else self.args.fps,
-            timestamp=timestamp,
-            slo_ms=slo_ms,
+            width=top_level_fields.get("width", width),
+            height=top_level_fields.get("height", height),
+            num_frames=top_level_fields.get("num_frames", num_frames if num_frames is not None else self.args.num_frames),
+            num_inference_steps=top_level_fields.get(
+                "num_inference_steps",
+                num_steps if num_steps is not None else self.args.num_inference_steps,
+            ),
+            seed=top_level_fields.get("seed", seed if seed is not None else self.args.seed),
+            fps=top_level_fields.get("fps", fps if fps is not None else self.args.fps),
+            timestamp=top_level_fields.get("timestamp", timestamp),
+            slo_ms=top_level_fields.get("slo_ms", slo_ms),
+            extra_body=extra_body,
             image_paths=image_paths,
             video_poll_timeout_s=self.args.video_poll_timeout_s,
-            request_id=str(row.get("request_id")) if row.get("request_id") is not None else str(uuid.uuid4()),
+            request_id=(
+                str(top_level_fields["request_id"])
+                if top_level_fields.get("request_id") is not None
+                else str(uuid.uuid4())
+            ),
             trace_log_file=getattr(self.args, "trace_log_file", None),
             trace_label=getattr(self.args, "trace_label", None),
         )
@@ -610,7 +665,8 @@ class RandomDataset(BaseDataset):
         }
         if self._sampled_requests:
             profile = self._sampled_requests[idx]
-            params.update(profile)
+            top_level_fields, extra_body = _split_request_profile_fields(profile, extra_body=extra_body)
+            params.update(top_level_fields)
         return RequestFuncInput(
             prompt=f"Random prompt {idx} for benchmarking diffusion models",
             api_url=self.api_url,

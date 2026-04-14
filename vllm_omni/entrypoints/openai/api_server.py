@@ -1950,12 +1950,14 @@ async def _run_video_generation_job(
     started_at = time.perf_counter()
     output_path = None
     try:
+        logger.info("Video job %s started background generation", video_id)
         response = await handler.generate_videos(
             request,
             video_id,
             reference_image=reference_image,
             request_headers=request_headers,
         )
+        logger.info("Video job %s received handler response", video_id)
         if not response.data:
             raise RuntimeError("Video generation completed but returned no outputs.")
 
@@ -1986,6 +1988,7 @@ async def _run_video_generation_job(
             video_id,
             update_fields,
         )
+        logger.info("Video job %s marked completed", video_id)
     except Exception as exc:
         logger.exception("Video generation failed for id=%s", video_id)
 

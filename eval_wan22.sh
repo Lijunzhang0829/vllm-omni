@@ -5,27 +5,61 @@ set -euo pipefail
 #
 # Notes:
 # - This script only launches the client benchmark. Start the server manually first.
-# - Both baseline and super_p95 should go through the dispatcher endpoint even when
-#   there is only one backend, so the serving topology stays identical.
-# - TODO(super-p95-v018): Once diffusion_benchmark_serving.py regains
-#   client-timeout / arrival-seed / random-request-seed parity, thread those
-#   options through this script instead of relying on the benchmark defaults.
+# - Wan2.2 validation is intentionally scoped to the old v0.16 squashed topology:
+#   dispatcher on :8080 plus a single managed backend on :8091.
+# - The supported backend config is fixed to:
+#     --usp 8
+#     --enable-layerwise-offload
+#     --boundary-ratio 0.875
+#     --vae-use-slicing
+#     --vae-use-tiling
 #
-# Baseline via dispatcher with a single backend:
+# Baseline via dispatcher with a single managed backend:
 # env NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost \
+# VLLM_OMNI_ENABLE_DIFFUSION_SERVER_SCHEDULING=0 \
+# VLLM_OMNI_ENABLE_DIFFUSION_PREEMPTION=0 \
 # python3 benchmarks/diffusion/super_p95_dispatcher.py \
-#   --host 127.0.0.1 \
+#   --host 0.0.0.0 \
 #   --port 8080 \
-#   --backend-url http://127.0.0.1:8091 \
-#   --hardware-profile 910B3
+#   --model Wan-AI/Wan2.2-T2V-A14B-Diffusers \
+#   --num-servers 1 \
+#   --backend-start-port 8091 \
+#   --device-env-var ASCEND_RT_VISIBLE_DEVICES \
+#   --backend-hardware-profiles 910B3 \
+#   --backend-log-dir /tmp/super_p95_backends_wan22_baseline \
+#   --request-timeout-s 1000000 \
+#   --backend-args=--omni \
+#   --backend-args=--usp \
+#   --backend-args=8 \
+#   --backend-args=--enable-layerwise-offload \
+#   --backend-args=--boundary-ratio \
+#   --backend-args=0.875 \
+#   --backend-args=--vae-use-slicing \
+#   --backend-args=--vae-use-tiling
 #
-# Super-P95 via dispatcher with a single backend:
+# super_p95 via dispatcher with a single managed backend:
 # env NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost \
+# VLLM_OMNI_ENABLE_DIFFUSION_SERVER_SCHEDULING=1 \
+# VLLM_OMNI_ENABLE_DIFFUSION_PREEMPTION=1 \
 # python3 benchmarks/diffusion/super_p95_dispatcher.py \
-#   --host 127.0.0.1 \
+#   --host 0.0.0.0 \
 #   --port 8080 \
-#   --backend-url http://127.0.0.1:8091 \
-#   --hardware-profile 910B3
+#   --model Wan-AI/Wan2.2-T2V-A14B-Diffusers \
+#   --num-servers 1 \
+#   --backend-start-port 8091 \
+#   --device-env-var ASCEND_RT_VISIBLE_DEVICES \
+#   --backend-hardware-profiles 910B3 \
+#   --backend-log-dir /tmp/super_p95_backends_wan22 \
+#   --request-timeout-s 1000000 \
+#   --sacrificial-load-factor 0.1 \
+#   --backend-args=--omni \
+#   --backend-args=--usp \
+#   --backend-args=8 \
+#   --backend-args=--enable-layerwise-offload \
+#   --backend-args=--boundary-ratio \
+#   --backend-args=0.875 \
+#   --backend-args=--vae-use-slicing \
+#   --backend-args=--vae-use-tiling
 
 usage() {
   cat <<'EOF'
@@ -39,14 +73,17 @@ Description:
   server manually first, then run this script.
 
 Environment overrides:
-  BASE_URL          Default: http://127.0.0.1:8080
-  MODEL             Default: Wan-AI/Wan2.2-T2V-A14B-Diffusers
-  NUM_PROMPTS       Default: 160
-  MAX_CONCURRENCY   Default: 1000
-  REQUEST_RATES     Default: "0.012 0.020"
-  WARMUP_REQUESTS   Default: 0
-  SEED              Default: 0
-  OUTPUT_ROOT       Default: benchmarks/diffusion/results/wan22_p95_sweep
+  BASE_URL            Default: http://127.0.0.1:8080
+  MODEL               Default: Wan-AI/Wan2.2-T2V-A14B-Diffusers
+  NUM_PROMPTS         Default: 160
+  MAX_CONCURRENCY     Default: 1000
+  REQUEST_RATES       Default: "0.012 0.020"
+  WARMUP_REQUESTS     Default: 0
+  SEED                Default: 0
+  RANDOM_REQUEST_SEED Default: 8
+  ARRIVAL_SEED        Default: 456
+  CLIENT_TIMEOUT_S    Default: 1000000
+  OUTPUT_ROOT         Default: benchmarks/diffusion/results/wan22_p95_sweep
 EOF
 }
 
@@ -73,6 +110,9 @@ MAX_CONCURRENCY="${MAX_CONCURRENCY:-1000}"
 REQUEST_RATES="${REQUEST_RATES:-0.012 0.020}"
 WARMUP_REQUESTS="${WARMUP_REQUESTS:-0}"
 SEED="${SEED:-0}"
+RANDOM_REQUEST_SEED="${RANDOM_REQUEST_SEED:-8}"
+ARRIVAL_SEED="${ARRIVAL_SEED:-456}"
+CLIENT_TIMEOUT_S="${CLIENT_TIMEOUT_S:-1000000}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-benchmarks/diffusion/results/wan22_p95_sweep}"
 
 DEFAULT_WAN22_RANDOM3="$(cat <<'EOF'
@@ -94,6 +134,9 @@ echo "Model           : ${MODEL}"
 echo "Num prompts     : ${NUM_PROMPTS}"
 echo "Max concurrency : ${MAX_CONCURRENCY}"
 echo "Request rates   : ${REQUEST_RATES}"
+echo "Random seed     : ${RANDOM_REQUEST_SEED}"
+echo "Arrival seed    : ${ARRIVAL_SEED}"
+echo "Client timeout  : ${CLIENT_TIMEOUT_S}"
 echo "Output dir      : ${OUT_DIR}"
 
 python - <<'PY' <<<"${WAN22_RANDOM3}" >/dev/null
@@ -125,6 +168,9 @@ for rate in ${REQUEST_RATES}; do
     --request-rate "${rate}" \
     --warmup-requests "${WARMUP_REQUESTS}" \
     --seed "${SEED}" \
+    --random-request-seed "${RANDOM_REQUEST_SEED}" \
+    --arrival-seed "${ARRIVAL_SEED}" \
+    --client-timeout-s "${CLIENT_TIMEOUT_S}" \
     --random-request-config "${WAN22_RANDOM3}" \
     --output-file "${output_file}"
 done

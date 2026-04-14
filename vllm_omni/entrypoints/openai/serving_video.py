@@ -150,7 +150,9 @@ class OmniOpenAIServingVideo:
             gen_params.seed,
         )
 
+        logger.info("Video request %s entering _run_generation", reference_id)
         result = await self._run_generation(prompt, gen_params, reference_id)
+        logger.info("Video request %s returned from _run_generation", reference_id)
         response_metrics = None
         snapshot = parse_super_p95_load_metrics(getattr(result, "metrics", None))
         if snapshot is not None:
@@ -160,6 +162,13 @@ class OmniOpenAIServingVideo:
         audios = self._extract_audio_outputs(result, expected_count=len(videos))
         audio_sample_rate = self._resolve_audio_sample_rate(result)
         output_fps = vp.fps or 24
+        logger.info(
+            "Video request %s extracted outputs: videos=%s audios=%s output_fps=%s",
+            reference_id,
+            len(videos),
+            len(audios),
+            output_fps,
+        )
 
         video_data = [
             VideoData(
@@ -177,7 +186,7 @@ class OmniOpenAIServingVideo:
             for idx, video in enumerate(videos)
         ]
         _t_encode_ms = (time.perf_counter() - _t_encode_start) * 1000
-        logger.info("Video response encoding (MP4+base64): %.2f ms", _t_encode_ms)
+        logger.info("Video request %s response encoding (MP4+base64): %.2f ms", reference_id, _t_encode_ms)
         return VideoGenerationResponse(created=int(time.time()), data=video_data, metrics=response_metrics)
 
     @staticmethod
