@@ -11,6 +11,7 @@ model-related operations.
 from __future__ import annotations
 
 import copy
+import os
 import time
 from collections.abc import Iterable
 from contextlib import nullcontext
@@ -38,6 +39,15 @@ from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTran
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
+
+
+def _step_trace_enabled() -> bool:
+    return os.environ.get("VLLM_OMNI_STEP_TRACE", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 class DiffusionModelRunner:
@@ -358,6 +368,14 @@ class DiffusionModelRunner:
         grad_context = torch.no_grad() if use_hsdp else torch.inference_mode()
         with grad_context:
             state, is_new_request = self._update_states(scheduler_output)
+            if _step_trace_enabled():
+                logger.info(
+                    "step-trace runner begin req_id=%s step_index=%s is_new_request=%s denoise_completed=%s",
+                    state.req_id,
+                    state.step_index,
+                    is_new_request,
+                    state.denoise_completed,
+                )
 
             if is_new_request:
                 # TODO: support kv manager recv
@@ -454,6 +472,14 @@ class DiffusionModelRunner:
                         result = None
 
                 self._update_states_after(state, finished)
+                if _step_trace_enabled():
+                    logger.info(
+                        "step-trace runner end req_id=%s step_index=%s finished=%s result_is_none=%s",
+                        state.req_id,
+                        state.step_index,
+                        finished,
+                        result is None,
+                    )
 
                 return RunnerOutput(
                     req_id=state.req_id,

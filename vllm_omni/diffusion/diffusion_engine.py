@@ -28,6 +28,15 @@ from vllm_omni.outputs import OmniRequestOutput
 logger = init_logger(__name__)
 
 
+def _step_trace_enabled() -> bool:
+    return os.environ.get("VLLM_OMNI_STEP_TRACE", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 def _make_default_scheduler(od_config: OmniDiffusionConfig) -> SchedulerInterface:
     scheduler_name = os.environ.get("VLLM_OMNI_DIFFUSION_SCHEDULER", "").strip().lower()
     if scheduler_name == "super_p95_step":
@@ -88,6 +97,10 @@ class DiffusionEngine:
         self.scheduler: SchedulerInterface = scheduler or _make_default_scheduler(od_config)
         self.scheduler.initialize(od_config)
         self._rpc_lock = threading.Lock()
+        self._scheduler_lock = threading.Lock()
+        self._driver_cv = threading.Condition(self._scheduler_lock)
+        self._driver_active = False
+        self._completed_outputs: dict[str, DiffusionOutput] = {}
 
         try:
             self._dummy_run()
@@ -289,17 +302,38 @@ class DiffusionEngine:
         return DiffusionEngine(config, scheduler=scheduler)
 
     def add_req_and_wait_for_response(self, request: OmniDiffusionRequest) -> DiffusionOutput:
-        with self._rpc_lock:
-            target_sched_req_id = self.scheduler.add_request(request)
-            use_step_execution = bool(getattr(getattr(self, "od_config", None), "step_execution", False))
+        self._ensure_runtime_state()
+        use_step_execution = bool(getattr(getattr(self, "od_config", None), "step_execution", False))
 
-            # keep scheduling and executing until the target request is finished
+        with self._driver_cv:
+            target_sched_req_id = self.scheduler.add_request(request)
+            self._driver_cv.notify_all()
             while True:
-                sched_output = self.scheduler.schedule()
-                if sched_output.is_empty:
-                    if not self.scheduler.has_requests():
-                        raise RuntimeError("Diffusion scheduler has no runnable requests.")
-                    continue
+                output = self._consume_completed_output_locked(target_sched_req_id)
+                if output is not None:
+                    return output
+                if not self._driver_active:
+                    self._driver_active = True
+                    break
+                self._driver_cv.wait()
+
+        try:
+            while True:
+                with self._driver_cv:
+                    output = self._consume_completed_output_locked(target_sched_req_id)
+                    if output is not None:
+                        self._driver_active = False
+                        self._driver_cv.notify_all()
+                        return output
+
+                    sched_output = self.scheduler.schedule()
+                    if sched_output.is_empty:
+                        if not self.scheduler.has_requests():
+                            self._driver_active = False
+                            self._driver_cv.notify_all()
+                            raise RuntimeError("Diffusion scheduler has no runnable requests.")
+                        self._driver_cv.wait(timeout=0.001)
+                        continue
 
                 # NOTE: add_req_and_wait_for_response() is synchronous, and
                 # the scheduler currently enforces _max_batch_size = 1 (see
@@ -308,7 +342,21 @@ class DiffusionEngine:
                 sched_req_id = sched_output.scheduled_req_ids[0]
                 if use_step_execution:
                     try:
-                        runner_output = self.executor.execute_stepwise(sched_output)
+                        if _step_trace_enabled():
+                            logger.info(
+                                "step-trace engine rpc begin req_id=%s target_req_id=%s",
+                                sched_req_id,
+                                target_sched_req_id,
+                            )
+                        with self._rpc_lock:
+                            runner_output = self.executor.execute_stepwise(sched_output)
+                        if _step_trace_enabled():
+                            logger.info(
+                                "step-trace engine rpc end req_id=%s runner_req_id=%s finished=%s",
+                                sched_req_id,
+                                getattr(runner_output, "req_id", None),
+                                getattr(runner_output, "finished", None),
+                            )
                     except Exception as exc:
                         from vllm_omni.diffusion.worker.utils import RunnerOutput
 
@@ -324,15 +372,14 @@ class DiffusionEngine:
                         )
 
                     finished_req_ids = self.scheduler.update_from_runner_output(sched_output, runner_output)
-                    if target_sched_req_id in finished_req_ids:
-                        self.scheduler.pop_request_state(target_sched_req_id)
-                        if runner_output.result is None:
-                            return DiffusionOutput(error=f"Missing final stepwise result for {target_sched_req_id}")
-                        return runner_output.result
+                    with self._driver_cv:
+                        self._record_finished_output_locked(sched_req_id, finished_req_ids, runner_output.result)
+                        self._driver_cv.notify_all()
                 else:
                     req = sched_output.scheduled_new_reqs[0].req
                     try:
-                        output = self.executor.add_req(req)
+                        with self._rpc_lock:
+                            output = self.executor.add_req(req)
                     except Exception as exc:
                         logger.error(
                             "Execution failed for diffusion request %s",
@@ -342,9 +389,44 @@ class DiffusionEngine:
                         output = DiffusionOutput(error=str(exc))
 
                     finished_req_ids = self.scheduler.update_from_output(sched_output, output)
-                    if target_sched_req_id in finished_req_ids:
-                        self.scheduler.pop_request_state(target_sched_req_id)
-                        return output
+                    with self._driver_cv:
+                        self._record_finished_output_locked(sched_req_id, finished_req_ids, output)
+                        self._driver_cv.notify_all()
+        finally:
+            with self._driver_cv:
+                if self._driver_active:
+                    self._driver_active = False
+                    self._driver_cv.notify_all()
+
+    def _ensure_runtime_state(self) -> None:
+        if not hasattr(self, "_rpc_lock"):
+            self._rpc_lock = threading.Lock()
+        if not hasattr(self, "_scheduler_lock"):
+            self._scheduler_lock = threading.Lock()
+        if not hasattr(self, "_driver_cv"):
+            self._driver_cv = threading.Condition(self._scheduler_lock)
+        if not hasattr(self, "_driver_active"):
+            self._driver_active = False
+        if not hasattr(self, "_completed_outputs"):
+            self._completed_outputs = {}
+
+    def _consume_completed_output_locked(self, sched_req_id: str) -> DiffusionOutput | None:
+        output = self._completed_outputs.pop(sched_req_id, None)
+        if output is not None:
+            self.scheduler.pop_request_state(sched_req_id)
+        return output
+
+    def _record_finished_output_locked(
+        self,
+        sched_req_id: str,
+        finished_req_ids: set[str],
+        output: DiffusionOutput | None,
+    ) -> None:
+        if sched_req_id not in finished_req_ids:
+            return
+        if output is None:
+            output = DiffusionOutput(error=f"Missing final diffusion output for {sched_req_id}")
+        self._completed_outputs[sched_req_id] = output
 
     def profile(self, is_start: bool = True, profile_prefix: str | None = None) -> None:
         """Start or stop torch profiling on all diffusion workers.

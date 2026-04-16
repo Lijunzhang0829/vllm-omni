@@ -1,4 +1,5 @@
 import multiprocessing as mp
+import os
 import time
 import weakref
 from dataclasses import dataclass
@@ -16,6 +17,15 @@ from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
 from vllm_omni.diffusion.worker import WorkerProc
 
 logger = init_logger(__name__)
+
+
+def _step_trace_enabled() -> bool:
+    return os.environ.get("VLLM_OMNI_STEP_TRACE", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 @dataclass
@@ -193,6 +203,8 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
 
     def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput):
         self._ensure_open()
+        sched_req_ids = getattr(scheduler_output, "scheduled_req_ids", [])
+        req_id = sched_req_ids[0] if sched_req_ids else None
         rpc_request = {
             "type": "rpc",
             "method": "execute_stepwise",
@@ -203,8 +215,21 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         }
 
         try:
+            if _step_trace_enabled():
+                logger.info("step-trace executor enqueue req_id=%s", req_id)
             self._broadcast_mq.enqueue(rpc_request)
             response = self._result_mq.dequeue()
+            if _step_trace_enabled():
+                logger.info(
+                    "step-trace executor dequeue req_id=%s response_req_id=%s finished=%s",
+                    req_id,
+                    getattr(response, "req_id", None),
+                    getattr(response, "finished", None),
+                )
+            try:
+                unpack_diffusion_output_shm(response)
+            except Exception as e:
+                logger.warning("SHM unpack failed during stepwise execution (data may already be inline): %s", e)
             if isinstance(response, dict) and response.get("status") == "error":
                 raise RuntimeError(
                     f"Worker failed with error '{response.get('error')}', "

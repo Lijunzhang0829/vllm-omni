@@ -77,6 +77,11 @@ class SuperP95StepScheduler(_BaseScheduler):
         self._hardware_profile = normalize_super_p95_hardware_profile(
             os.environ.get("VLLM_OMNI_SUPER_P95_HARDWARE_PROFILE")
         )
+        self._num_added_normal = 0
+        self._num_added_sacrificial = 0
+        self._num_scheduled_normal = 0
+        self._num_scheduled_sacrificial = 0
+        self._num_preemptions = 0
 
     def has_requests(self) -> bool:
         return bool(self._running or self._normal_pending or self._sacrificial_pending)
@@ -115,6 +120,20 @@ class SuperP95StepScheduler(_BaseScheduler):
         self._arrival_seq += 1
         self._queue_metadata[sched_req_id] = queued
         self._push_pending(queued)
+        if sacrificial:
+            self._num_added_sacrificial += 1
+        else:
+            self._num_added_normal += 1
+        logger.info(
+            "super_p95 scheduler add req=%s sacrificial=%s estimated_service_s=%.4f "
+            "total_steps=%d added_normal=%d added_sacrificial=%d",
+            sched_req_id,
+            sacrificial,
+            estimated_service_s,
+            queued.total_steps,
+            self._num_added_normal,
+            self._num_added_sacrificial,
+        )
         return sched_req_id
 
     def schedule(self) -> DiffusionSchedulerOutput:
@@ -131,6 +150,18 @@ class SuperP95StepScheduler(_BaseScheduler):
             if active_state is not None and not active_state.is_finished():
                 active_state.status = DiffusionRequestStatus.PREEMPTED
                 self._push_pending(active_queued)
+                self._num_preemptions += 1
+                logger.info(
+                    "super_p95 scheduler preempt running=%s sacrificial=%s candidate=%s candidate_sacrificial=%s "
+                    "preemptions=%d normal_pending=%d sacrificial_pending=%d",
+                    active_queued.sched_req_id,
+                    active_queued.is_sacrificial,
+                    candidate.sched_req_id,
+                    candidate.is_sacrificial,
+                    self._num_preemptions,
+                    len(self._normal_pending),
+                    len(self._sacrificial_pending),
+                )
             active_queued = None
 
         if active_queued is not None:
@@ -143,6 +174,22 @@ class SuperP95StepScheduler(_BaseScheduler):
                     was_new_request = state.status == DiffusionRequestStatus.WAITING and queued.completed_steps == 0
                     state.status = DiffusionRequestStatus.RUNNING
                     self._running = [queued.sched_req_id]
+                    if queued.is_sacrificial:
+                        self._num_scheduled_sacrificial += 1
+                    else:
+                        self._num_scheduled_normal += 1
+                    logger.info(
+                        "super_p95 scheduler select req=%s sacrificial=%s completed_steps=%d total_steps=%d "
+                        "scheduled_normal=%d scheduled_sacrificial=%d normal_pending=%d sacrificial_pending=%d",
+                        queued.sched_req_id,
+                        queued.is_sacrificial,
+                        queued.completed_steps,
+                        queued.total_steps,
+                        self._num_scheduled_normal,
+                        self._num_scheduled_sacrificial,
+                        len(self._normal_pending),
+                        len(self._sacrificial_pending),
+                    )
                     if was_new_request:
                         scheduled_new_reqs.append(NewRequestData.from_state(state))
                     else:
@@ -244,6 +291,11 @@ class SuperP95StepScheduler(_BaseScheduler):
         self._queue_metadata.clear()
         self._arrival_seq = 0
         self._current_time_s = 0.0
+        self._num_added_normal = 0
+        self._num_added_sacrificial = 0
+        self._num_scheduled_normal = 0
+        self._num_scheduled_sacrificial = 0
+        self._num_preemptions = 0
 
     def _pop_extra_request_state(self, sched_req_id: str) -> None:
         self._queue_metadata.pop(sched_req_id, None)

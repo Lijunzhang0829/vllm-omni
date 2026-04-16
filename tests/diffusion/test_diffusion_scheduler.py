@@ -22,6 +22,7 @@ from vllm_omni.diffusion.super_p95 import (
     EXTRA_ARG_SUPER_P95_ESTIMATED_SERVICE_S,
     EXTRA_ARG_SUPER_P95_SACRIFICIAL,
     estimate_service_time_s,
+    normalize_wan2_2_num_frames,
 )
 from vllm_omni.diffusion.worker.utils import RunnerOutput
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -292,6 +293,11 @@ class TestRequestScheduler:
 
         assert estimate_service_time_s(request) == pytest.approx(38.07)
 
+    def test_normalize_wan_num_frames_matches_pipeline_contract(self) -> None:
+        assert normalize_wan2_2_num_frames(80) == 81
+        assert normalize_wan2_2_num_frames(81) == 81
+        assert normalize_wan2_2_num_frames(82) == 81
+
 
 class TestSuperP95StepScheduler:
     def setup_method(self) -> None:
@@ -369,6 +375,61 @@ class TestDiffusionEngine:
 
         assert output is expected
         assert engine.executor.execute_stepwise.call_count == 2
+
+    def test_step_execution_allows_new_arrival_while_first_step_is_running(self) -> None:
+        engine = DiffusionEngine.__new__(DiffusionEngine)
+        engine.od_config = Mock(step_execution=True)
+        engine.scheduler = RequestScheduler()
+        engine.scheduler.initialize(Mock())
+        engine.executor = Mock()
+        engine._rpc_lock = threading.Lock()
+
+        first_started = threading.Event()
+        second_enqueued = threading.Event()
+        first_output = DiffusionOutput(output=None)
+        second_output = DiffusionOutput(output=None)
+
+        original_add_request = engine.scheduler.add_request
+
+        def tracked_add_request(request: OmniDiffusionRequest) -> str:
+            sched_req_id = original_add_request(request)
+            if request.request_ids == ["second"]:
+                second_enqueued.set()
+            return sched_req_id
+
+        engine.scheduler.add_request = tracked_add_request
+
+        def execute_stepwise(sched_output):
+            req_id = sched_output.scheduled_req_ids[0]
+            if req_id == "first":
+                first_started.set()
+                assert second_enqueued.wait(timeout=2.0) is True
+                return RunnerOutput(req_id="first", step_index=1, finished=True, result=first_output)
+            assert req_id == "second"
+            return RunnerOutput(req_id="second", step_index=1, finished=True, result=second_output)
+
+        engine.executor.execute_stepwise.side_effect = execute_stepwise
+
+        results: dict[str, DiffusionOutput] = {}
+
+        def run_first() -> None:
+            results["first"] = engine.add_req_and_wait_for_response(_make_request("first"))
+
+        def run_second() -> None:
+            assert first_started.wait(timeout=2.0) is True
+            results["second"] = engine.add_req_and_wait_for_response(_make_request("second"))
+
+        first_thread = threading.Thread(target=run_first, daemon=True)
+        second_thread = threading.Thread(target=run_second, daemon=True)
+        first_thread.start()
+        second_thread.start()
+        first_thread.join(timeout=5.0)
+        second_thread.join(timeout=5.0)
+
+        assert not first_thread.is_alive()
+        assert not second_thread.is_alive()
+        assert results["first"] is first_output
+        assert results["second"] is second_output
 
     def test_initializes_injected_scheduler(self) -> None:
         request = _make_request("init")

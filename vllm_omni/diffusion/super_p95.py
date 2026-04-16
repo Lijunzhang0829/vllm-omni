@@ -74,6 +74,8 @@ _WAN2_2_PER_PIXEL_FRAME_STEP_MS: dict[str, float] = {
     if _WAN2_2_FALLBACK_BASE_KEY in anchors
 }
 
+_WAN2_2_VAE_SCALE_FACTOR_TEMPORAL = 4
+
 
 @dataclass(frozen=True)
 class SuperP95LoadSnapshot:
@@ -187,5 +189,13 @@ def _estimate_wan2_2_service_time_s(
     if exact_match is not None:
         return exact_match
 
+    frames = normalize_wan2_2_num_frames(frames)
     per_pixel_frame_step_ms = _WAN2_2_PER_PIXEL_FRAME_STEP_MS[profile]
     return per_pixel_frame_step_ms * width * height * steps * frames / 1000.0
+
+
+def normalize_wan2_2_num_frames(num_frames: int | None) -> int:
+    frames = max(int(num_frames or 1), 1)
+    if frames % _WAN2_2_VAE_SCALE_FACTOR_TEMPORAL != 1:
+        frames = frames // _WAN2_2_VAE_SCALE_FACTOR_TEMPORAL * _WAN2_2_VAE_SCALE_FACTOR_TEMPORAL + 1
+    return max(frames, 1)

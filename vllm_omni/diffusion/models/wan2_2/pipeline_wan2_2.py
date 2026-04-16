@@ -119,10 +119,51 @@ def get_wan22_post_process_func(
 
     video_processor = VideoProcessor(vae_scale_factor=8)
 
+    def _describe_video_payload(video: Any, depth: int = 0) -> str:
+        if depth >= 3:
+            return f"{type(video).__name__}(...)"
+        if hasattr(video, "shape"):
+            shape = getattr(video, "shape", None)
+            return f"{type(video).__name__}(shape={shape})"
+        if isinstance(video, dict):
+            items = []
+            for key, value in list(video.items())[:4]:
+                items.append(f"{key}={_describe_video_payload(value, depth + 1)}")
+            return f"dict({', '.join(items)})"
+        if isinstance(video, (list, tuple)):
+            items = [_describe_video_payload(item, depth + 1) for item in list(video)[:4]]
+            return f"{type(video).__name__}(len={len(video)}, items=[{', '.join(items)}])"
+        return type(video).__name__
+
+    def _unwrap_video_payload(video: Any) -> Any:
+        if isinstance(video, dict):
+            for key in ("video", "videos", "sample", "samples", "frames", "output"):
+                if key in video:
+                    return _unwrap_video_payload(video[key])
+            if len(video) == 1:
+                return _unwrap_video_payload(next(iter(video.values())))
+            for value in video.values():
+                if isinstance(value, (dict, list, tuple)) or hasattr(value, "shape"):
+                    return _unwrap_video_payload(value)
+        if isinstance(video, (list, tuple)):
+            if len(video) == 1:
+                return _unwrap_video_payload(video[0])
+            for item in video:
+                if isinstance(item, (dict, list, tuple)) or hasattr(item, "shape"):
+                    return _unwrap_video_payload(item)
+        for attr in ("sample", "samples", "video", "videos", "frames", "output"):
+            value = getattr(video, attr, None)
+            if value is not None:
+                return _unwrap_video_payload(value)
+        return video
+
     def post_process_func(
-        video: torch.Tensor,
+        video: torch.Tensor | dict[str, Any] | Any,
         output_type: str = "np",
     ):
+        logger.info("Wan2.2 post_process input: %s", _describe_video_payload(video))
+        video = _unwrap_video_payload(video)
+        logger.info("Wan2.2 post_process unwrapped: %s", _describe_video_payload(video))
         if output_type == "latent":
             return video
         return video_processor.postprocess_video(video, output_type=output_type)

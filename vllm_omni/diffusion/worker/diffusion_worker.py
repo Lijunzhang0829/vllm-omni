@@ -48,6 +48,15 @@ from vllm_omni.worker.gpu_memory_utils import get_process_gpu_memory
 logger = init_logger(__name__)
 
 
+def _step_trace_enabled() -> bool:
+    return os.environ.get("VLLM_OMNI_STEP_TRACE", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 class DiffusionWorker:
     """
     A worker that manages GPU infrastructure and delegates to the model runner.
@@ -420,6 +429,13 @@ class WorkerProc:
     def return_result(self, output: object):
         """Reply to client, only on rank 0."""
         if self.result_mq is not None:
+            if _step_trace_enabled():
+                logger.info(
+                    "step-trace worker return_result rank=%s req_id=%s finished=%s",
+                    self.gpu_id,
+                    getattr(output, "req_id", None),
+                    getattr(output, "finished", None),
+                )
             try:
                 pack_diffusion_output_shm(output)
             except Exception as e:
@@ -445,8 +461,25 @@ class WorkerProc:
             return None, False
 
         try:
+            if _step_trace_enabled():
+                logger.info(
+                    "step-trace worker execute_rpc begin rank=%s method=%s output_rank=%s exec_all_ranks=%s",
+                    self.gpu_id,
+                    method,
+                    output_rank,
+                    exec_all_ranks,
+                )
             # Use execute_method from WorkerWrapperBase for consistent method resolution
             result = self.worker.execute_method(method, *args, **kwargs)
+            if _step_trace_enabled():
+                logger.info(
+                    "step-trace worker execute_rpc end rank=%s method=%s reply=%s result_req_id=%s finished=%s",
+                    self.gpu_id,
+                    method,
+                    should_reply,
+                    getattr(result, "req_id", None),
+                    getattr(result, "finished", None),
+                )
             return result, should_reply
         except Exception as e:
             logger.error(f"Error executing RPC: {e}", exc_info=True)

@@ -11,7 +11,9 @@ import torch
 from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.executor.multiproc_executor import MultiprocDiffusionExecutor
+from vllm_omni.diffusion.ipc import pack_diffusion_output_shm
 from vllm_omni.diffusion.sched import RequestScheduler
+from vllm_omni.diffusion.worker.utils import RunnerOutput
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.core_model, pytest.mark.cpu]
 
@@ -228,6 +230,34 @@ class TestConcurrentAddReqVsCollectiveRpcBug:
         assert isinstance(results["A"], DiffusionOutput)
         assert results["A"].error == "result_for_A"
         assert results["B"].error == "result_for_call_B"
+
+
+class TestStepwiseShmUnpack:
+    def test_execute_stepwise_unpacks_shm_tensor_result(self):
+        executor, req_q, res_q = _make_executor()
+
+        tensor = torch.zeros(300_000, dtype=torch.float32)
+        packed = pack_diffusion_output_shm(
+            RunnerOutput(
+                req_id="req-1",
+                step_index=1,
+                finished=True,
+                result=DiffusionOutput(output=tensor),
+            )
+        )
+        res_q.put(packed)
+
+        sched_output = Mock()
+        sched_output.scheduled_req_ids = ["req-1"]
+
+        output = executor.execute_stepwise(sched_output)
+
+        assert output.finished is True
+        assert isinstance(output.result.output, torch.Tensor)
+        torch.testing.assert_close(output.result.output, tensor)
+
+        rpc = req_q.get(timeout=1)
+        assert rpc["method"] == "execute_stepwise"
 
 
 # ─────────────── backward-compatibility (serial) tests ────────────────────
