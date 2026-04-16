@@ -304,13 +304,13 @@ class TestSuperP95StepScheduler:
         self.scheduler = SuperP95StepScheduler()
         self.scheduler.initialize(Mock())
 
-    def test_prefers_longer_normal_request_over_shorter_normal(self) -> None:
-        short_id = self.scheduler.add_request(_make_super_request("short", estimated_service_s=5.0))
-        long_id = self.scheduler.add_request(_make_super_request("long", estimated_service_s=20.0))
+    def test_preserves_fifo_for_normal_requests(self) -> None:
+        first_id = self.scheduler.add_request(_make_super_request("first", estimated_service_s=5.0))
+        second_id = self.scheduler.add_request(_make_super_request("second", estimated_service_s=20.0))
 
         sched_output = self.scheduler.schedule()
-        assert _new_ids(sched_output) == [long_id]
-        assert short_id != long_id
+        assert _new_ids(sched_output) == [first_id]
+        assert first_id != second_id
 
     def test_prefers_normal_request_over_sacrificial(self) -> None:
         sacrificial_id = self.scheduler.add_request(
@@ -321,6 +321,14 @@ class TestSuperP95StepScheduler:
         sched_output = self.scheduler.schedule()
         assert _new_ids(sched_output) == [normal_id]
         assert sacrificial_id != normal_id
+
+    def test_prefers_newer_sacrificial_request(self) -> None:
+        older_id = self.scheduler.add_request(_make_super_request("older", estimated_service_s=20.0, sacrificial=True))
+        newer_id = self.scheduler.add_request(_make_super_request("newer", estimated_service_s=5.0, sacrificial=True))
+
+        sched_output = self.scheduler.schedule()
+        assert _new_ids(sched_output) == [newer_id]
+        assert older_id != newer_id
 
 
 class TestDiffusionEngine:

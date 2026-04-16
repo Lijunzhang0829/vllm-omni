@@ -31,7 +31,7 @@ logger = init_logger(__name__)
 
 @dataclass(order=True)
 class _QueuedRequest:
-    sort_key: tuple[float, int] = field(init=False, repr=False)
+    sort_key: tuple[int, ...] = field(init=False, repr=False)
     arrival_seq: int
     arrival_time_s: float
     sched_req_id: str = field(compare=False)
@@ -52,11 +52,14 @@ class _QueuedRequest:
         return self.estimated_service_s * self.remaining_steps / max(self.total_steps, 1)
 
     def refresh_sort_key(self) -> None:
-        priority = self.remaining_service_s - self.arrival_time_s
         if self.is_sacrificial:
-            self.sort_key = (priority, self.arrival_seq)
+            # Sacrificial requests are the explicit cost sink: newer sacrificial
+            # arrivals are allowed to jump ahead of older sacrificial requests.
+            self.sort_key = (-self.arrival_seq,)
         else:
-            self.sort_key = (-priority, self.arrival_seq)
+            # Normal requests preserve FIFO to avoid inflating worst-case delay
+            # by reordering within the main queue.
+            self.sort_key = (self.arrival_seq,)
 
 
 class SuperP95StepScheduler(_BaseScheduler):
@@ -328,6 +331,4 @@ class SuperP95StepScheduler(_BaseScheduler):
 
     @staticmethod
     def request_outranks(candidate: _QueuedRequest, incumbent: _QueuedRequest) -> bool:
-        if candidate.is_sacrificial != incumbent.is_sacrificial:
-            return not candidate.is_sacrificial and incumbent.is_sacrificial
-        return candidate.sort_key < incumbent.sort_key
+        return not candidate.is_sacrificial and incumbent.is_sacrificial
