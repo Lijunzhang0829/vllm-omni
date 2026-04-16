@@ -65,15 +65,17 @@ python3 benchmarks/diffusion/super_p95_dispatcher.py \
 
 Baseline:
 ```bash
+BASE_URL=http://127.0.0.1:8080 \
+NUM_PROMPTS=500 \
+MAX_CONCURRENCY=1000 \
+REQUEST_RATES=0.8 \
+SEED=0 \
+RANDOM_REQUEST_SEED=8 \
+ARRIVAL_SEED=8 \
 bash eval_qwen_image.sh baseline
 ```
 
 Super P95:
-```bash
-bash eval_qwen_image.sh super_p95
-```
-
-Pinned config:
 ```bash
 BASE_URL=http://127.0.0.1:8080 \
 NUM_PROMPTS=500 \
