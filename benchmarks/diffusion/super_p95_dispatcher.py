@@ -324,6 +324,8 @@ class SuperP95Dispatcher:
         self.quota_credits_consumed = 0
         self._client: httpx.AsyncClient | None = None
         self._backend_launcher = backend_launcher
+        self._video_backend_by_id: dict[str, int] = {}
+        self._video_decision_by_id: dict[str, DispatchDecision] = {}
 
     async def startup(self) -> None:
         if self._backend_launcher is not None:
@@ -430,7 +432,12 @@ class SuperP95Dispatcher:
             raise
 
         elapsed_s = time.perf_counter() - start_time
-        await self._apply_response_feedback(decision, response.headers, elapsed_s)
+        if path == "/v1/videos" and response.status_code < 400:
+            remembered = self._remember_video_backend(path, response, decision)
+            if not remembered:
+                await self._apply_response_feedback(decision, response.headers, elapsed_s)
+        else:
+            await self._apply_response_feedback(decision, response.headers, elapsed_s)
         return Response(
             content=response.content,
             status_code=response.status_code,
@@ -439,9 +446,10 @@ class SuperP95Dispatcher:
         )
 
     async def proxy_get(self, path: str) -> Response:
-        backend = self.backends[0]
+        backend = self.backends[self._backend_index_for_proxy_path(path)]
         assert self._client is not None
         response = await self._client.get(f"{backend.base_url}{path}")
+        await self._maybe_release_video_load_from_get(path, response)
         return Response(
             content=response.content,
             status_code=response.status_code,
@@ -450,15 +458,78 @@ class SuperP95Dispatcher:
         )
 
     async def proxy_delete(self, path: str) -> Response:
-        backend = self.backends[0]
+        backend_index = self._backend_index_for_proxy_path(path)
+        backend = self.backends[backend_index]
         assert self._client is not None
         response = await self._client.delete(f"{backend.base_url}{path}")
+        if response.status_code < 400:
+            video_id = self._video_id_from_proxy_path(path)
+            if video_id is not None:
+                await self._release_video_load(video_id)
+                self._video_backend_by_id.pop(video_id, None)
         return Response(
             content=response.content,
             status_code=response.status_code,
             headers=self._filter_response_headers(response.headers),
             media_type=response.headers.get("content-type"),
         )
+
+    def _remember_video_backend(
+        self,
+        path: str,
+        response: httpx.Response,
+        decision: DispatchDecision,
+    ) -> bool:
+        if path != "/v1/videos" or response.status_code >= 400:
+            return False
+        try:
+            payload = response.json()
+        except ValueError:
+            return False
+        video_id = payload.get("id") if isinstance(payload, dict) else None
+        if isinstance(video_id, str) and video_id:
+            self._video_backend_by_id[video_id] = decision.backend_index
+            self._video_decision_by_id[video_id] = decision
+            return True
+        return False
+
+    async def _maybe_release_video_load_from_get(self, path: str, response: httpx.Response) -> None:
+        video_id = self._video_id_from_proxy_path(path)
+        if video_id is None or "/" in path.removeprefix(f"/v1/videos/{video_id}"):
+            return
+        if response.status_code >= 400:
+            return
+        try:
+            payload = response.json()
+        except ValueError:
+            return
+        status = payload.get("status") if isinstance(payload, dict) else None
+        if status in {"completed", "failed", "cancelled", "canceled"}:
+            await self._release_video_load(video_id)
+
+    async def _release_video_load(self, video_id: str) -> None:
+        decision = self._video_decision_by_id.pop(video_id, None)
+        if decision is None:
+            return
+        async with self._lock:
+            backend = self.backends[decision.backend_index]
+            self._dec_inflight(backend, decision.is_sacrificial)
+            self._fallback_remove_estimated_load(backend, decision)
+
+    def _backend_index_for_proxy_path(self, path: str) -> int:
+        video_id = self._video_id_from_proxy_path(path)
+        if video_id is None:
+            return 0
+        return self._video_backend_by_id.get(video_id, 0)
+
+    @staticmethod
+    def _video_id_from_proxy_path(path: str) -> str | None:
+        prefix = "/v1/videos/"
+        if not path.startswith(prefix):
+            return None
+        suffix = path[len(prefix) :]
+        video_id = suffix.split("/", 1)[0]
+        return video_id or None
 
     async def health(self) -> JSONResponse:
         assert self._client is not None
@@ -872,9 +943,18 @@ def _parse_device_ids(device_ids: str | None, num_servers: int, usp_degree: int)
     if num_servers == 1:
         return [raw]
 
+    if ";" in raw:
+        parsed = [item.strip() for item in raw.split(";") if item.strip()]
+        if len(parsed) != num_servers:
+            raise ValueError(f"--device-ids must provide exactly {num_servers} ';'-separated groups")
+        return parsed
+
     parsed = [item.strip() for item in raw.split(",") if item.strip()]
     if len(parsed) != num_servers:
-        raise ValueError(f"--device-ids must provide exactly {num_servers} entries")
+        raise ValueError(
+            f"--device-ids must provide exactly {num_servers} entries. "
+            "For multi-card backends, use ';'-separated groups, e.g. '0,1,2,3;4,5,6,7'."
+        )
     return parsed
 
 

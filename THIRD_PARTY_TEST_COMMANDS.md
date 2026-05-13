@@ -122,8 +122,13 @@ python3 benchmarks/diffusion/super_p95_dispatcher.py \
 ### 3.2 Wan2.2 Super P95 Server
 
 ```bash
-bash benchmarks/diffusion/run_wan22_super_p95_dispatcher.sh
+bash benchmarks/diffusion/run_wan22_super_p95_dispatcher_2x4.sh
 ```
+
+This starts one dispatcher on port `8080` and two managed Wan2.2 backends:
+
+- backend `8091`: `ASCEND_RT_VISIBLE_DEVICES=0,1,2,3`, `--usp 4`
+- backend `8092`: `ASCEND_RT_VISIBLE_DEVICES=4,5,6,7`, `--usp 4`
 
 ### 3.3 Wan2.2 Benchmark
 
@@ -136,9 +141,9 @@ python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
   --backend v1/videos \
   --dataset random \
   --task t2v \
-  --num-prompts 160 \
-  --max-concurrency 160 \
-  --request-rate 0.02 \
+  --num-prompts 50 \
+  --max-concurrency 50 \
+  --request-rate 0.05 \
   --enable-negative-prompt \
   --seed 42 \
   --random-request-seed 42 \
@@ -148,7 +153,7 @@ python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
     {"width":854,"height":480,"num_inference_steps":4,"num_frames":120,"fps":24,"weight":0.25},
     {"width":1280,"height":720,"num_inference_steps":6,"num_frames":80,"fps":16,"weight":0.6}
   ]' \
-  --output-file /tmp/wan22_t2v_baseline_usp8/run_160req_mix3_rps0.02_seed42.json
+  --output-file /tmp/wan22_t2v_baseline_usp8_rps005/run_50req_mix3_rps0.05_seed42.json
 ```
 
 Super P95:
@@ -160,9 +165,9 @@ python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
   --backend v1/videos \
   --dataset random \
   --task t2v \
-  --num-prompts 160 \
-  --max-concurrency 160 \
-  --request-rate 0.02 \
+  --num-prompts 50 \
+  --max-concurrency 50 \
+  --request-rate 0.05 \
   --enable-negative-prompt \
   --seed 42 \
   --random-request-seed 42 \
@@ -172,8 +177,15 @@ python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
     {"width":854,"height":480,"num_inference_steps":4,"num_frames":120,"fps":24,"weight":0.25},
     {"width":1280,"height":720,"num_inference_steps":6,"num_frames":80,"fps":16,"weight":0.6}
   ]' \
-  --output-file /tmp/wan22_t2v_super_p95_usp8/run_160req_mix3_rps0.02_seed42.json
+  --output-file /tmp/wan22_t2v_super_p95_2x4/run_50req_mix3_rps0.05_seed42.json
 ```
+
+Validated 50-prompt, rps `0.05` results:
+
+| Mode | Deployment | Successful | Duration (s) | Throughput (req/s) | Mean (s) | P95 (s) | P99 (s) |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Baseline | 1 x `--usp 8` | 50/50 | 3716.58 | 0.0135 | 1514.82 | 2750.93 | 2887.74 |
+| Super P95 | 2 x `--usp 4` | 50/50 | 3193.27 | 0.0157 | 1241.44 | 2191.56 | 2724.41 |
 
 ## 4. Readiness Check
 
